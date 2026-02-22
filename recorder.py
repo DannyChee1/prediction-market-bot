@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""
+Polymarket BTC 15-Min Market Recorder
+
+Captures 1-second snapshots to parquet for backtesting:
+  - Full top-5 book depth for Up and Down outcomes
+  - Chainlink BTC/USD price (streaming)
+  - Window metadata and time remaining
+  - Trade ticks (last_trade_price events)
+
+Outputs one parquet file per 15-minute window under ./data/
+
+Run with native Windows Python (has pyarrow):
+    py -3 recorder.py
+    py -3 recorder.py --debug
+    py -3 recorder.py --top-n 10   # capture top-10 levels
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import ssl
+import sys
+import time as _time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import requests
+import websockets
+
+try:
+    import certifi
+    SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    SSL_CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    SSL_CTX.check_hostname = False
+    SSL_CTX.verify_mode = ssl.CERT_NONE
+
+# ── Config ───────────────────────────────────────────────────────────────────
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+RTDS_WS = "wss://ws-live-data.polymarket.com"
+DATA_DIR = Path("data")
+
+DEBUG = False
+TOP_N = 5
+
+
+# ── Order book ───────────────────────────────────────────────────────────────
+class OrderBook:
+    """Maintains a price-level order book from WS events."""
+
+    __slots__ = ("bids", "asks")
+
+    def __init__(self):
+        self.bids: dict[float, float] = {}  # price -> size
+        self.asks: dict[float, float] = {}
+
+    def on_snapshot(self, bid_levels: list, ask_levels: list):
+        self.bids = {
+            float(l["price"]): float(l["size"]) for l in bid_levels
+        }
+        self.asks = {
+            float(l["price"]): float(l["size"]) for l in ask_levels
+        }
+
+    def on_price_change(self, price: str, size: str, side: str):
+        book = self.bids if side == "BUY" else self.asks
+        p, s = float(price), float(size)
+        if s == 0:
+            book.pop(p, None)
+        else:
+            book[p] = s
+
+    @property
+    def best_bid(self) -> float | None:
+        return max(self.bids) if self.bids else None
+
+    @property
+    def best_ask(self) -> float | None:
+        return min(self.asks) if self.asks else None
+
+    def top_bids(self, n: int) -> list[tuple[float, float]]:
+        """Top N bids, highest price first."""
+        return sorted(self.bids.items(), key=lambda x: -x[0])[:n]
+
+    def top_asks(self, n: int) -> list[tuple[float, float]]:
+        """Top N asks, lowest price first."""
+        return sorted(self.asks.items(), key=lambda x: x[0])[:n]
+
+
+# ── Shared state ─────────────────────────────────────────────────────────────
+book_up = OrderBook()
+book_down = OrderBook()
+chainlink_btc: float | None = None
+window_start_price: float | None = None
+
+# Metadata set per window
+meta = {
+    "market_slug": "",
+    "condition_id": "",
+    "token_id_up": "",
+    "token_id_down": "",
+    "window_start_ms": 0,
+    "window_end_ms": 0,
+}
+
+# Trade tick accumulator (flushed into each snapshot row)
+last_trade_up: dict | None = None
+last_trade_down: dict | None = None
+
+
+def _ensure_list(val):
+    return json.loads(val) if isinstance(val, str) else val
+
+
+# ── Market discovery ─────────────────────────────────────────────────────────
+def find_market():
+    now = datetime.now(timezone.utc)
+    minute = (now.minute // 15) * 15
+    base = now.replace(minute=minute, second=0, microsecond=0)
+
+    for offset in [0, -15, 15, -30, 30]:
+        candidate = base + timedelta(minutes=offset)
+        ts = int(candidate.timestamp())
+        slug = f"btc-updown-15m-{ts}"
+        try:
+            resp = requests.get(
+                f"{GAMMA_API}/events",
+                params={"slug": slug},
+                timeout=10,
+            )
+            data = resp.json()
+            if not data:
+                continue
+            event, market = data[0], data[0]["markets"][0]
+            end = datetime.fromisoformat(
+                market["endDate"].replace("Z", "+00:00")
+            )
+            start = datetime.fromisoformat(
+                market["eventStartTime"].replace("Z", "+00:00")
+            )
+            if now < end or start > now:
+                return event, market
+        except Exception:
+            continue
+
+    return None, None
+
+
+# ── Snapshot builder ─────────────────────────────────────────────────────────
+def build_row() -> dict:
+    """Sample current state into a flat dict for one parquet row."""
+    now_ms = int(_time.time() * 1000)
+    remaining_s = max(0, (meta["window_end_ms"] - now_ms) / 1000)
+
+    row = {
+        "ts_ms": now_ms,
+        "market_slug": meta["market_slug"],
+        "condition_id": meta["condition_id"],
+        "token_id_up": meta["token_id_up"],
+        "token_id_down": meta["token_id_down"],
+        "window_start_ms": meta["window_start_ms"],
+        "window_end_ms": meta["window_end_ms"],
+        "time_remaining_s": round(remaining_s, 3),
+        "chainlink_btc": chainlink_btc,
+        "window_start_price": window_start_price,
+    }
+
+    # Book data for each side
+    for label, book in [("up", book_up), ("down", book_down)]:
+        bb = book.best_bid
+        ba = book.best_ask
+        row[f"best_bid_{label}"] = bb
+        row[f"best_ask_{label}"] = ba
+
+        # Sizes at best
+        row[f"size_bid_{label}"] = book.bids.get(bb) if bb else None
+        row[f"size_ask_{label}"] = book.asks.get(ba) if ba else None
+
+        # Mid / spread
+        if bb is not None and ba is not None:
+            row[f"mid_{label}"] = round((bb + ba) / 2, 6)
+            row[f"spread_{label}"] = round(ba - bb, 6)
+        else:
+            row[f"mid_{label}"] = None
+            row[f"spread_{label}"] = None
+
+        # Top N levels
+        top_b = book.top_bids(TOP_N)
+        top_a = book.top_asks(TOP_N)
+
+        for i in range(TOP_N):
+            if i < len(top_b):
+                row[f"bid_px_{label}_{i+1}"] = top_b[i][0]
+                row[f"bid_sz_{label}_{i+1}"] = top_b[i][1]
+            else:
+                row[f"bid_px_{label}_{i+1}"] = None
+                row[f"bid_sz_{label}_{i+1}"] = None
+
+            if i < len(top_a):
+                row[f"ask_px_{label}_{i+1}"] = top_a[i][0]
+                row[f"ask_sz_{label}_{i+1}"] = top_a[i][1]
+            else:
+                row[f"ask_px_{label}_{i+1}"] = None
+                row[f"ask_sz_{label}_{i+1}"] = None
+
+        # Depth and imbalance over top N
+        bid_depth = sum(s for _, s in top_b)
+        ask_depth = sum(s for _, s in top_a)
+        total = bid_depth + ask_depth
+        row[f"bid_depth{TOP_N}_{label}"] = round(bid_depth, 4)
+        row[f"ask_depth{TOP_N}_{label}"] = round(ask_depth, 4)
+        row[f"imbalance{TOP_N}_{label}"] = (
+            round(bid_depth / total, 6) if total > 0 else None
+        )
+
+    # Last trade info
+    global last_trade_up, last_trade_down
+    for label, lt in [("up", last_trade_up), ("down", last_trade_down)]:
+        if lt:
+            row[f"last_trade_px_{label}"] = lt.get("price")
+            row[f"last_trade_sz_{label}"] = lt.get("size")
+            row[f"last_trade_side_{label}"] = lt.get("side")
+        else:
+            row[f"last_trade_px_{label}"] = None
+            row[f"last_trade_sz_{label}"] = None
+            row[f"last_trade_side_{label}"] = None
+
+    return row
+
+
+# ── CLOB WebSocket ───────────────────────────────────────────────────────────
+async def clob_ws(up_token: str, down_token: str, cancel: asyncio.Event):
+    global last_trade_up, last_trade_down
+    token_map = {up_token: "up", down_token: "down"}
+    book_map = {"up": book_up, "down": book_down}
+    backoff = 2
+
+    while not cancel.is_set():
+        try:
+            async with websockets.connect(
+                CLOB_WS, ssl=SSL_CTX, ping_interval=None
+            ) as ws:
+                backoff = 2
+                await ws.send(
+                    json.dumps(
+                        {
+                            "assets_ids": [up_token, down_token],
+                            "type": "market",
+                            "custom_feature_enabled": True,
+                        }
+                    )
+                )
+
+                async def heartbeat():
+                    try:
+                        while not cancel.is_set():
+                            await asyncio.sleep(10)
+                            await ws.send("PING")
+                    except Exception:
+                        pass
+
+                hb = asyncio.create_task(heartbeat())
+                try:
+                    async for raw in ws:
+                        if cancel.is_set():
+                            break
+                        if raw == "PONG" or not raw:
+                            continue
+                        if DEBUG:
+                            print(f"  [CLOB] {raw[:200]}")
+
+                        try:
+                            payload = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+
+                        msgs = (
+                            payload if isinstance(payload, list) else [payload]
+                        )
+                        for msg in msgs:
+                            if not isinstance(msg, dict):
+                                continue
+                            etype = msg.get("event_type")
+                            asset_id = msg.get("asset_id")
+                            side = token_map.get(asset_id)
+
+                            if etype == "book" and side:
+                                book_map[side].on_snapshot(
+                                    msg.get("bids", []),
+                                    msg.get("asks", []),
+                                )
+
+                            elif etype == "price_change":
+                                for ch in msg.get("price_changes", []):
+                                    s = token_map.get(ch.get("asset_id"))
+                                    if s:
+                                        book_map[s].on_price_change(
+                                            ch["price"],
+                                            ch["size"],
+                                            ch["side"],
+                                        )
+
+                            elif etype == "last_trade_price" and side:
+                                trade = {
+                                    "price": float(msg.get("price", 0)),
+                                    "size": float(msg.get("size", 0)),
+                                    "side": msg.get("side"),
+                                }
+                                if side == "up":
+                                    last_trade_up = trade
+                                else:
+                                    last_trade_down = trade
+
+                finally:
+                    hb.cancel()
+
+        except Exception as exc:
+            if cancel.is_set():
+                return
+            if DEBUG:
+                print(f"  [CLOB] {type(exc).__name__}: {exc}")
+            await asyncio.sleep(min(backoff, 30))
+            backoff = min(backoff * 2, 60)
+
+
+# ── RTDS WebSocket ───────────────────────────────────────────────────────────
+async def rtds_ws(cancel: asyncio.Event):
+    global chainlink_btc, window_start_price
+    backoff = 2
+
+    while not cancel.is_set():
+        try:
+            async with websockets.connect(
+                RTDS_WS, ssl=SSL_CTX, ping_interval=None
+            ) as ws:
+                backoff = 2
+                # Unfiltered subscription streams continuously;
+                # filtered goes silent after first batch.
+                await ws.send(
+                    json.dumps(
+                        {
+                            "action": "subscribe",
+                            "subscriptions": [
+                                {
+                                    "topic": "crypto_prices_chainlink",
+                                    "type": "*",
+                                }
+                            ],
+                        }
+                    )
+                )
+
+                async def heartbeat():
+                    try:
+                        while not cancel.is_set():
+                            await asyncio.sleep(5)
+                            await ws.send("PING")
+                    except Exception:
+                        pass
+
+                hb = asyncio.create_task(heartbeat())
+                try:
+                    async for raw in ws:
+                        if cancel.is_set():
+                            break
+                        if raw == "PONG" or not raw:
+                            continue
+
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+
+                        payload = msg.get("payload", {})
+                        if payload.get("symbol") not in ("btc/usd", None):
+                            continue
+
+                        # Single streaming update
+                        price = payload.get("value")
+                        if price is not None:
+                            chainlink_btc = float(price)
+                            if window_start_price is None:
+                                window_start_price = chainlink_btc
+                            continue
+
+                        # Initial batch
+                        data_arr = payload.get("data")
+                        if isinstance(data_arr, list) and data_arr:
+                            chainlink_btc = float(data_arr[-1]["value"])
+                            if window_start_price is None:
+                                window_start_price = chainlink_btc
+
+                finally:
+                    hb.cancel()
+
+        except Exception as exc:
+            if cancel.is_set():
+                return
+            if DEBUG:
+                print(f"  [RTDS] {type(exc).__name__}: {exc}")
+            await asyncio.sleep(min(backoff, 30))
+            backoff = min(backoff * 2, 60)
+
+
+# ── Snapshot sampler ─────────────────────────────────────────────────────────
+async def sampler(
+    rows: list[dict], cancel: asyncio.Event, interval: float = 1.0
+):
+    """Append a snapshot row every `interval` seconds."""
+    while not cancel.is_set():
+        await asyncio.sleep(interval)
+        if cancel.is_set():
+            break
+        rows.append(build_row())
+
+
+# ── Parquet flush ────────────────────────────────────────────────────────────
+def flush_parquet(rows: list[dict], slug: str):
+    if not rows:
+        return None
+    DATA_DIR.mkdir(exist_ok=True)
+    df = pd.DataFrame(rows)
+    path = DATA_DIR / f"{slug}.parquet"
+
+    # Append if file already exists (e.g., recorder restarted mid-window)
+    if path.exists():
+        try:
+            existing = pd.read_parquet(path)
+            df = pd.concat([existing, df], ignore_index=True)
+        except Exception:
+            pass  # corrupted file, overwrite it
+
+    # Write to temp then rename for atomic flush
+    tmp = path.with_suffix(".parquet.tmp")
+    df.to_parquet(tmp, index=False, engine="pyarrow")
+    tmp.replace(path)
+    return path
+
+
+# ── Window lifecycle ─────────────────────────────────────────────────────────
+async def run_window():
+    global chainlink_btc, window_start_price
+    global last_trade_up, last_trade_down
+
+    print("  Searching for active BTC 15-minute market...")
+    event, market = find_market()
+
+    if not event or not market:
+        print("  No market found. Retrying in 30s...")
+        await asyncio.sleep(30)
+        return
+
+    outcomes = _ensure_list(market["outcomes"])
+    tokens = _ensure_list(market["clobTokenIds"])
+    up_token = tokens[outcomes.index("Up")]
+    down_token = tokens[outcomes.index("Down")]
+
+    end = datetime.fromisoformat(market["endDate"].replace("Z", "+00:00"))
+    start = datetime.fromisoformat(
+        market["eventStartTime"].replace("Z", "+00:00")
+    )
+    slug = event["slug"]
+
+    # Reset per-window state
+    book_up.__init__()
+    book_down.__init__()
+    window_start_price = None
+    last_trade_up = None
+    last_trade_down = None
+
+    meta.update(
+        {
+            "market_slug": slug,
+            "condition_id": market.get("conditionId", ""),
+            "token_id_up": up_token,
+            "token_id_down": down_token,
+            "window_start_ms": int(start.timestamp() * 1000),
+            "window_end_ms": int(end.timestamp() * 1000),
+        }
+    )
+
+    print(f"  Recording: {event['title']}")
+    print(f"  Window:    {start.strftime('%H:%M:%S')} -> {end.strftime('%H:%M:%S')} UTC")
+    print(f"  Slug:      {slug}")
+
+    rows: list[dict] = []
+    cancel = asyncio.Event()
+
+    tasks = [
+        asyncio.create_task(clob_ws(up_token, down_token, cancel)),
+        asyncio.create_task(rtds_ws(cancel)),
+        asyncio.create_task(sampler(rows, cancel)),
+    ]
+
+    # Progress printer
+    async def progress():
+        while not cancel.is_set():
+            await asyncio.sleep(10)
+            if cancel.is_set():
+                break
+            now = datetime.now(timezone.utc)
+            rem = max(0, (end - now).total_seconds())
+            bb = book_up.best_bid
+            ba = book_up.best_ask
+            price_str = f"${chainlink_btc:,.2f}" if chainlink_btc else "---"
+            book_str = (
+                f"Up {bb:.2f}/{ba:.2f}" if bb and ba else "Up ---/---"
+            )
+            print(
+                f"  [{now.strftime('%H:%M:%S')}] "
+                f"{len(rows):>5} rows | {rem:>6.1f}s left | "
+                f"{price_str} | {book_str}"
+            )
+
+    # Periodic flusher — write every 60s so we don't lose data on crash
+    async def periodic_flush():
+        while not cancel.is_set():
+            await asyncio.sleep(60)
+            if rows:
+                flush_parquet(rows, slug)
+
+    tasks.append(asyncio.create_task(progress()))
+    tasks.append(asyncio.create_task(periodic_flush()))
+
+    # Wait until window ends + 5s grace
+    now = datetime.now(timezone.utc)
+    try:
+        await asyncio.sleep(max(0, (end - now).total_seconds()) + 5)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        cancel.set()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Final flush
+        path = flush_parquet(rows, slug)
+        if path:
+            print(f"  Saved {len(rows)} rows -> {path}")
+        else:
+            print("  No rows captured.")
+
+
+_current_window_task: asyncio.Task | None = None
+
+
+async def main():
+    global _current_window_task
+    while True:
+        _current_window_task = asyncio.current_task()
+        await run_window()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Record Polymarket BTC 15-min data to parquet"
+    )
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=5,
+        help="Number of book levels to capture (default: 5)",
+    )
+    args = parser.parse_args()
+    DEBUG = args.debug
+    TOP_N = args.top_n
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # run_window's finally block handles the flush
+        print("\n  Exiting.")

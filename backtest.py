@@ -234,6 +234,7 @@ class DiffusionSignal(Signal):
         kelly_fraction: float = 0.5,
         slippage: float = 0.0,
         max_z: float = 2.0,
+        momentum_lookback_s: int = 30,
         vol_regime_lookback_s: int = 120,
         vol_regime_mult: float = 3.0,
     ):
@@ -247,6 +248,7 @@ class DiffusionSignal(Signal):
         self.kelly_fraction = kelly_fraction
         self.slippage = slippage
         self.max_z = max_z
+        self.momentum_lookback_s = momentum_lookback_s
         self.vol_regime_lookback_s = vol_regime_lookback_s
         self.vol_regime_mult = vol_regime_mult
 
@@ -323,6 +325,22 @@ class DiffusionSignal(Signal):
             return Decision("FLAT", 0.0, 0.0,
                             f"no edge (up={edge_up:.4f} down={edge_down:.4f} "
                             f"thresh={dyn_threshold:.4f})")
+
+        # Momentum confirmation: delta must be same-sign for the
+        # entire lookback window — prevents whipsawing when BTC
+        # oscillates near the start price.
+        start_px = snapshot.window_start_price
+        mom_n = min(self.momentum_lookback_s, len(hist))
+        if mom_n >= 2:
+            mom_prices = hist[-mom_n:]
+            if side == "BUY_UP":
+                if not all(p >= start_px for p in mom_prices):
+                    return Decision("FLAT", 0.0, 0.0,
+                        f"momentum fail: BTC crossed below start in last {mom_n}s")
+            else:
+                if not all(p <= start_px for p in mom_prices):
+                    return Decision("FLAT", 0.0, 0.0,
+                        f"momentum fail: BTC crossed above start in last {mom_n}s")
 
         if eff_price >= 1.0:
             return Decision("FLAT", 0.0, 0.0, "eff price >= 1")
@@ -634,12 +652,14 @@ class BacktestEngine:
             "final_bankroll": self.bankroll,
         }
         if not results:
-            base.update(n_trades=0, total_pnl=0.0, win_rate=0.0,
-                        avg_pnl=0.0, avg_win=0.0, avg_loss=0.0,
-                        max_drawdown=0.0, max_dd_pct=0.0, sharpe=0.0)
+            base.update(n_trades=0, total_pnl=0.0, total_fees=0.0,
+                        win_rate=0.0, avg_pnl=0.0, avg_win=0.0,
+                        avg_loss=0.0, max_drawdown=0.0, max_dd_pct=0.0,
+                        sharpe=0.0)
             return base
 
         pnls = [r.pnl for r in results]
+        total_fees = sum(r.fill.fee_per_share * r.fill.shares for r in results)
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
 
@@ -664,6 +684,7 @@ class BacktestEngine:
         base.update(
             n_trades=len(results),
             total_pnl=round(sum(pnls), 2),
+            total_fees=round(total_fees, 2),
             win_rate=round(len(wins) / len(results), 4),
             avg_pnl=round(mean_pnl, 2),
             avg_win=round(float(np.mean(wins)), 2) if wins else 0.0,
@@ -719,6 +740,7 @@ def print_summary(metrics: dict, trades_df: pd.DataFrame):
     print(f"  Trades:         {metrics['n_trades']}")
     print(f"  Win rate:       {metrics['win_rate']:.1%}")
     print(f"  Total PnL:      ${metrics['total_pnl']:+.2f}")
+    print(f"  Total fees:     ${metrics['total_fees']:.2f}")
     print(f"  Avg PnL/trade:  ${metrics['avg_pnl']:+.2f}")
     print(f"  Avg win:        ${metrics['avg_win']:+.2f}")
     print(f"  Avg loss:       ${metrics['avg_loss']:+.2f}")

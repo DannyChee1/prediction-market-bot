@@ -235,6 +235,8 @@ class DiffusionSignal(Signal):
         slippage: float = 0.0,
         max_z: float = 2.0,
         momentum_lookback_s: int = 30,
+        max_spread: float = 0.05,
+        spread_edge_penalty: float = 1.0,
         vol_regime_lookback_s: int = 120,
         vol_regime_mult: float = 3.0,
     ):
@@ -249,6 +251,8 @@ class DiffusionSignal(Signal):
         self.slippage = slippage
         self.max_z = max_z
         self.momentum_lookback_s = momentum_lookback_s
+        self.max_spread = max_spread
+        self.spread_edge_penalty = spread_edge_penalty
         self.vol_regime_lookback_s = vol_regime_lookback_s
         self.vol_regime_mult = vol_regime_mult
 
@@ -274,10 +278,20 @@ class DiffusionSignal(Signal):
 
         ask_up = snapshot.best_ask_up
         ask_down = snapshot.best_ask_down
-        if ask_up is None or ask_down is None:
+        bid_up = snapshot.best_bid_up
+        bid_down = snapshot.best_bid_down
+        if ask_up is None or ask_down is None or bid_up is None or bid_down is None:
             return Decision("FLAT", 0.0, 0.0, "missing book")
         if ask_up <= 0 or ask_up >= 1 or ask_down <= 0 or ask_down >= 1:
             return Decision("FLAT", 0.0, 0.0, "invalid asks")
+
+        # Spread gate: wide spreads signal uncertain/illiquid pricing
+        spread_up = ask_up - bid_up
+        spread_down = ask_down - bid_down
+        if spread_up > self.max_spread or spread_down > self.max_spread:
+            return Decision("FLAT", 0.0, 0.0,
+                f"spread too wide (up={spread_up:.3f} down={spread_down:.3f} "
+                f"max={self.max_spread})")
 
         tau = snapshot.time_remaining_s
         if tau <= 0:
@@ -313,9 +327,9 @@ class DiffusionSignal(Signal):
         p_up_cost = ask_up + poly_fee(ask_up) + self.slippage
         p_down_cost = ask_down + poly_fee(ask_down) + self.slippage
 
-        # Edges
-        edge_up = p_model - p_up_cost
-        edge_down = (1.0 - p_model) - p_down_cost
+        # Edges (penalized by spread — wider spread = less trustworthy pricing)
+        edge_up = p_model - p_up_cost - self.spread_edge_penalty * spread_up
+        edge_down = (1.0 - p_model) - p_down_cost - self.spread_edge_penalty * spread_down
 
         if edge_up >= edge_down and edge_up > dyn_threshold:
             side, edge, eff_price, p_side = "BUY_UP", edge_up, p_up_cost, p_model
@@ -342,6 +356,20 @@ class DiffusionSignal(Signal):
                     return Decision("FLAT", 0.0, 0.0,
                         f"momentum fail: BTC crossed above start in last {mom_n}s")
 
+        # Order book imbalance: require buy pressure on the chosen side
+        # imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
+        if side == "BUY_UP":
+            bid_d = sum(sz for _, sz in snapshot.bid_levels_up)
+            ask_d = sum(sz for _, sz in snapshot.ask_levels_up)
+        else:
+            bid_d = sum(sz for _, sz in snapshot.bid_levels_down)
+            ask_d = sum(sz for _, sz in snapshot.ask_levels_down)
+        total_d = bid_d + ask_d
+        imbalance = (bid_d - ask_d) / total_d if total_d > 0 else 0.0
+        if imbalance < 0:
+            return Decision("FLAT", 0.0, 0.0,
+                f"imbalance disagrees ({imbalance:+.3f} for {side})")
+
         if eff_price >= 1.0:
             return Decision("FLAT", 0.0, 0.0, "eff price >= 1")
 
@@ -363,11 +391,12 @@ class DiffusionSignal(Signal):
             "expected_high": snapshot.window_start_price + move_1sig,
         }
 
+        sprd = spread_up if side == "BUY_UP" else spread_down
         reason = (
             f"p={p_model:.4f} sig={sigma_per_s:.2e} z={z:.2f}"
             f"{'(cap)' if abs(z_raw) > self.max_z else ''} "
             f"tau={tau:.0f}s edge={edge:.4f} thresh={dyn_threshold:.4f} "
-            f"kelly={kelly_f:.4f} ${size_usd:.0f}"
+            f"spread={sprd:.3f} kelly={kelly_f:.4f} ${size_usd:.0f}"
         )
         return Decision(side, edge, size_usd, reason)
 

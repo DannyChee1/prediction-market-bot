@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Paper Trading Mode for Polymarket BTC 15-Min Bot
+Paper Trading Mode for Polymarket 15-Min Bot
 
 Connects the DiffusionSignal from backtest.py to real-time market data
 via WebSocket feeds, simulating trades without placing real orders.
 
 Usage:
-    python paper_trader.py
+    python paper_trader.py                  # BTC (default)
+    python paper_trader.py --market eth     # ETH
     python paper_trader.py --bankroll 5000
     python paper_trader.py --latency 250 --slippage 0.002
     python paper_trader.py --resume
@@ -34,6 +35,7 @@ from backtest import (
     Snapshot, Decision, Fill, TradeResult,
     DiffusionSignal, walk_book, poly_fee, BacktestEngine,
 )
+from market_config import MarketConfig, MARKET_CONFIGS, DEFAULT_MARKET, get_config
 
 # ── SSL ──────────────────────────────────────────────────────────────────────
 try:
@@ -52,8 +54,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RTDS_WS = "wss://ws-live-data.polymarket.com"
 
-TRADES_LOG = Path("paper_trades.jsonl")
-STATE_FILE = Path("paper_state.json")
+TRADES_LOG = Path("paper_trades.jsonl")   # overridden per-market in main()
+STATE_FILE = Path("paper_state.json")    # overridden per-market in main()
 
 DEBUG = False
 
@@ -80,8 +82,8 @@ def _try_slug(slug: str):
     return None
 
 
-def find_market():
-    """Resolve the current BTC 15-min market."""
+def find_market(config: MarketConfig):
+    """Resolve the current 15-min market for the given config."""
     now = datetime.now(timezone.utc)
     minute = (now.minute // 15) * 15
     window_start = now.replace(minute=minute, second=0, microsecond=0)
@@ -89,7 +91,7 @@ def find_market():
     for offset in [0, -15, 15, -30, 30]:
         candidate = window_start + timedelta(minutes=offset)
         ts = int(candidate.timestamp())
-        result = _try_slug(f"btc-updown-15m-{ts}")
+        result = _try_slug(f"{config.slug_prefix}-{ts}")
         if result:
             event, market = result
             end = datetime.fromisoformat(
@@ -115,7 +117,7 @@ def find_market():
         )
         candidates = []
         for e in resp.json():
-            if "btc-updown-15m" not in e.get("slug", ""):
+            if config.slug_prefix not in e.get("slug", ""):
                 continue
             m = e["markets"][0]
             end = datetime.fromisoformat(
@@ -214,7 +216,7 @@ def snapshot_from_live(
         ts_ms=int(_time.time() * 1000),
         market_slug=market_slug,
         time_remaining_s=time_remaining_s,
-        chainlink_btc=btc_price,
+        chainlink_price=btc_price,
         window_start_price=window_start_price,
         best_bid_up=bb_up,
         best_ask_up=ba_up,
@@ -364,7 +366,7 @@ class PaperTradeTracker:
             cost_usd=total_cost,
             signal_name=self.signal.name,
             decision_reason=decision.reason,
-            btc_at_fill=rng.get("btc_at_fill", snapshot.chainlink_btc),
+            btc_at_fill=rng.get("btc_at_fill", snapshot.chainlink_price),
             start_price=rng.get("start_price", snapshot.window_start_price),
             expected_low=rng.get("expected_low", 0.0),
             expected_high=rng.get("expected_high", 0.0),
@@ -639,8 +641,8 @@ async def clob_ws(
             backoff = min(backoff * 2, 60)
 
 
-async def rtds_ws(price_state: dict, cancel: asyncio.Event):
-    """RTDS WS: Chainlink BTC/USD price stream."""
+async def rtds_ws(price_state: dict, cancel: asyncio.Event, config: MarketConfig):
+    """RTDS WS: Chainlink price stream for the configured market."""
     backoff = 2
 
     while not cancel.is_set():
@@ -683,8 +685,8 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event):
 
                         payload = msg.get("payload", {})
 
-                        # Filter for BTC/USD only
-                        if payload.get("symbol") not in ("btc/usd", None):
+                        # Filter for configured symbol only
+                        if payload.get("symbol") not in (config.chainlink_symbol, None):
                             continue
 
                         # Batch format: payload.data = [{value, ...}, ...]
@@ -692,7 +694,7 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event):
                         if isinstance(data_arr, list) and data_arr:
                             price = data_arr[-1].get("value")
                             if price is not None:
-                                price_state["btc_price"] = float(price)
+                                price_state["price"] = float(price)
                                 if price_state["window_start_price"] is None:
                                     price_state["window_start_price"] = (
                                         float(price)
@@ -702,7 +704,7 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event):
                         # Single update: payload.value
                         price = payload.get("value")
                         if price is not None:
-                            price_state["btc_price"] = float(price)
+                            price_state["price"] = float(price)
                             if price_state["window_start_price"] is None:
                                 price_state["window_start_price"] = (
                                     float(price)
@@ -730,6 +732,7 @@ async def signal_ticker(
     window_end: datetime,
     market_slug: str,
     cancel: asyncio.Event,
+    skip_trading: bool = False,
 ):
     """Run signal evaluation every 1 second (matches recorder's 1Hz sampling)."""
     while not cancel.is_set():
@@ -739,11 +742,11 @@ async def signal_ticker(
 
         snap = snapshot_from_live(
             book_up, book_down,
-            price_state.get("btc_price"),
+            price_state.get("price"),
             price_state.get("window_start_price"),
             window_end, market_slug,
         )
-        if snap is not None:
+        if snap is not None and not skip_trading:
             tracker.evaluate(snap)
 
 
@@ -756,11 +759,12 @@ def render_display(
     market_title: str,
     window_start: datetime,
     window_end: datetime,
+    config: MarketConfig,
 ):
     """Render terminal TUI with market data and paper trading overlay."""
     lines = ["\033[2J\033[H"]
     lines.append("=" * 62)
-    lines.append(f"  BTC Up/Down 15m: {market_title}")
+    lines.append(f"  {config.display_name} Up/Down 15m: {market_title}")
     lines.append("=" * 62)
     lines.append("")
 
@@ -786,18 +790,19 @@ def render_display(
     )
     lines.append("")
 
-    btc = price_state.get("btc_price")
+    btc = price_state.get("price")
     start_px = price_state.get("window_start_price")
+    price_label = f"Chainlink {config.chainlink_symbol.upper()}"
     if btc is not None:
-        lines.append(f"  Chainlink BTC/USD:  ${btc:>12,.2f}")
+        lines.append(f"  {price_label}:  ${btc:>12,.2f}")
         if start_px is not None:
             delta = btc - start_px
             lines.append(
-                f"  Start Price:        ${start_px:>12,.2f}"
+                f"  Start Price:{' ' * (len(price_label) - 11)}${start_px:>12,.2f}"
                 f"  (delta: ${delta:+,.2f})"
             )
     else:
-        lines.append("  Chainlink BTC/USD:     waiting...")
+        lines.append(f"  {price_label}:     waiting...")
     lines.append("")
 
     # Book table
@@ -901,25 +906,26 @@ async def display_ticker(
     window_start: datetime,
     window_end: datetime,
     cancel: asyncio.Event,
+    config: MarketConfig,
 ):
     """Update display every 1 second."""
     while not cancel.is_set():
         render_display(
             tracker, price_state, flat_state,
-            market_title, window_start, window_end,
+            market_title, window_start, window_end, config,
         )
         await asyncio.sleep(1)
 
 
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
 
-async def run_window(tracker: PaperTradeTracker):
+async def run_window(tracker: PaperTradeTracker, config: MarketConfig):
     """Run one 15-minute market window."""
-    print("  Searching for active BTC 15-minute market...")
-    event, market = find_market()
+    print(f"  Searching for active {config.display_name} 15-minute market...")
+    event, market = find_market(config)
 
     if not event or not market:
-        print("  No active BTC 15-minute market found. Retrying in 30s...")
+        print(f"  No active {config.display_name} 15-minute market found. Retrying in 30s...")
         await asyncio.sleep(30)
         return
 
@@ -940,7 +946,7 @@ async def run_window(tracker: PaperTradeTracker):
     book_up = OrderBook()
     book_down = OrderBook()
     price_state = {
-        "btc_price": None,
+        "price": None,
         "window_start_price": None,
     }
     flat_state = {
@@ -951,6 +957,18 @@ async def run_window(tracker: PaperTradeTracker):
     }
 
     tracker.new_window(end)
+
+    # Detect if we're joining mid-window on startup — start price will be wrong
+    now_check = datetime.now(timezone.utc)
+    elapsed_since_start = (now_check - start).total_seconds()
+    skip_trading = (tracker.windows_seen == 1 and elapsed_since_start > 10)
+    if skip_trading:
+        tracker.last_decision = Decision(
+            "FLAT", 0.0, 0.0,
+            f"WARM-UP: joined {elapsed_since_start:.0f}s into window, feeds warming up"
+        )
+        print(f"  [WARM-UP] Joined {elapsed_since_start:.0f}s after window start — "
+              f"skipping trading, warming up feeds for next window")
 
     print(f"  Market:   {title}")
     print(
@@ -965,14 +983,15 @@ async def run_window(tracker: PaperTradeTracker):
             clob_ws(up_token, down_token, book_up, book_down,
                      flat_state, cancel)
         ),
-        asyncio.create_task(rtds_ws(price_state, cancel)),
+        asyncio.create_task(rtds_ws(price_state, cancel, config)),
         asyncio.create_task(
             signal_ticker(tracker, book_up, book_down, price_state,
-                          end, slug, cancel)
+                          end, slug, cancel,
+                          skip_trading=skip_trading)
         ),
         asyncio.create_task(
             display_ticker(tracker, price_state, flat_state,
-                           title, start, end, cancel)
+                           title, start, end, cancel, config)
         ),
     ]
 
@@ -988,25 +1007,30 @@ async def run_window(tracker: PaperTradeTracker):
     # Resolve window using actual Gamma API resolution
     tracker.resolve_window(
         slug,
-        price_state.get("btc_price"),
+        price_state.get("price"),
         price_state.get("window_start_price"),
     )
     tracker.save_state()
 
 
-async def run(tracker: PaperTradeTracker):
+async def run(tracker: PaperTradeTracker, config: MarketConfig):
     """Main loop: run windows continuously."""
     while True:
-        await run_window(tracker)
+        await run_window(tracker, config)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global DEBUG
+    global DEBUG, TRADES_LOG, STATE_FILE
 
     parser = argparse.ArgumentParser(
-        description="Paper trading for Polymarket BTC Up/Down 15-min markets"
+        description="Paper trading for Polymarket Up/Down 15-min markets"
+    )
+    parser.add_argument(
+        "--market", default=DEFAULT_MARKET,
+        choices=list(MARKET_CONFIGS),
+        help="Market to paper-trade (default: btc)",
     )
     parser.add_argument(
         "--bankroll", type=float, default=10_000.0,
@@ -1022,7 +1046,7 @@ def main():
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="Resume from saved paper_state.json",
+        help="Resume from saved state file",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -1030,6 +1054,11 @@ def main():
     )
     args = parser.parse_args()
     DEBUG = args.debug
+
+    config = get_config(args.market)
+    # Per-market state files to avoid clobber when running BTC + ETH simultaneously
+    TRADES_LOG = Path(f"paper_trades_{config.data_subdir}.jsonl")
+    STATE_FILE = Path(f"paper_state_{config.data_subdir}.json")
 
     bankroll = args.bankroll
     saved = None
@@ -1065,7 +1094,7 @@ def main():
         tracker.max_drawdown = saved.get("max_drawdown", 0.0)
         tracker.max_dd_pct = saved.get("max_dd_pct", 0.0)
 
-    print(f"\n  Paper Trading Mode -- DiffusionSignal")
+    print(f"\n  Paper Trading Mode -- {config.display_name} -- DiffusionSignal")
     print(
         f"  Bankroll: ${bankroll:,.2f}  |  "
         f"Latency: {args.latency}ms  |  Slippage: {args.slippage}"
@@ -1074,7 +1103,7 @@ def main():
     print()
 
     try:
-        asyncio.run(run(tracker))
+        asyncio.run(run(tracker, config))
     except KeyboardInterrupt:
         tracker.save_state()
         print(f"\n  Session saved. Bankroll: ${tracker.bankroll:,.2f}")

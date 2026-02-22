@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC 15-Min Market Recorder
+Polymarket 15-Min Market Recorder
 
 Captures 1-second snapshots to parquet for backtesting:
   - Full top-5 book depth for Up and Down outcomes
-  - Chainlink BTC/USD price (streaming)
+  - Chainlink price (streaming)
   - Window metadata and time remaining
   - Trade ticks (last_trade_price events)
 
-Outputs one parquet file per 15-minute window under ./data/
+Outputs one parquet file per 15-minute window under ./data/<market>/
 
 Run with native Windows Python (has pyarrow):
-    py -3 recorder.py
+    py -3 recorder.py                  # BTC (default)
+    py -3 recorder.py --market eth     # ETH
     py -3 recorder.py --debug
-    py -3 recorder.py --top-n 10   # capture top-10 levels
+    py -3 recorder.py --top-n 10       # capture top-10 levels
 """
 
 import argparse
@@ -31,6 +32,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
 import websockets
+
+from market_config import MarketConfig, MARKET_CONFIGS, DEFAULT_MARKET, get_config
 
 try:
     import certifi
@@ -96,7 +99,7 @@ class OrderBook:
 # ── Shared state ─────────────────────────────────────────────────────────────
 book_up = OrderBook()
 book_down = OrderBook()
-chainlink_btc: float | None = None
+chainlink_price: float | None = None
 window_start_price: float | None = None
 
 # Metadata set per window
@@ -119,7 +122,7 @@ def _ensure_list(val):
 
 
 # ── Market discovery ─────────────────────────────────────────────────────────
-def find_market():
+def find_market(config: MarketConfig):
     now = datetime.now(timezone.utc)
     minute = (now.minute // 15) * 15
     base = now.replace(minute=minute, second=0, microsecond=0)
@@ -127,7 +130,7 @@ def find_market():
     for offset in [0, -15, 15, -30, 30]:
         candidate = base + timedelta(minutes=offset)
         ts = int(candidate.timestamp())
-        slug = f"btc-updown-15m-{ts}"
+        slug = f"{config.slug_prefix}-{ts}"
         try:
             resp = requests.get(
                 f"{GAMMA_API}/events",
@@ -167,7 +170,7 @@ def build_row() -> dict:
         "window_start_ms": meta["window_start_ms"],
         "window_end_ms": meta["window_end_ms"],
         "time_remaining_s": round(remaining_s, 3),
-        "chainlink_btc": chainlink_btc,
+        "chainlink_price": chainlink_price,
         "window_start_price": window_start_price,
     }
 
@@ -330,8 +333,8 @@ async def clob_ws(up_token: str, down_token: str, cancel: asyncio.Event):
 
 
 # ── RTDS WebSocket ───────────────────────────────────────────────────────────
-async def rtds_ws(cancel: asyncio.Event):
-    global chainlink_btc, window_start_price
+async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
+    global chainlink_price, window_start_price
     backoff = 2
 
     while not cancel.is_set():
@@ -378,23 +381,23 @@ async def rtds_ws(cancel: asyncio.Event):
                             continue
 
                         payload = msg.get("payload", {})
-                        if payload.get("symbol") not in ("btc/usd", None):
+                        if payload.get("symbol") not in (config.chainlink_symbol, None):
                             continue
 
                         # Single streaming update
                         price = payload.get("value")
                         if price is not None:
-                            chainlink_btc = float(price)
+                            chainlink_price = float(price)
                             if window_start_price is None:
-                                window_start_price = chainlink_btc
+                                window_start_price = chainlink_price
                             continue
 
                         # Initial batch
                         data_arr = payload.get("data")
                         if isinstance(data_arr, list) and data_arr:
-                            chainlink_btc = float(data_arr[-1]["value"])
+                            chainlink_price = float(data_arr[-1]["value"])
                             if window_start_price is None:
-                                window_start_price = chainlink_btc
+                                window_start_price = chainlink_price
 
                 finally:
                     hb.cancel()
@@ -421,12 +424,13 @@ async def sampler(
 
 
 # ── Parquet flush ────────────────────────────────────────────────────────────
-def flush_parquet(rows: list[dict], slug: str):
+def flush_parquet(rows: list[dict], slug: str, config: MarketConfig):
     if not rows:
         return None
-    DATA_DIR.mkdir(exist_ok=True)
+    out_dir = DATA_DIR / config.data_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
-    path = DATA_DIR / f"{slug}.parquet"
+    path = out_dir / f"{slug}.parquet"
 
     # Append if file already exists (e.g., recorder restarted mid-window)
     if path.exists():
@@ -444,15 +448,15 @@ def flush_parquet(rows: list[dict], slug: str):
 
 
 # ── Window lifecycle ─────────────────────────────────────────────────────────
-async def run_window():
-    global chainlink_btc, window_start_price
+async def run_window(config: MarketConfig):
+    global chainlink_price, window_start_price
     global last_trade_up, last_trade_down
 
-    print("  Searching for active BTC 15-minute market...")
-    event, market = find_market()
+    print(f"  Searching for active {config.display_name} 15-minute market...")
+    event, market = find_market(config)
 
     if not event or not market:
-        print("  No market found. Retrying in 30s...")
+        print(f"  No {config.display_name} market found. Retrying in 30s...")
         await asyncio.sleep(30)
         return
 
@@ -494,7 +498,7 @@ async def run_window():
 
     tasks = [
         asyncio.create_task(clob_ws(up_token, down_token, cancel)),
-        asyncio.create_task(rtds_ws(cancel)),
+        asyncio.create_task(rtds_ws(cancel, config)),
         asyncio.create_task(sampler(rows, cancel)),
     ]
 
@@ -508,7 +512,7 @@ async def run_window():
             rem = max(0, (end - now).total_seconds())
             bb = book_up.best_bid
             ba = book_up.best_ask
-            price_str = f"${chainlink_btc:,.2f}" if chainlink_btc else "---"
+            price_str = f"${chainlink_price:,.2f}" if chainlink_price else "---"
             book_str = (
                 f"Up {bb:.2f}/{ba:.2f}" if bb and ba else "Up ---/---"
             )
@@ -523,7 +527,7 @@ async def run_window():
         while not cancel.is_set():
             await asyncio.sleep(60)
             if rows:
-                flush_parquet(rows, slug)
+                flush_parquet(rows, slug, config)
 
     tasks.append(asyncio.create_task(progress()))
     tasks.append(asyncio.create_task(periodic_flush()))
@@ -541,7 +545,7 @@ async def run_window():
         await asyncio.gather(*tasks, return_exceptions=True)
 
         # Final flush
-        path = flush_parquet(rows, slug)
+        path = flush_parquet(rows, slug, config)
         if path:
             print(f"  Saved {len(rows)} rows -> {path}")
         else:
@@ -551,16 +555,22 @@ async def run_window():
 _current_window_task: asyncio.Task | None = None
 
 
-async def main():
+async def main(config: MarketConfig):
     global _current_window_task
     while True:
         _current_window_task = asyncio.current_task()
-        await run_window()
+        await run_window(config)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Record Polymarket BTC 15-min data to parquet"
+        description="Record Polymarket 15-min data to parquet"
+    )
+    parser.add_argument(
+        "--market",
+        default=DEFAULT_MARKET,
+        choices=list(MARKET_CONFIGS),
+        help="Market to record (default: btc)",
     )
     parser.add_argument("--debug", action="store_true")
     parser.add_argument(
@@ -573,8 +583,11 @@ if __name__ == "__main__":
     DEBUG = args.debug
     TOP_N = args.top_n
 
+    _config = get_config(args.market)
+    print(f"  Market: {_config.display_name} ({_config.slug_prefix})")
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(_config))
     except KeyboardInterrupt:
         # run_window's finally block handles the flush
         print("\n  Exiting.")

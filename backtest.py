@@ -25,6 +25,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from market_config import MARKET_CONFIGS, DEFAULT_MARKET, get_config
+
 DATA_DIR = Path(__file__).parent / "data"
 
 # Windows whose final row has time_remaining_s above this are incomplete
@@ -50,7 +52,7 @@ class Snapshot:
     ts_ms: int
     market_slug: str
     time_remaining_s: float
-    chainlink_btc: float
+    chainlink_price: float
     window_start_price: float
 
     best_bid_up: Optional[float]
@@ -70,8 +72,13 @@ class Snapshot:
 
     @staticmethod
     def from_row(row: pd.Series) -> Optional[Snapshot]:
+        # Support both old "chainlink_btc" and new "chainlink_price" columns
+        price_val = row.get("chainlink_price")
+        if price_val is None or pd.isna(price_val):
+            price_val = row.get("chainlink_btc")
         if (
-            pd.isna(row.get("chainlink_btc"))
+            price_val is None
+            or pd.isna(price_val)
             or pd.isna(row.get("window_start_price"))
             or pd.isna(row.get("time_remaining_s"))
         ):
@@ -102,7 +109,7 @@ class Snapshot:
             ts_ms=int(row["ts_ms"]),
             market_slug=str(row["market_slug"]),
             time_remaining_s=float(row["time_remaining_s"]),
-            chainlink_btc=float(row["chainlink_btc"]),
+            chainlink_price=float(price_val),
             window_start_price=float(row["window_start_price"]),
             best_bid_up=_f(row.get("best_bid_up")),
             best_ask_up=_f(row.get("best_ask_up")),
@@ -228,9 +235,10 @@ class DiffusionSignal(Signal):
         vol_lookback_s: int = 20,
         min_sigma: float = 1e-6,
         edge_threshold: float = 0.10,
-        early_edge_mult: float = 5.0,
+        early_edge_mult: float = 4.0,
         window_duration: float = 900.0,
         max_bet_fraction: float = 0.0125,
+        min_order_usd: float = 1.0,
         kelly_fraction: float = 0.25,
         slippage: float = 0.0,
         max_z: float = 2.0,
@@ -247,6 +255,7 @@ class DiffusionSignal(Signal):
         self.early_edge_mult = early_edge_mult
         self.window_duration = window_duration
         self.max_bet_fraction = max_bet_fraction
+        self.min_order_usd = min_order_usd
         self.kelly_fraction = kelly_fraction
         self.slippage = slippage
         self.max_z = max_z
@@ -257,20 +266,38 @@ class DiffusionSignal(Signal):
         self.vol_regime_mult = vol_regime_mult
 
     def _compute_vol(self, prices: list[float]) -> float:
-        """Realized vol (std of log returns) from a price series."""
-        log_ret = [
-            math.log(prices[i] / prices[i - 1])
-            for i in range(1, len(prices))
-            if prices[i - 1] > 0 and prices[i] > 0
-        ]
-        if len(log_ret) < 2:
+        """Realized vol from price series, ignoring stale (duplicate) ticks.
+
+        Chainlink oracle updates irregularly. Between updates the same
+        price is recorded every tick, producing zero-returns that
+        artificially deflate sigma.  We skip consecutive duplicates and
+        normalize each return by sqrt(dt) to get per-second volatility.
+        """
+        # Collect (index, price) for each actual price change
+        changes: list[tuple[int, float]] = []
+        for i, p in enumerate(prices):
+            if p > 0 and (not changes or p != changes[-1][1]):
+                changes.append((i, p))
+
+        if len(changes) < 3:
             return 0.0
-        return max(float(np.std(log_ret, ddof=1)), self.min_sigma)
+
+        # Time-normalized log returns
+        log_rets = []
+        for j in range(1, len(changes)):
+            dt = changes[j][0] - changes[j-1][0]   # ticks ≈ seconds
+            if dt > 0:
+                lr = math.log(changes[j][1] / changes[j-1][1])
+                log_rets.append(lr / math.sqrt(dt))
+
+        if len(log_rets) < 2:
+            return 0.0
+        return max(float(np.std(log_rets, ddof=1)), self.min_sigma)
 
     def decide(self, snapshot: Snapshot, ctx: dict) -> Decision:
         # Build price history
         hist = ctx.setdefault("price_history", [])
-        hist.append(snapshot.chainlink_btc)
+        hist.append(snapshot.chainlink_price)
 
         if len(hist) < max(2, self.vol_lookback_s):
             return Decision("FLAT", 0.0, 0.0,
@@ -318,7 +345,7 @@ class DiffusionSignal(Signal):
                     f"{self.vol_regime_mult}x baseline {sigma_baseline:.2e})")
 
         # Model probability (z capped to prevent overconfidence)
-        delta = snapshot.chainlink_btc - snapshot.window_start_price
+        delta = snapshot.chainlink_price - snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = norm_cdf(z)
@@ -398,11 +425,19 @@ class DiffusionSignal(Signal):
 
         size_usd = self.bankroll * frac
 
+        # Floor to exchange minimum, skip if bankroll can't cover it
+        if size_usd < self.min_order_usd:
+            if self.bankroll >= self.min_order_usd:
+                size_usd = self.min_order_usd
+            else:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"bankroll ${self.bankroll:.2f} < min order ${self.min_order_usd}")
+
         # Store expected price range in ctx for the engine to attach to Fill
-        btc = snapshot.chainlink_btc
-        move_1sig = sigma_per_s * math.sqrt(tau) * btc
+        price = snapshot.chainlink_price
+        move_1sig = sigma_per_s * math.sqrt(tau) * price
         ctx["_expected_range"] = {
-            "btc_at_fill": btc,
+            "btc_at_fill": price,
             "start_price": snapshot.window_start_price,
             "expected_low": snapshot.window_start_price - move_1sig,
             "expected_high": snapshot.window_start_price + move_1sig,
@@ -470,7 +505,14 @@ class BacktestEngine:
         self.bankroll = initial_bankroll
 
     def load_data(self) -> pd.DataFrame:
+        if not self.data_dir.exists() or not any(self.data_dir.glob("*.parquet")):
+            return pd.DataFrame()
         df = pd.read_parquet(self.data_dir)
+        if df.empty:
+            return df
+        # Backward compat: rename old column name
+        if "chainlink_btc" in df.columns and "chainlink_price" not in df.columns:
+            df.rename(columns={"chainlink_btc": "chainlink_price"}, inplace=True)
         df.sort_values("ts_ms", inplace=True, ignore_index=True)
         df.drop_duplicates(subset=["market_slug", "ts_ms"], keep="last", inplace=True)
         df.reset_index(drop=True, inplace=True)
@@ -487,7 +529,8 @@ class BacktestEngine:
             return None
         start_price = start_price.iloc[0]
 
-        final_btc = float(window_df["chainlink_btc"].iloc[-1])
+        price_col = "chainlink_price" if "chainlink_price" in window_df.columns else "chainlink_btc"
+        final_btc = float(window_df[price_col].iloc[-1])
         if pd.isna(final_btc) or pd.isna(start_price):
             return None
 
@@ -542,7 +585,7 @@ class BacktestEngine:
             cost_usd=total_cost,
             signal_name=self.signal.name,
             decision_reason=decision.reason,
-            btc_at_fill=rng.get("btc_at_fill", snap.chainlink_btc),
+            btc_at_fill=rng.get("btc_at_fill", snap.chainlink_price),
             start_price=rng.get("start_price", snap.window_start_price),
             expected_low=rng.get("expected_low", 0.0),
             expected_high=rng.get("expected_high", 0.0),
@@ -608,6 +651,10 @@ class BacktestEngine:
 
     def run(self) -> tuple[list[TradeResult], dict, pd.DataFrame]:
         df = self.load_data()
+        if df.empty:
+            print("  No data found.")
+            metrics = self._compute_metrics([], [self.bankroll])
+            return [], metrics, pd.DataFrame()
         slugs = df["market_slug"].unique()
         results: list[TradeResult] = []
         self.bankroll = self.initial_bankroll
@@ -748,6 +795,7 @@ def run_sensitivity(
     initial_bankroll: float = 10_000.0,
     latency_grid: list[int] | None = None,
     slippage_grid: list[float] | None = None,
+    data_dir: Path = DATA_DIR,
 ) -> pd.DataFrame:
     if latency_grid is None:
         latency_grid = [0, 250, 500, 1000]
@@ -765,6 +813,7 @@ def run_sensitivity(
             signal = DiffusionSignal(bankroll=initial_bankroll, slippage=slip)
             engine = BacktestEngine(
                 signal=signal,
+                data_dir=data_dir,
                 latency_ms=lat,
                 slippage=slip,
                 initial_bankroll=initial_bankroll,
@@ -818,7 +867,10 @@ def print_summary(metrics: dict, trades_df: pd.DataFrame):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Polymarket BTC Up/Down Backtest")
+    parser = argparse.ArgumentParser(description="Polymarket Up/Down Backtest")
+    parser.add_argument("--market", default=DEFAULT_MARKET,
+                        choices=list(MARKET_CONFIGS),
+                        help="Market to backtest (default: btc)")
     parser.add_argument("--bankroll", type=float, default=10_000.0)
     parser.add_argument("--signal", default="diffusion",
                         choices=["diffusion", "always_up", "always_down", "random", "all"])
@@ -828,9 +880,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    config = get_config(args.market)
+    data_dir = DATA_DIR / config.data_subdir
+
     if args.sensitivity:
-        print("Running sensitivity analysis...\n")
-        sens_df = run_sensitivity(initial_bankroll=args.bankroll)
+        print(f"Running sensitivity analysis ({config.display_name})...\n")
+        sens_df = run_sensitivity(initial_bankroll=args.bankroll, data_dir=data_dir)
         print(f"\n{'='*62}")
         print("  SENSITIVITY GRID (DiffusionSignal)")
         print(f"{'='*62}")
@@ -854,12 +909,13 @@ def main():
         signal = signal_map[name]()
         engine = BacktestEngine(
             signal=signal,
+            data_dir=data_dir,
             latency_ms=args.latency,
             slippage=args.slippage,
             initial_bankroll=args.bankroll,
         )
         print(f"\n{'='*62}")
-        print(f"  Running: {signal.name}")
+        print(f"  Running: {signal.name} ({config.display_name})")
         print(f"{'='*62}")
         _, metrics, trades_df = engine.run()
         print_summary(metrics, trades_df)

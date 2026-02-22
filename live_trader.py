@@ -169,12 +169,20 @@ def build_clob_client() -> ClobClient:
 
 
 def query_usdc_balance(client: ClobClient) -> float | None:
-    """Fetch current USDC (collateral) balance from the CLOB API."""
+    """Fetch current USDC (collateral) balance from the CLOB API.
+
+    The API returns balance in micro-USDC (6 decimal places),
+    so we divide by 1e6 to get USD.
+    """
     try:
         resp = client.get_balance_allowance(
             BalanceAllowanceParams(asset_type="COLLATERAL")
         )
-        return float(resp.get("balance", 0))
+        raw = float(resp.get("balance", 0))
+        # API returns micro-USDC (6 decimals); convert to USD
+        if raw > 1_000_000:  # clearly micro-USDC, not USD
+            return raw / 1e6
+        return raw
     except Exception as exc:
         if DEBUG:
             print(f"  [BALANCE] error: {exc}")
@@ -354,7 +362,7 @@ class LiveTradeTracker:
         self.last_decision: Decision = Decision("FLAT", 0.0, 0.0, "initializing")
         self.last_price_update_ts: float = 0.0
         self.window_trade_count: int = 0
-        self.min_order_usd: float = 1.0  # Polymarket FOK minimum
+        self.min_order_shares: float = 5.0  # Polymarket min_order_size
 
         # Session stats
         self.windows_seen: int = 0
@@ -525,14 +533,19 @@ class LiveTradeTracker:
         if amount_usd <= 0:
             return
 
-        # Ensure order meets Polymarket's FOK minimum ($1 USD)
-        if amount_usd < 1.0:
-            if self.bankroll >= 1.0:
-                amount_usd = 1.0
+        # Ensure order meets Polymarket's minimum (5 shares)
+        if decision.action == "BUY_UP":
+            ask_px = snapshot.best_ask_up
+        else:
+            ask_px = snapshot.best_ask_down
+        min_usd = 5.0 * ask_px if ask_px and ask_px > 0 else 1.0
+        if amount_usd < min_usd:
+            if self.bankroll >= min_usd:
+                amount_usd = round(min_usd, 2)
             else:
                 self._log({
                     "type": "skip",
-                    "reason": f"bankroll ${self.bankroll:.2f} < $1 FOK minimum",
+                    "reason": f"bankroll ${self.bankroll:.2f} < min order ${min_usd:.2f} (5 shares)",
                 })
                 return
 
@@ -740,8 +753,13 @@ class LiveTradeTracker:
             for f in self.pending_fills
         )
         if has_winning and self.condition_id:
-            print("  Redeeming winning positions on-chain...")
+            # Wait for on-chain resolution to propagate before attempting redeem
+            print(f"  Waiting 15s for on-chain resolution (conditionId: {self.condition_id[:10]}...)...")
+            _time.sleep(15)
             self.redeem_positions(self.condition_id)
+        elif has_winning and not self.condition_id:
+            print("  WARNING: Won but no conditionId — cannot auto-redeem. "
+                  "Claim manually on Polymarket.")
 
         # Update drawdown
         if self.bankroll > self.peak_bankroll:
@@ -790,10 +808,12 @@ class LiveTradeTracker:
         except Exception as exc:
             print(f"  Warning: cancel_all failed: {exc}")
 
-    def redeem_positions(self, condition_id: str) -> str | None:
+    def redeem_positions(self, condition_id: str,
+                         max_retries: int = 3) -> str | None:
         """Call CTF.redeemPositions() on-chain to convert winning tokens to USDC.
 
         Routes through the proxy wallet (sig type 1) or direct EOA (sig type 0).
+        Retries on failure since on-chain resolution may still be propagating.
         Returns the tx hash on success, None on failure.
         """
         if DRY_RUN:
@@ -804,6 +824,22 @@ class LiveTradeTracker:
             print("  [REDEEM] Skipped (no conditionId)")
             return None
 
+        for attempt in range(max_retries):
+            if attempt > 0:
+                delay = 20 * attempt
+                print(f"  [REDEEM] Retry {attempt + 1}/{max_retries} in {delay}s...")
+                _time.sleep(delay)
+
+            result = self._try_redeem_once(condition_id)
+            if result is not None:
+                return result
+
+        print(f"  [REDEEM] Failed after {max_retries} attempts. "
+              f"Claim manually on Polymarket.")
+        return None
+
+    def _try_redeem_once(self, condition_id: str) -> str | None:
+        """Single attempt at on-chain CTF redemption."""
         try:
             w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
             if not w3.is_connected():
@@ -819,6 +855,14 @@ class LiveTradeTracker:
             sig_type = int(os.getenv("SIGNATURE_TYPE", "1"))
             funder = os.getenv("POLY_FUNDER", "")
 
+            # Check gas balance
+            pol_balance = w3.eth.get_balance(signer.address)
+            if pol_balance < w3.to_wei(0.001, "ether"):
+                print(f"  [REDEEM] ERROR: Insufficient POL for gas "
+                      f"({w3.from_wei(pol_balance, 'ether'):.6f} POL). "
+                      f"Send POL to {signer.address}")
+                return None
+
             # Encode CTF.redeemPositions(USDC, 0x0, conditionId, [1, 2])
             ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
             condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
@@ -831,6 +875,16 @@ class LiveTradeTracker:
                     [1, 2],  # indexSets: both outcomes
                 ],
             )
+
+            # Convert encode_abi output to raw bytes reliably.
+            # web3.py may return hex string ("0x...") or HexBytes.
+            if isinstance(redeem_data, str):
+                redeem_bytes = bytes.fromhex(
+                    redeem_data[2:] if redeem_data.startswith("0x")
+                    else redeem_data
+                )
+            else:
+                redeem_bytes = bytes(redeem_data)
 
             if sig_type == 0:
                 # EOA: send tx directly to CTF contract
@@ -850,7 +904,7 @@ class LiveTradeTracker:
                 proxy_contract = w3.eth.contract(address=proxy_addr, abi=PROXY_ABI)
                 proxy_call_data = proxy_contract.encode_abi(
                     "proxy",
-                    args=[[(CTF_ADDRESS, 0, bytes.fromhex(redeem_data[2:]))]],
+                    args=[[(CTF_ADDRESS, 0, redeem_bytes)]],
                 )
                 tx = {
                     "to": proxy_addr,
@@ -863,6 +917,8 @@ class LiveTradeTracker:
                     "chainId": CHAIN_ID,
                 }
 
+            print(f"  [REDEEM] Sending tx (sig_type={sig_type}, "
+                  f"conditionId={condition_id[:10]}...)...")
             signed_tx = w3.eth.account.sign_transaction(tx, private_key)
             tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             tx_hash_hex = tx_hash.hex()
@@ -886,7 +942,8 @@ class LiveTradeTracker:
                 })
                 return tx_hash_hex
             else:
-                print(f"  [REDEEM] ERROR: Tx reverted (hash: {tx_hash_hex})")
+                print(f"  [REDEEM] Tx reverted (hash: {tx_hash_hex}) — "
+                      f"market may not be resolved on-chain yet")
                 self._log({
                     "type": "redemption",
                     "ts": datetime.now(timezone.utc).isoformat(),
@@ -895,6 +952,17 @@ class LiveTradeTracker:
                     "status": "reverted",
                 })
                 return None
+
+        except ContractLogicError as exc:
+            print(f"  [REDEEM] Contract reverted: {exc}")
+            self._log({
+                "type": "redemption",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "condition_id": condition_id,
+                "status": "contract_error",
+                "error": str(exc),
+            })
+            return None
 
         except Exception as exc:
             print(f"  [REDEEM] ERROR: {type(exc).__name__}: {exc}")
@@ -1159,7 +1227,8 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event,
                             continue
 
                         payload = msg.get("payload", {})
-                        if payload.get("symbol") not in (config.chainlink_symbol, None):
+                        symbol = payload.get("symbol")
+                        if symbol is None or symbol != config.chainlink_symbol:
                             continue
 
                         data_arr = payload.get("data")
@@ -1396,7 +1465,15 @@ async def display_ticker(
 
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
 
-async def run_window(tracker: LiveTradeTracker, config: MarketConfig):
+async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
+                     price_state: dict):
+    """Run a single 15-minute trading window.
+
+    price_state is a shared dict continuously updated by the persistent RTDS
+    websocket. At window start we snapshot the current live price as the
+    window_start_price, which is much more accurate than carrying a stale
+    price from after the previous window's RTDS disconnected.
+    """
     print(f"  Searching for active {config.display_name} 15-minute market...")
     event, market = find_market(config)
 
@@ -1427,7 +1504,14 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig):
 
     book_up = OrderBook()
     book_down = OrderBook()
-    price_state = {"price": None, "window_start_price": None}
+
+    # Snapshot the current live RTDS price as this window's start price.
+    # Because RTDS stays connected across window transitions, this is
+    # the most recent oracle price (~1-2s old at most), far more accurate
+    # than the old approach of carrying a stale price across a reconnection gap.
+    current_price = price_state.get("price")
+    price_state["window_start_price"] = current_price
+
     flat_state = {
         "up_best_bid": None, "up_best_ask": None,
         "down_best_bid": None, "down_best_ask": None,
@@ -1450,7 +1534,11 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig):
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     print(f"  [{mode}] Market: {title}")
     print(f"  Window:   {start.strftime('%H:%M:%S')} -> {end.strftime('%H:%M:%S')} UTC")
-    print(f"  Bankroll: ${tracker.bankroll:,.2f}  |  Min order: ${tracker.min_order_usd:.0f} FOK")
+    if current_price is not None:
+        print(f"  Start price: ${current_price:,.2f} (live RTDS)")
+    else:
+        print(f"  Start price: waiting for RTDS...")
+    print(f"  Bankroll: ${tracker.bankroll:,.2f}  |  Min order: {tracker.min_order_shares:.0f} shares")
 
     cancel = asyncio.Event()
     tasks = [
@@ -1458,9 +1546,7 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig):
             clob_ws(up_token, down_token, book_up, book_down,
                     flat_state, cancel)
         ),
-        asyncio.create_task(
-            rtds_ws(price_state, cancel, config, tracker)
-        ),
+        # RTDS runs persistently in run() — NOT per-window
         asyncio.create_task(
             signal_ticker(tracker, book_up, book_down, price_state,
                           end, slug, up_token, down_token, cancel,
@@ -1494,8 +1580,26 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig):
 
 
 async def run(tracker: LiveTradeTracker, config: MarketConfig):
-    while True:
-        await run_window(tracker, config)
+    # Shared price state that persists across windows.
+    # The RTDS websocket continuously updates 'price'; at each window
+    # transition run_window() snapshots it as 'window_start_price'.
+    # Keeping RTDS persistent eliminates the reconnection gap that caused
+    # stale "Price to Beat" values ($20+ errors).
+    price_state: dict = {"price": None, "window_start_price": None}
+
+    # Persistent RTDS connection — stays alive across window transitions
+    rtds_cancel = asyncio.Event()
+    rtds_task = asyncio.create_task(
+        rtds_ws(price_state, rtds_cancel, config, tracker)
+    )
+
+    try:
+        while True:
+            await run_window(tracker, config, price_state)
+    finally:
+        rtds_cancel.set()
+        rtds_task.cancel()
+        await asyncio.gather(rtds_task, return_exceptions=True)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -1577,7 +1681,17 @@ def main():
             bankroll = 10_000.0
             print(f"  WARNING: Could not query balance, using default ${bankroll:,.0f}")
 
-    signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage)
+    # Per-market signal overrides (ETH needs tighter filters due to mean reversion)
+    signal_kw: dict = {}
+    if args.market == "eth":
+        signal_kw = dict(
+            edge_threshold=0.15,        # higher bar (BTC default 0.10)
+            reversion_discount=0.15,    # ETH mean-reverts ~33%, discount p toward 0.5
+            momentum_lookback_s=15,     # shorter lookback (ETH oscillates more)
+            momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
+            spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
+        )
+    signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
     tracker = LiveTradeTracker(
         client=client,
         signal=signal,

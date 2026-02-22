@@ -238,7 +238,7 @@ class DiffusionSignal(Signal):
         early_edge_mult: float = 4.0,
         window_duration: float = 900.0,
         max_bet_fraction: float = 0.0125,
-        min_order_usd: float = 1.0,
+        min_order_shares: float = 5.0,
         kelly_fraction: float = 0.25,
         slippage: float = 0.0,
         max_z: float = 2.0,
@@ -247,6 +247,9 @@ class DiffusionSignal(Signal):
         spread_edge_penalty: float = 1.0,
         vol_regime_lookback_s: int = 120,
         vol_regime_mult: float = 3.0,
+        max_entry_time_s: float | None = None,
+        reversion_discount: float = 0.0,
+        momentum_majority: float = 1.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -255,7 +258,7 @@ class DiffusionSignal(Signal):
         self.early_edge_mult = early_edge_mult
         self.window_duration = window_duration
         self.max_bet_fraction = max_bet_fraction
-        self.min_order_usd = min_order_usd
+        self.min_order_shares = min_order_shares
         self.kelly_fraction = kelly_fraction
         self.slippage = slippage
         self.max_z = max_z
@@ -264,6 +267,9 @@ class DiffusionSignal(Signal):
         self.spread_edge_penalty = spread_edge_penalty
         self.vol_regime_lookback_s = vol_regime_lookback_s
         self.vol_regime_mult = vol_regime_mult
+        self.max_entry_time_s = max_entry_time_s
+        self.reversion_discount = reversion_discount
+        self.momentum_majority = momentum_majority
 
     def _compute_vol(self, prices: list[float]) -> float:
         """Realized vol from price series, ignoring stale (duplicate) ticks.
@@ -324,6 +330,11 @@ class DiffusionSignal(Signal):
         if tau <= 0:
             return Decision("FLAT", 0.0, 0.0, "window expired")
 
+        # Late-entry gate: only trade when time remaining <= max_entry_time_s
+        if self.max_entry_time_s is not None and tau > self.max_entry_time_s:
+            return Decision("FLAT", 0.0, 0.0,
+                f"too early ({tau:.0f}s left > {self.max_entry_time_s:.0f}s gate)")
+
         # Dynamic edge threshold: higher early, decays with sqrt(tau)
         # At tau=900s: base * (1 + mult), at tau=0: base
         dyn_threshold = self.edge_threshold * (
@@ -350,6 +361,10 @@ class DiffusionSignal(Signal):
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = norm_cdf(z)
 
+        # Mean-reversion discount: pull p_model toward 0.5
+        if self.reversion_discount > 0:
+            p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
+
         # Effective costs
         p_up_cost = ask_up + poly_fee(ask_up) + self.slippage
         p_down_cost = ask_down + poly_fee(ask_down) + self.slippage
@@ -367,21 +382,23 @@ class DiffusionSignal(Signal):
                             f"no edge (up={edge_up:.4f} down={edge_down:.4f} "
                             f"thresh={dyn_threshold:.4f})")
 
-        # Momentum confirmation: delta must be same-sign for the
-        # entire lookback window — prevents whipsawing when BTC
+        # Momentum confirmation: majority of recent prices must be on
+        # the same side of start price — prevents whipsawing when price
         # oscillates near the start price.
         start_px = snapshot.window_start_price
         mom_n = min(self.momentum_lookback_s, len(hist))
         if mom_n >= 2:
             mom_prices = hist[-mom_n:]
             if side == "BUY_UP":
-                if not all(p >= start_px for p in mom_prices):
+                frac_ok = sum(1 for p in mom_prices if p >= start_px) / len(mom_prices)
+                if frac_ok < self.momentum_majority:
                     return Decision("FLAT", 0.0, 0.0,
-                        f"momentum fail: BTC crossed below start in last {mom_n}s")
+                        f"momentum fail: only {frac_ok:.0%} above start in last {mom_n}s")
             else:
-                if not all(p <= start_px for p in mom_prices):
+                frac_ok = sum(1 for p in mom_prices if p <= start_px) / len(mom_prices)
+                if frac_ok < self.momentum_majority:
                     return Decision("FLAT", 0.0, 0.0,
-                        f"momentum fail: BTC crossed above start in last {mom_n}s")
+                        f"momentum fail: only {frac_ok:.0%} below start in last {mom_n}s")
 
         # Order book imbalance: require buy pressure on the chosen side
         # imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
@@ -425,13 +442,14 @@ class DiffusionSignal(Signal):
 
         size_usd = self.bankroll * frac
 
-        # Floor to exchange minimum, skip if bankroll can't cover it
-        if size_usd < self.min_order_usd:
-            if self.bankroll >= self.min_order_usd:
-                size_usd = self.min_order_usd
+        # Floor to exchange minimum (5 shares), skip if bankroll can't cover
+        min_usd = self.min_order_shares * eff_price
+        if size_usd < min_usd:
+            if self.bankroll >= min_usd:
+                size_usd = min_usd
             else:
                 return Decision("FLAT", 0.0, 0.0,
-                    f"bankroll ${self.bankroll:.2f} < min order ${self.min_order_usd}")
+                    f"bankroll ${self.bankroll:.2f} < min order ${min_usd:.2f} (5 shares)")
 
         # Store expected price range in ctx for the engine to attach to Fill
         price = snapshot.chainlink_price
@@ -496,6 +514,7 @@ class BacktestEngine:
         latency_ms: int = 0,
         slippage: float = 0.0,
         initial_bankroll: float = 10_000.0,
+        max_trades_per_window: int | None = None,
     ):
         self.signal = signal
         self.data_dir = data_dir
@@ -503,16 +522,26 @@ class BacktestEngine:
         self.slippage = slippage
         self.initial_bankroll = initial_bankroll
         self.bankroll = initial_bankroll
+        self.max_trades_per_window = max_trades_per_window
 
     def load_data(self) -> pd.DataFrame:
         if not self.data_dir.exists() or not any(self.data_dir.glob("*.parquet")):
             return pd.DataFrame()
-        df = pd.read_parquet(self.data_dir)
+        # Read each file individually and normalize column names before
+        # concatenating.  Older files use "chainlink_btc", newer ones use
+        # "chainlink_price".  Pyarrow drops mismatched columns when reading
+        # a directory of mixed-schema parquets, so we must handle it here.
+        frames = []
+        for f in sorted(self.data_dir.glob("*.parquet")):
+            part = pd.read_parquet(f)
+            if "chainlink_btc" in part.columns and "chainlink_price" not in part.columns:
+                part.rename(columns={"chainlink_btc": "chainlink_price"}, inplace=True)
+            frames.append(part)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
         if df.empty:
             return df
-        # Backward compat: rename old column name
-        if "chainlink_btc" in df.columns and "chainlink_price" not in df.columns:
-            df.rename(columns={"chainlink_btc": "chainlink_price"}, inplace=True)
         df.sort_values("ts_ms", inplace=True, ignore_index=True)
         df.drop_duplicates(subset=["market_slug", "ts_ms"], keep="last", inplace=True)
         df.reset_index(drop=True, inplace=True)
@@ -622,6 +651,10 @@ class BacktestEngine:
             # Cooldown between bets
             if snap.ts_ms - last_fill_ts < cooldown_ms and last_fill_ts > 0:
                 continue
+
+            # Max trades per window
+            if self.max_trades_per_window is not None and len(results) >= self.max_trades_per_window:
+                break
 
             # Run signal
             decision = self.signal.decide(snap, ctx)
@@ -827,22 +860,6 @@ def run_sensitivity(
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def print_summary(metrics: dict, trades_df: pd.DataFrame):
-    print(f"\n{'='*62}")
-    print(f"  BACKTEST SUMMARY: {metrics['signal']}")
-    print(f"{'='*62}")
-    print(f"  Bankroll:       ${metrics['initial_bankroll']:,.0f} -> ${metrics['final_bankroll']:,.2f}")
-    print(f"  Latency:        {metrics['latency_ms']}ms  |  Slippage: {metrics['slippage']}")
-    print(f"  Trades:         {metrics['n_trades']}")
-    print(f"  Win rate:       {metrics['win_rate']:.1%}")
-    print(f"  Total PnL:      ${metrics['total_pnl']:+.2f}")
-    print(f"  Total fees:     ${metrics['total_fees']:.2f}")
-    print(f"  Avg PnL/trade:  ${metrics['avg_pnl']:+.2f}")
-    print(f"  Avg win:        ${metrics['avg_win']:+.2f}")
-    print(f"  Avg loss:       ${metrics['avg_loss']:+.2f}")
-    print(f"  Max drawdown:   ${metrics['max_drawdown']:.2f} ({metrics['max_dd_pct']:.1%})")
-    print(f"  Sharpe (ann.):  {metrics['sharpe']:.2f}")
-    print(f"{'='*62}")
-
     if not trades_df.empty:
         print("\n  Per-trade detail:")
         print("-" * 72)
@@ -864,6 +881,22 @@ def print_summary(metrics: dict, trades_df: pd.DataFrame):
             print(f"    PnL:         ${t['pnl']:+.2f} ({t['pnl_pct']:+.2%})")
             print(f"    Reason:      {t['reason']}")
             print("-" * 72)
+
+    print(f"\n{'='*62}")
+    print(f"  BACKTEST SUMMARY: {metrics['signal']}")
+    print(f"{'='*62}")
+    print(f"  Bankroll:       ${metrics['initial_bankroll']:,.0f} -> ${metrics['final_bankroll']:,.2f}")
+    print(f"  Latency:        {metrics['latency_ms']}ms  |  Slippage: {metrics['slippage']}")
+    print(f"  Trades:         {metrics['n_trades']}")
+    print(f"  Win rate:       {metrics['win_rate']:.1%}")
+    print(f"  Total PnL:      ${metrics['total_pnl']:+.2f}")
+    print(f"  Total fees:     ${metrics['total_fees']:.2f}")
+    print(f"  Avg PnL/trade:  ${metrics['avg_pnl']:+.2f}")
+    print(f"  Avg win:        ${metrics['avg_win']:+.2f}")
+    print(f"  Avg loss:       ${metrics['avg_loss']:+.2f}")
+    print(f"  Max drawdown:   ${metrics['max_drawdown']:.2f} ({metrics['max_dd_pct']:.1%})")
+    print(f"  Sharpe (ann.):  {metrics['sharpe']:.2f}")
+    print(f"{'='*62}")
 
 
 def main():
@@ -894,9 +927,22 @@ def main():
         print(sens_df[cols].to_string(index=False))
         return
 
+    # Per-market signal overrides (ETH needs tighter filters due to mean reversion)
+    eth_overrides = {}
+    eth_engine_kw = {}
+    if args.market == "eth":
+        eth_overrides = dict(
+            edge_threshold=0.15,        # higher bar (BTC default 0.10)
+            reversion_discount=0.15,    # ETH mean-reverts ~33%, discount p toward 0.5
+            momentum_lookback_s=15,     # shorter lookback (ETH oscillates more)
+            momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
+            spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
+        )
+        eth_engine_kw = dict(max_trades_per_window=1)
+
     signal_map = {
         "diffusion": lambda: DiffusionSignal(
-            bankroll=args.bankroll, slippage=args.slippage),
+            bankroll=args.bankroll, slippage=args.slippage, **eth_overrides),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),
         "random": lambda: RandomCoinFlip(bankroll=args.bankroll, seed=args.seed),
@@ -913,6 +959,7 @@ def main():
             latency_ms=args.latency,
             slippage=args.slippage,
             initial_bankroll=args.bankroll,
+            **eth_engine_kw,
         )
         print(f"\n{'='*62}")
         print(f"  Running: {signal.name} ({config.display_name})")

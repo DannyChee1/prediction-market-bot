@@ -381,7 +381,8 @@ async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
                             continue
 
                         payload = msg.get("payload", {})
-                        if payload.get("symbol") not in (config.chainlink_symbol, None):
+                        symbol = payload.get("symbol")
+                        if symbol is None or symbol != config.chainlink_symbol:
                             continue
 
                         # Single streaming update

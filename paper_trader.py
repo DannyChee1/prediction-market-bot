@@ -54,8 +54,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RTDS_WS = "wss://ws-live-data.polymarket.com"
 
-TRADES_LOG = Path("paper_trades.jsonl")   # overridden per-market in main()
-STATE_FILE = Path("paper_state.json")    # overridden per-market in main()
+TRADES_LOG = Path("paper/paper_trades.jsonl")   # overridden per-market in main()
+STATE_FILE = Path("paper/paper_state.json")    # overridden per-market in main()
 
 DEBUG = False
 
@@ -919,8 +919,13 @@ async def display_ticker(
 
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
 
-async def run_window(tracker: PaperTradeTracker, config: MarketConfig):
-    """Run one 15-minute market window."""
+async def run_window(tracker: PaperTradeTracker, config: MarketConfig,
+                     price_state: dict):
+    """Run one 15-minute market window.
+
+    price_state is a shared dict continuously updated by the persistent RTDS
+    websocket, ensuring accurate start prices across window transitions.
+    """
     print(f"  Searching for active {config.display_name} 15-minute market...")
     event, market = find_market(config)
 
@@ -945,10 +950,11 @@ async def run_window(tracker: PaperTradeTracker, config: MarketConfig):
     # Initialize per-window state
     book_up = OrderBook()
     book_down = OrderBook()
-    price_state = {
-        "price": None,
-        "window_start_price": None,
-    }
+
+    # Snapshot the current live RTDS price as this window's start price
+    current_price = price_state.get("price")
+    price_state["window_start_price"] = current_price
+
     flat_state = {
         "up_best_bid": None,
         "up_best_ask": None,
@@ -975,6 +981,10 @@ async def run_window(tracker: PaperTradeTracker, config: MarketConfig):
         f"  Window:   {start.strftime('%H:%M:%S')}"
         f" -> {end.strftime('%H:%M:%S')} UTC"
     )
+    if current_price is not None:
+        print(f"  Start:    ${current_price:,.2f} (live RTDS)")
+    else:
+        print(f"  Start:    waiting for RTDS...")
     print(f"  Bankroll: ${tracker.bankroll:,.2f}")
 
     cancel = asyncio.Event()
@@ -983,7 +993,7 @@ async def run_window(tracker: PaperTradeTracker, config: MarketConfig):
             clob_ws(up_token, down_token, book_up, book_down,
                      flat_state, cancel)
         ),
-        asyncio.create_task(rtds_ws(price_state, cancel, config)),
+        # RTDS runs persistently in run() — NOT per-window
         asyncio.create_task(
             signal_ticker(tracker, book_up, book_down, price_state,
                           end, slug, cancel,
@@ -1014,9 +1024,21 @@ async def run_window(tracker: PaperTradeTracker, config: MarketConfig):
 
 
 async def run(tracker: PaperTradeTracker, config: MarketConfig):
-    """Main loop: run windows continuously."""
-    while True:
-        await run_window(tracker, config)
+    """Main loop: persistent RTDS + per-window trading."""
+    price_state: dict = {"price": None, "window_start_price": None}
+
+    rtds_cancel = asyncio.Event()
+    rtds_task = asyncio.create_task(
+        rtds_ws(price_state, rtds_cancel, config)
+    )
+
+    try:
+        while True:
+            await run_window(tracker, config, price_state)
+    finally:
+        rtds_cancel.set()
+        rtds_task.cancel()
+        await asyncio.gather(rtds_task, return_exceptions=True)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -1057,8 +1079,8 @@ def main():
 
     config = get_config(args.market)
     # Per-market state files to avoid clobber when running BTC + ETH simultaneously
-    TRADES_LOG = Path(f"paper_trades_{config.data_subdir}.jsonl")
-    STATE_FILE = Path(f"paper_state_{config.data_subdir}.json")
+    TRADES_LOG = Path(f"paper/paper_trades_{config.data_subdir}.jsonl")
+    STATE_FILE = Path(f"paper/paper_state_{config.data_subdir}.json")
 
     bankroll = args.bankroll
     saved = None

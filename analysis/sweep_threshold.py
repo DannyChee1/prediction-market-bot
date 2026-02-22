@@ -21,7 +21,7 @@ def run_sweep(early_mult, max_trades):
     signal = DiffusionSignal(
         bankroll=BANKROLL,
         early_edge_mult=early_mult,
-        min_order_usd=1.0,
+        min_order_shares=5.0,
     )
     engine = BacktestEngine(
         signal=signal,

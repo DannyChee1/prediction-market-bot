@@ -1,0 +1,9 @@
+.env
+__pycache__/
+.venv/
+.ipynb_checkpoints/
+.claude/
+data/
+paper/
+live_state_*.json
+live_trades_*.jsonl

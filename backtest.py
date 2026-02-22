@@ -230,8 +230,8 @@ class DiffusionSignal(Signal):
         edge_threshold: float = 0.10,
         early_edge_mult: float = 5.0,
         window_duration: float = 900.0,
-        max_bet_fraction: float = 0.05,
-        kelly_fraction: float = 0.5,
+        max_bet_fraction: float = 0.0125,
+        kelly_fraction: float = 0.25,
         slippage: float = 0.0,
         max_z: float = 2.0,
         momentum_lookback_s: int = 30,
@@ -369,6 +369,23 @@ class DiffusionSignal(Signal):
         if imbalance < 0:
             return Decision("FLAT", 0.0, 0.0,
                 f"imbalance disagrees ({imbalance:+.3f} for {side})")
+
+        # Delta velocity: require price moving in the direction of the bet.
+        # OLS slope over last 30s of BTC prices.
+        vel_n = min(30, len(hist))
+        if vel_n >= 5:
+            recent = hist[-vel_n:]
+            x_mean = (vel_n - 1) / 2.0
+            y_mean = sum(recent) / vel_n
+            num = sum((i - x_mean) * (p - y_mean) for i, p in enumerate(recent))
+            den = sum((i - x_mean) ** 2 for i in range(vel_n))
+            slope = num / den if den > 0 else 0.0
+            if side == "BUY_UP" and slope < 0:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"delta velocity disagrees (slope={slope:+.2f} $/s for BUY_UP)")
+            elif side == "BUY_DOWN" and slope > 0:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"delta velocity disagrees (slope={slope:+.2f} $/s for BUY_DOWN)")
 
         if eff_price >= 1.0:
             return Decision("FLAT", 0.0, 0.0, "eff price >= 1")

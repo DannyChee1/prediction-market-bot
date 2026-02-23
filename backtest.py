@@ -235,6 +235,7 @@ class DiffusionSignal(Signal):
         vol_lookback_s: int = 20,
         min_sigma: float = 1e-6,
         edge_threshold: float = 0.10,
+        edge_threshold_step: float = 0.0,
         early_edge_mult: float = 4.0,
         window_duration: float = 900.0,
         max_bet_fraction: float = 0.0125,
@@ -250,11 +251,13 @@ class DiffusionSignal(Signal):
         max_entry_time_s: float | None = None,
         reversion_discount: float = 0.0,
         momentum_majority: float = 1.0,
+        maker_mode: bool = False,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
         self.min_sigma = min_sigma
         self.edge_threshold = edge_threshold
+        self.edge_threshold_step = edge_threshold_step
         self.early_edge_mult = early_edge_mult
         self.window_duration = window_duration
         self.max_bet_fraction = max_bet_fraction
@@ -270,6 +273,7 @@ class DiffusionSignal(Signal):
         self.max_entry_time_s = max_entry_time_s
         self.reversion_discount = reversion_discount
         self.momentum_majority = momentum_majority
+        self.maker_mode = maker_mode
 
     def _compute_vol(self, prices: list[float]) -> float:
         """Realized vol from price series, ignoring stale (duplicate) ticks.
@@ -335,9 +339,13 @@ class DiffusionSignal(Signal):
             return Decision("FLAT", 0.0, 0.0,
                 f"too early ({tau:.0f}s left > {self.max_entry_time_s:.0f}s gate)")
 
+        # Tiered threshold: each subsequent trade in a window requires more edge
+        window_trade_count = ctx.get("window_trade_count", 0)
+        base_for_trade = self.edge_threshold + self.edge_threshold_step * window_trade_count
+
         # Dynamic edge threshold: higher early, decays with sqrt(tau)
         # At tau=900s: base * (1 + mult), at tau=0: base
-        dyn_threshold = self.edge_threshold * (
+        dyn_threshold = base_for_trade * (
             1.0 + self.early_edge_mult * math.sqrt(tau / self.window_duration)
         )
 
@@ -357,7 +365,7 @@ class DiffusionSignal(Signal):
 
         # Model probability (z capped to prevent overconfidence)
         delta = snapshot.chainlink_price - snapshot.window_start_price
-        z_raw = delta / (sigma_per_s * math.sqrt(tau))
+        z_raw = delta / (sigma_per_s * math.sqrt(tau) * snapshot.chainlink_price)
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = norm_cdf(z)
 
@@ -366,8 +374,15 @@ class DiffusionSignal(Signal):
             p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
 
         # Effective costs
-        p_up_cost = ask_up + poly_fee(ask_up) + self.slippage
-        p_down_cost = ask_down + poly_fee(ask_down) + self.slippage
+        if self.maker_mode:
+            # Maker: limit order at mid-price, 0% fee
+            mid_up = (bid_up + ask_up) / 2.0
+            mid_down = (bid_down + ask_down) / 2.0
+            p_up_cost = mid_up
+            p_down_cost = mid_down
+        else:
+            p_up_cost = ask_up + poly_fee(ask_up) + self.slippage
+            p_down_cost = ask_down + poly_fee(ask_down) + self.slippage
 
         # Edges (penalized by spread — wider spread = less trustworthy pricing)
         edge_up = p_model - p_up_cost - self.spread_edge_penalty * spread_up
@@ -568,37 +583,62 @@ class BacktestEngine:
 
     def _execute_fill(self, snap: Snapshot, decision: Decision,
                       ctx: dict) -> Optional[Fill]:
+        maker_mode = getattr(self.signal, "maker_mode", False)
+
         if decision.action == "BUY_UP":
-            side, ask_levels, best_ask = "UP", snap.ask_levels_up, snap.best_ask_up
+            side = "UP"
+            best_ask, best_bid = snap.best_ask_up, snap.best_bid_up
+            ask_levels = snap.ask_levels_up
+            bid_levels = snap.bid_levels_up
         elif decision.action == "BUY_DOWN":
-            side, ask_levels, best_ask = "DOWN", snap.ask_levels_down, snap.best_ask_down
+            side = "DOWN"
+            best_ask, best_bid = snap.best_ask_down, snap.best_bid_down
+            ask_levels = snap.ask_levels_down
+            bid_levels = snap.bid_levels_down
         else:
             return None
 
-        if not ask_levels or best_ask is None or best_ask <= 0:
-            return None
-
-        eff_est = best_ask + poly_fee(best_ask) + self.slippage
-        if eff_est <= 0 or eff_est >= 1.0:
-            return None
-
-        desired_shares = decision.size_usd / eff_est
-        filled, total_cost, avg_price = walk_book(ask_levels, desired_shares, self.slippage)
-
-        if filled <= 0 or total_cost <= 0:
-            return None
-
-        # Compute average raw price for fee reporting
-        raw_total = 0.0
-        temp = 0.0
-        for px, sz in ask_levels:
-            take = min(sz, desired_shares - temp)
-            if take <= 0:
-                break
-            raw_total += take * px
-            temp += take
-        raw_avg = raw_total / temp if temp > 0 else 0
-        fee_avg = avg_price - raw_avg - self.slippage
+        if maker_mode:
+            # Maker: limit order at mid-price, 0% fee
+            if best_bid is None or best_ask is None:
+                return None
+            if best_bid <= 0 or best_ask <= 0:
+                return None
+            mid_price = (best_bid + best_ask) / 2.0
+            if mid_price <= 0 or mid_price >= 1.0:
+                return None
+            desired_shares = decision.size_usd / mid_price
+            # Use bid-side depth as fill estimate (optimistic: assume we get filled)
+            avail = sum(sz for _, sz in bid_levels) if bid_levels else 0.0
+            filled = min(desired_shares, max(avail, desired_shares))  # assume fill
+            if filled <= 0:
+                return None
+            total_cost = filled * mid_price
+            avg_price = mid_price
+            fee_avg = 0.0
+        else:
+            # Taker: walk ask book with fees
+            if not ask_levels or best_ask is None or best_ask <= 0:
+                return None
+            eff_est = best_ask + poly_fee(best_ask) + self.slippage
+            if eff_est <= 0 or eff_est >= 1.0:
+                return None
+            desired_shares = decision.size_usd / eff_est
+            filled, total_cost, avg_price = walk_book(
+                ask_levels, desired_shares, self.slippage)
+            if filled <= 0 or total_cost <= 0:
+                return None
+            # Compute average raw price for fee reporting
+            raw_total = 0.0
+            temp = 0.0
+            for px, sz in ask_levels:
+                take = min(sz, desired_shares - temp)
+                if take <= 0:
+                    break
+                raw_total += take * px
+                temp += take
+            raw_avg = raw_total / temp if temp > 0 else 0
+            fee_avg = avg_price - raw_avg - self.slippage
 
         # Expected price range from signal (if available)
         rng = ctx.get("_expected_range", {})
@@ -646,6 +686,7 @@ class BacktestEngine:
                         if hasattr(self.signal, "bankroll"):
                             self.signal.bankroll = self.bankroll
                         last_fill_ts = snap.ts_ms
+                        ctx["window_trade_count"] = len(results)
                     pending = None
 
             # Cooldown between bets
@@ -667,6 +708,7 @@ class BacktestEngine:
                         if hasattr(self.signal, "bankroll"):
                             self.signal.bankroll = self.bankroll
                         last_fill_ts = snap.ts_ms
+                        ctx["window_trade_count"] = len(results)
                 else:
                     pending = (snap.ts_ms + self.latency_ms, decision)
 
@@ -910,6 +952,8 @@ def main():
     parser.add_argument("--latency", type=int, default=0, help="ms")
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--sensitivity", action="store_true")
+    parser.add_argument("--maker", action="store_true",
+                        help="Simulate maker (limit order) fills: 0%% fee, mid-price entry")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -927,22 +971,32 @@ def main():
         print(sens_df[cols].to_string(index=False))
         return
 
-    # Per-market signal overrides (ETH needs tighter filters due to mean reversion)
-    eth_overrides = {}
-    eth_engine_kw = {}
+    # Per-market signal overrides
+    signal_overrides = {}
+    engine_kw = {}
     if args.market == "eth":
-        eth_overrides = dict(
-            edge_threshold=0.15,        # higher bar (BTC default 0.10)
-            reversion_discount=0.15,    # ETH mean-reverts ~33%, discount p toward 0.5
-            momentum_lookback_s=15,     # shorter lookback (ETH oscillates more)
-            momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
-            spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
+        signal_overrides = dict(
+            edge_threshold=0.10,
+            edge_threshold_step=0.0,
+            max_bet_fraction=0.10,
+            reversion_discount=0.15,
+            momentum_lookback_s=15,
+            momentum_majority=0.7,
+            spread_edge_penalty=0.2,
         )
-        eth_engine_kw = dict(max_trades_per_window=1)
+        engine_kw = dict(max_trades_per_window=4)
+    else:
+        signal_overrides = dict(
+            edge_threshold_step=0.0,
+            max_bet_fraction=0.05,
+        )
+        engine_kw = dict(max_trades_per_window=4)
+    if args.maker:
+        signal_overrides["maker_mode"] = True
 
     signal_map = {
         "diffusion": lambda: DiffusionSignal(
-            bankroll=args.bankroll, slippage=args.slippage, **eth_overrides),
+            bankroll=args.bankroll, slippage=args.slippage, **signal_overrides),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),
         "random": lambda: RandomCoinFlip(bankroll=args.bankroll, seed=args.seed),
@@ -959,7 +1013,7 @@ def main():
             latency_ms=args.latency,
             slippage=args.slippage,
             initial_bankroll=args.bankroll,
-            **eth_engine_kw,
+            **engine_kw,
         )
         print(f"\n{'='*62}")
         print(f"  Running: {signal.name} ({config.display_name})")

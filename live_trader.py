@@ -38,7 +38,7 @@ from web3.exceptions import ContractLogicError
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
-    MarketOrderArgs, OrderType, ApiCreds, BalanceAllowanceParams,
+    MarketOrderArgs, OrderArgs, OrderType, ApiCreds, BalanceAllowanceParams,
     OpenOrderParams,
 )
 from py_clob_client.order_builder.constants import BUY
@@ -77,6 +77,11 @@ STATE_FILE = Path("live_state.json")     # overridden per-market in main()
 
 DEBUG = False
 DRY_RUN = False
+MULTI_MODE = False
+
+# Shared display state for multi-market mode.
+# Keys are market names ("btc", "eth"), values are dicts with tracker/price/book state.
+MARKET_DISPLAY_STATES: dict[str, dict] = {}
 
 # ── On-chain redemption constants ────────────────────────────────────────────
 POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-rpc.com")
@@ -96,7 +101,14 @@ CTF_ABI = [
         "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function",
-    }
+    },
+    {
+        "inputs": [{"name": "conditionId", "type": "bytes32"}],
+        "name": "payoutDenominator",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 PROXY_ABI = [
@@ -190,6 +202,40 @@ def query_usdc_balance(client: ClobClient) -> float | None:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def fetch_chainlink_price_rest(config: MarketConfig) -> float | None:
+    """Fetch current Chainlink price from Polymarket's REST API (fallback for RTDS)."""
+    try:
+        resp = requests.get(
+            "https://data-api.polymarket.com/prices",
+            params={"symbols": config.chainlink_symbol},
+            timeout=10,
+        )
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return float(data[0].get("price", 0))
+        if isinstance(data, dict):
+            val = data.get(config.chainlink_symbol) or data.get("price")
+            if val:
+                return float(val)
+    except Exception:
+        pass
+    # Fallback: try CoinGecko
+    cg_ids = {"btc": "bitcoin", "eth": "ethereum"}
+    cg_id = cg_ids.get(config.data_subdir)
+    if cg_id:
+        try:
+            resp = requests.get(
+                f"https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": cg_id, "vs_currencies": "usd"},
+                timeout=10,
+            )
+            data = resp.json()
+            return float(data[cg_id]["usd"])
+        except Exception:
+            pass
+    return None
+
 
 def _ensure_list(val):
     return json.loads(val) if isinstance(val, str) else val
@@ -336,8 +382,12 @@ class LiveTradeTracker:
         cooldown_ms: int = 30_000,
         max_loss_pct: float = 50.0,
         max_trades_per_window: int = 1,
-        stale_price_timeout_s: float = 10.0,
+        stale_price_timeout_s: float = 60.0,
         min_balance_usd: float = 5.0,
+        maker_mode: bool = False,
+        trades_log: Path | None = None,
+        state_file: Path | None = None,
+        market_key: str = "",
     ):
         self.client = client
         self.signal = signal
@@ -346,6 +396,12 @@ class LiveTradeTracker:
         self.latency_ms = latency_ms
         self.slippage = slippage
         self.cooldown_ms = cooldown_ms
+        self.maker_mode = maker_mode
+        self.market_key = market_key  # "btc" / "eth"
+
+        # Per-tracker file paths (avoids global dependency)
+        self.trades_log: Path = trades_log or TRADES_LOG
+        self.state_file: Path = state_file or STATE_FILE
 
         # Failsafes
         self.max_loss_pct = max_loss_pct
@@ -384,16 +440,27 @@ class LiveTradeTracker:
         self.signal_eval_count: int = 0
         self.last_diag_ts: float = 0.0
 
+        # Maker mode: open limit orders awaiting fill
+        self.open_orders: list[dict] = []  # {order_id, side, price, size, token_id, ts}
+
+        # Arb PnL tracking (maker dual-side)
+        self.arb_pairs_completed: int = 0
+        self.arb_total_pnl: float = 0.0
+        self.last_arb_result: str = ""  # human-readable last arb outcome
+
     def new_window(self, window_end: datetime):
         # Log previous window's FLAT reason summary before resetting
         if self.flat_reason_counts:
             self._log_flat_summary()
+        # Cancel any leftover open limit orders from previous window
+        self._cancel_open_orders()
         self.ctx = {}
         self.pending_fills = []
         self.last_fill_ts_ms = 0
         self.last_decision = Decision("FLAT", 0.0, 0.0, "new window")
         self.windows_seen += 1
         self.window_trade_count = 0
+        self.open_orders = []
         self.flat_reason_counts: dict[str, int] = {}
         self.signal_eval_count = 0
         self.last_diag_ts: float = 0.0
@@ -437,7 +504,9 @@ class LiveTradeTracker:
         if self.last_price_update_ts == 0:
             return True
         age = _time.time() - self.last_price_update_ts
-        return age > self.stale_price_timeout_s
+        # Use a longer timeout (60s) to tolerate RTDS reconnections.
+        # The 10s default was too aggressive and caused entire windows to be skipped.
+        return age > 60.0
 
     def evaluate(
         self,
@@ -459,6 +528,10 @@ class LiveTradeTracker:
                 f"stale price ({_time.time() - self.last_price_update_ts:.0f}s old)"
             )
             return self.last_decision
+
+        # Maker mode: dual-side market making (own cooldown / polling)
+        if self.maker_mode:
+            return self._evaluate_dual_maker(snapshot, up_token, down_token)
 
         # Cooldown
         if (self.last_fill_ts_ms > 0
@@ -511,6 +584,283 @@ class LiveTradeTracker:
             self._place_order(snapshot, decision, up_token, down_token)
 
         return decision
+
+    # ── Dual-side maker strategy ────────────────────────────────────────
+
+    def _evaluate_dual_maker(self, snapshot, up_token, down_token):
+        """Dual-side market making: limit orders on BOTH Up and Down.
+
+        With 0% maker fee and mid-price execution:
+        - Arb component: guaranteed profit when mid_up + mid_down < 1.0
+        - Directional lean: more shares on the model-favored side
+        """
+        # Build price history (same tracking as signal.decide)
+        hist = self.ctx.setdefault("price_history", [])
+        hist.append(snapshot.chainlink_price)
+        self.signal_eval_count += 1
+
+        if len(hist) < self.signal.vol_lookback_s:
+            reason = f"need {self.signal.vol_lookback_s}s history ({len(hist)})"
+            self.flat_reason_counts["warmup"] = self.flat_reason_counts.get("warmup", 0) + 1
+            self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
+            return self.last_decision
+
+        bid_up = snapshot.best_bid_up
+        ask_up = snapshot.best_ask_up
+        bid_down = snapshot.best_bid_down
+        ask_down = snapshot.best_ask_down
+        if any(x is None or x <= 0 for x in [bid_up, ask_up, bid_down, ask_down]):
+            self.flat_reason_counts["missing_book"] = self.flat_reason_counts.get("missing_book", 0) + 1
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "missing book")
+            return self.last_decision
+
+        tau = snapshot.time_remaining_s
+        if tau <= 0:
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "window expired")
+            return self.last_decision
+
+        # Poll existing open orders for fills
+        if self.open_orders:
+            self._poll_open_orders(snapshot)
+
+        # If we already have orders on both sides, just wait for fills
+        existing_sides = {o["side"] for o in self.open_orders}
+        if "UP" in existing_sides and "DOWN" in existing_sides:
+            mid_up = (bid_up + ask_up) / 2.0
+            mid_down = (bid_down + ask_down) / 2.0
+            arb = 1.0 - (mid_up + mid_down)
+            self.last_decision = Decision("FLAT", 0.0, 0.0,
+                f"dual orders active (arb={arb:+.3f})")
+            now = _time.time()
+            if now - self.last_diag_ts >= 60:
+                self.last_diag_ts = now
+                self._log_diagnostic(snapshot, self.last_decision)
+            return self.last_decision
+
+        # Trade limit check
+        if self.window_trade_count >= self.max_trades_per_window:
+            reason = f"window trade limit ({self.window_trade_count}/{self.max_trades_per_window})"
+            self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
+            return self.last_decision
+
+        # Cooldown between order pairs
+        if (self.last_fill_ts_ms > 0
+                and snapshot.ts_ms - self.last_fill_ts_ms < self.cooldown_ms):
+            self.last_decision = Decision("FLAT", 0.0, 0.0,
+                f"cooldown ({(snapshot.ts_ms - self.last_fill_ts_ms) / 1000:.0f}s"
+                f" / {self.cooldown_ms / 1000:.0f}s)")
+            return self.last_decision
+
+        # Compute realized vol
+        sigma = self.signal._compute_vol(hist[-self.signal.vol_lookback_s:])
+        if sigma == 0:
+            self.flat_reason_counts["zero_vol"] = self.flat_reason_counts.get("zero_vol", 0) + 1
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "zero vol")
+            return self.last_decision
+
+        # Vol regime filter
+        if len(hist) >= self.signal.vol_regime_lookback_s:
+            sigma_bl = self.signal._compute_vol(
+                hist[-self.signal.vol_regime_lookback_s:])
+            if sigma_bl > 0 and sigma > self.signal.vol_regime_mult * sigma_bl:
+                self.flat_reason_counts["vol_spike"] = self.flat_reason_counts.get("vol_spike", 0) + 1
+                self.last_decision = Decision("FLAT", 0.0, 0.0,
+                    f"vol spike ({sigma:.2e} > "
+                    f"{self.signal.vol_regime_mult}x {sigma_bl:.2e})")
+                return self.last_decision
+
+        # Model probability
+        delta = snapshot.chainlink_price - snapshot.window_start_price
+        z_raw = delta / (sigma * math.sqrt(tau) * snapshot.chainlink_price)
+        z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
+        p_model = norm_cdf(z)
+        if self.signal.reversion_discount > 0:
+            p_model = (p_model * (1 - self.signal.reversion_discount)
+                       + 0.5 * self.signal.reversion_discount)
+
+        # Mid prices for limit orders
+        mid_up = round((bid_up + ask_up) / 2.0, 2)
+        mid_down = round((bid_down + ask_down) / 2.0, 2)
+
+        # Stay below asks (maker, not crossing the spread)
+        if mid_up >= ask_up:
+            mid_up = round(ask_up - 0.01, 2)
+        if mid_down >= ask_down:
+            mid_down = round(ask_down - 0.01, 2)
+        if mid_up <= 0 or mid_down <= 0 or mid_up >= 1.0 or mid_down >= 1.0:
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "invalid mid prices")
+            return self.last_decision
+
+        # Spread gate
+        spread_up = ask_up - bid_up
+        spread_down = ask_down - bid_down
+        if spread_up > self.signal.max_spread or spread_down > self.signal.max_spread:
+            self.flat_reason_counts["spread_wide"] = self.flat_reason_counts.get("spread_wide", 0) + 1
+            self.last_decision = Decision("FLAT", 0.0, 0.0,
+                f"spread too wide (up={spread_up:.3f} down={spread_down:.3f})")
+            return self.last_decision
+
+        arb_spread = 1.0 - (mid_up + mid_down)
+
+        # Only place orders if arb spread is positive (guaranteed profit)
+        if arb_spread <= 0:
+            self.flat_reason_counts["no_arb"] = self.flat_reason_counts.get("no_arb", 0) + 1
+            self.last_decision = Decision("FLAT", 0.0, 0.0,
+                f"no arb (mid_up+mid_down={mid_up + mid_down:.3f} >= 1.0)")
+            return self.last_decision
+
+        # Pure arb: equal shares on both sides for guaranteed profit
+        alloc_per_side = self.bankroll * self.signal.max_bet_fraction
+        max_mid = max(mid_up, mid_down)
+        shares = round(alloc_per_side / max_mid, 1)
+
+        min_sh = self.min_order_shares
+        if shares < min_sh:
+            shares = min_sh
+
+        up_shares = shares
+        down_shares = shares
+
+        up_cost = up_shares * mid_up
+        down_cost = down_shares * mid_down
+        total_cost = up_cost + down_cost
+
+        if total_cost > self.bankroll:
+            scale = (self.bankroll - 0.02) / total_cost
+            up_shares = round(up_shares * scale, 1)
+            down_shares = round(down_shares * scale, 1)
+            if up_shares < min_sh or down_shares < min_sh:
+                self.last_decision = Decision("FLAT", 0.0, 0.0,
+                    f"bankroll ${self.bankroll:.2f} < min dual order")
+                return self.last_decision
+            up_cost = up_shares * mid_up
+            down_cost = down_shares * mid_down
+            total_cost = up_cost + down_cost
+
+        arb_profit = arb_spread * shares
+        reason = (
+            f"arb: spread={arb_spread:+.4f} "
+            f"{shares:.0f}sh @{mid_up}/{mid_down} "
+            f"=${arb_profit:.3f}"
+        )
+
+        # Place both limit orders (equal shares, pure arb)
+        up_ok = self._place_one_limit(
+            "UP", up_token, mid_up, shares, snapshot, reason)
+        dn_ok = self._place_one_limit(
+            "DOWN", down_token, mid_down, shares, snapshot, reason)
+
+        if up_ok or dn_ok:
+            self.last_fill_ts_ms = snapshot.ts_ms  # cooldown starts after pair
+
+        self.last_decision = Decision(
+            "BUY_UP",
+            arb_spread, total_cost, reason,
+        )
+        return self.last_decision
+
+    def _place_one_limit(self, side_label, token_id, price, shares,
+                         snapshot, reason):
+        """Place a single GTC limit order (used by dual-side maker)."""
+        cost_est = round(shares * price, 2)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        trade_record = {
+            "type": "limit_order",
+            "ts": now_iso,
+            "market_slug": snapshot.market_slug,
+            "side": side_label,
+            "price": price,
+            "shares": shares,
+            "cost_est": cost_est,
+            "chainlink_price": round(snapshot.chainlink_price, 2),
+            "time_remaining_s": round(snapshot.time_remaining_s, 1),
+            "signal_reason": reason,
+            "bankroll_before": round(self.bankroll, 2),
+            "dual_side": True,
+        }
+
+        if DRY_RUN:
+            trade_record["dry_run"] = True
+            trade_record["status"] = "dry_run"
+            self._log(trade_record)
+            print(
+                f"\n  [DRY RUN] LIMIT BUY {side_label} "
+                f"{shares:.1f}sh @ {price:.4f} (~${cost_est:.2f})"
+            )
+            self.open_orders.append({
+                "order_id": f"dry_{side_label}_{snapshot.ts_ms}",
+                "side": side_label, "price": price, "size": shares,
+                "token_id": token_id, "ts": now_iso,
+                "market_slug": snapshot.market_slug,
+                "time_remaining_s": snapshot.time_remaining_s,
+                "chainlink_price": snapshot.chainlink_price,
+                "window_start_price": snapshot.window_start_price,
+            })
+            self.bankroll -= cost_est
+            self.signal.bankroll = self.bankroll
+            self.window_trade_count += 1
+            self.ctx["window_trade_count"] = self.window_trade_count
+            self.pending_fills.append({
+                "market_slug": snapshot.market_slug,
+                "side": side_label, "cost_usd": cost_est, "shares": shares,
+                "order_id": f"dry_{side_label}",
+                "entry_ts": now_iso,
+                "time_remaining_s": snapshot.time_remaining_s,
+                "chainlink_price": snapshot.chainlink_price,
+                "window_start_price": snapshot.window_start_price,
+            })
+            return True
+
+        try:
+            order_args = OrderArgs(
+                token_id=token_id, price=price, size=shares, side=BUY,
+            )
+            signed_order = self.client.create_order(order_args)
+            resp = self.client.post_order(signed_order, OrderType.GTC)
+        except Exception as exc:
+            trade_record["status"] = "error"
+            trade_record["error"] = str(exc)
+            self._log(trade_record)
+            print(f"\n  [LIMIT ERROR] {side_label}: {exc}")
+            return False
+
+        success = resp.get("success", False)
+        order_id = resp.get("orderID") or resp.get("id", "")
+        status = resp.get("status", "unknown")
+        trade_record["order_id"] = order_id
+        trade_record["status"] = status
+        trade_record["success"] = success
+
+        if not success:
+            err_msg = resp.get("errorMsg", "")
+            self._log(trade_record)
+            print(
+                f"\n  [LIMIT] {side_label} {shares:.1f}sh @ {price:.4f} "
+                f"-> REJECTED ({err_msg})")
+            return False
+
+        self._log(trade_record)
+        self.open_orders.append({
+            "order_id": order_id,
+            "side": side_label, "price": price, "size": shares,
+            "token_id": token_id, "ts": now_iso,
+            "market_slug": snapshot.market_slug,
+            "time_remaining_s": snapshot.time_remaining_s,
+            "chainlink_price": snapshot.chainlink_price,
+            "window_start_price": snapshot.window_start_price,
+        })
+        self.bankroll -= cost_est
+        self.signal.bankroll = self.bankroll
+        self.window_trade_count += 1
+        self.ctx["window_trade_count"] = self.window_trade_count
+
+        print(
+            f"\n  [LIMIT] BUY {side_label} {shares:.1f}sh @ {price:.4f} "
+            f"(~${cost_est:.2f}) | order={order_id[:12]}... "
+            f"| Bankroll: ${self.bankroll:,.2f}"
+        )
+        return True
 
     def _place_order(
         self,
@@ -636,6 +986,7 @@ class LiveTradeTracker:
         self.signal.bankroll = self.bankroll
         self.last_fill_ts_ms = snapshot.ts_ms
         self.window_trade_count += 1
+        self.ctx["window_trade_count"] = self.window_trade_count
 
         # Estimate fee for display (poly_fee on best ask)
         best_ask = (snapshot.best_ask_up if side_label == "UP"
@@ -661,6 +1012,260 @@ class LiveTradeTracker:
             f"-> {shares:.1f} shares @ {entry_price:.4f} "
             f"| Bankroll: ${self.bankroll:,.2f}"
         )
+
+    def _place_limit_order(
+        self,
+        snapshot: Snapshot,
+        decision: Decision,
+        up_token: str,
+        down_token: str,
+    ):
+        """Place a GTC limit order at mid-price (maker, 0% fee)."""
+        if decision.action == "BUY_UP":
+            side_label = "UP"
+            token_id = up_token
+            best_bid = snapshot.best_bid_up
+            best_ask = snapshot.best_ask_up
+        elif decision.action == "BUY_DOWN":
+            side_label = "DOWN"
+            token_id = down_token
+            best_bid = snapshot.best_bid_down
+            best_ask = snapshot.best_ask_down
+        else:
+            return
+
+        if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
+            return
+
+        # Limit price = mid-price, rounded to tick (0.01)
+        mid_price = round((best_bid + best_ask) / 2.0, 2)
+        if mid_price <= 0 or mid_price >= 1.0:
+            return
+        # Ensure we stay at or below the ask (maker, not taker)
+        if mid_price >= best_ask:
+            mid_price = round(best_ask - 0.01, 2)
+        if mid_price <= 0:
+            return
+
+        # Size in shares (not USD)
+        shares = round(decision.size_usd / mid_price, 1)
+        if shares < self.min_order_shares:
+            if self.bankroll >= self.min_order_shares * mid_price:
+                shares = self.min_order_shares
+            else:
+                self._log({
+                    "type": "skip",
+                    "reason": f"bankroll ${self.bankroll:.2f} < min order "
+                              f"${self.min_order_shares * mid_price:.2f} (5 shares)",
+                })
+                return
+
+        cost_est = shares * mid_price
+        if cost_est > self.bankroll:
+            shares = round((self.bankroll - 0.01) / mid_price, 1)
+            if shares < self.min_order_shares:
+                return
+            cost_est = shares * mid_price
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        trade_record = {
+            "type": "limit_order",
+            "ts": now_iso,
+            "market_slug": snapshot.market_slug,
+            "side": side_label,
+            "price": mid_price,
+            "shares": shares,
+            "cost_est": round(cost_est, 2),
+            "bid": best_bid,
+            "ask": best_ask,
+            "chainlink_price": round(snapshot.chainlink_price, 2),
+            "time_remaining_s": round(snapshot.time_remaining_s, 1),
+            "signal_reason": decision.reason,
+            "bankroll_before": round(self.bankroll, 2),
+        }
+
+        if DRY_RUN:
+            trade_record["dry_run"] = True
+            trade_record["status"] = "dry_run"
+            self._log(trade_record)
+            print(
+                f"\n  [DRY RUN] Would place: LIMIT BUY {side_label} "
+                f"{shares:.1f}sh @ {mid_price:.4f} (~${cost_est:.2f}) "
+                f"on {snapshot.market_slug}"
+            )
+            # Simulate fill for dry run
+            self.bankroll -= cost_est
+            self.signal.bankroll = self.bankroll
+            self.last_fill_ts_ms = snapshot.ts_ms
+            self.window_trade_count += 1
+            self.ctx["window_trade_count"] = self.window_trade_count
+            self.pending_fills.append({
+                "market_slug": snapshot.market_slug,
+                "side": side_label,
+                "cost_usd": cost_est,
+                "shares": shares,
+                "order_id": "dry_run",
+                "entry_ts": now_iso,
+                "time_remaining_s": snapshot.time_remaining_s,
+                "chainlink_price": snapshot.chainlink_price,
+                "window_start_price": snapshot.window_start_price,
+            })
+            return
+
+        # Place GTC limit order
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=mid_price,
+                size=shares,
+                side=BUY,
+            )
+            signed_order = self.client.create_order(order_args)
+            resp = self.client.post_order(signed_order, OrderType.GTC)
+        except Exception as exc:
+            trade_record["status"] = "error"
+            trade_record["error"] = str(exc)
+            self._log(trade_record)
+            print(f"\n  [LIMIT ORDER ERROR] {exc}")
+            self.last_fill_ts_ms = snapshot.ts_ms
+            return
+
+        success = resp.get("success", False)
+        order_id = resp.get("orderID") or resp.get("id", "")
+        status = resp.get("status", "unknown")
+
+        trade_record["order_id"] = order_id
+        trade_record["status"] = status
+        trade_record["success"] = success
+        trade_record["response"] = resp
+
+        if not success:
+            trade_record["filled"] = False
+            self._log(trade_record)
+            err_msg = resp.get("errorMsg", "")
+            print(
+                f"\n  [LIMIT] {side_label} {shares:.1f}sh @ {mid_price:.4f} -> "
+                f"REJECTED (status={status}, err={err_msg})"
+            )
+            self.last_fill_ts_ms = snapshot.ts_ms
+            return
+
+        self._log(trade_record)
+
+        # Track open order for polling
+        self.open_orders.append({
+            "order_id": order_id,
+            "side": side_label,
+            "price": mid_price,
+            "size": shares,
+            "token_id": token_id,
+            "ts": now_iso,
+            "market_slug": snapshot.market_slug,
+            "time_remaining_s": snapshot.time_remaining_s,
+            "chainlink_price": snapshot.chainlink_price,
+            "window_start_price": snapshot.window_start_price,
+        })
+
+        # Reserve bankroll for this order
+        self.bankroll -= cost_est
+        self.signal.bankroll = self.bankroll
+        self.last_fill_ts_ms = snapshot.ts_ms
+        self.window_trade_count += 1
+        self.ctx["window_trade_count"] = self.window_trade_count
+
+        print(
+            f"\n  [LIMIT] BUY {side_label} {shares:.1f}sh @ {mid_price:.4f} "
+            f"(~${cost_est:.2f}) | order={order_id[:12]}... "
+            f"| Bankroll: ${self.bankroll:,.2f}"
+        )
+
+    def _poll_open_orders(self, snapshot: Snapshot):
+        """Check open limit orders for fills, move filled ones to pending_fills."""
+        still_open = []
+        for order in self.open_orders:
+            try:
+                order_data = self.client.get_order(order["order_id"])
+            except Exception as exc:
+                if DEBUG:
+                    print(f"  [POLL] error checking {order['order_id'][:12]}...: {exc}")
+                still_open.append(order)
+                continue
+
+            status = order_data.get("status", "").upper()
+            size_matched = float(order_data.get("size_matched", 0))
+
+            if status == "MATCHED" or size_matched >= order["size"] * 0.99:
+                # Fully filled
+                cost_usd = size_matched * order["price"]
+                self.pending_fills.append({
+                    "market_slug": order["market_slug"],
+                    "side": order["side"],
+                    "cost_usd": cost_usd,
+                    "shares": size_matched,
+                    "order_id": order["order_id"],
+                    "entry_ts": order["ts"],
+                    "time_remaining_s": order["time_remaining_s"],
+                    "chainlink_price": order["chainlink_price"],
+                    "window_start_price": order["window_start_price"],
+                })
+                # Adjust bankroll: we reserved cost_est but actual cost may differ
+                cost_est = order["size"] * order["price"]
+                actual_cost = cost_usd
+                drift = cost_est - actual_cost
+                if abs(drift) > 0.01:
+                    self.bankroll += drift
+                    self.signal.bankroll = self.bankroll
+
+                self.total_fees += 0.0  # maker = 0 fee
+
+                entry_price = cost_usd / size_matched if size_matched > 0 else 0
+                print(
+                    f"\n  [FILLED] LIMIT {order['side']} "
+                    f"${cost_usd:.2f} -> {size_matched:.1f}sh @ {entry_price:.4f} "
+                    f"| Bankroll: ${self.bankroll:,.2f}"
+                )
+                self._log({
+                    "type": "limit_fill",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "order_id": order["order_id"],
+                    "side": order["side"],
+                    "price": order["price"],
+                    "size_matched": size_matched,
+                    "cost_usd": round(cost_usd, 2),
+                })
+            elif status in ("CANCELLED", "EXPIRED"):
+                # Order cancelled/expired — refund reserved bankroll
+                cost_est = order["size"] * order["price"]
+                self.bankroll += cost_est
+                self.signal.bankroll = self.bankroll
+                print(
+                    f"\n  [CANCELLED] {order['side']} {order['size']:.1f}sh "
+                    f"@ {order['price']:.4f} | refunded ${cost_est:.2f}"
+                )
+            else:
+                # Still live
+                still_open.append(order)
+
+        self.open_orders = still_open
+
+    def _cancel_open_orders(self):
+        """Cancel all open limit orders (called at window end / shutdown)."""
+        if DRY_RUN or not self.open_orders:
+            return
+        for order in self.open_orders:
+            try:
+                self.client.cancel(order["order_id"])
+                # Refund reserved bankroll
+                cost_est = order["size"] * order["price"]
+                self.bankroll += cost_est
+                self.signal.bankroll = self.bankroll
+                print(
+                    f"  [CANCEL] {order['side']} {order['size']:.1f}sh "
+                    f"@ {order['price']:.4f} | refunded ${cost_est:.2f}"
+                )
+            except Exception as exc:
+                print(f"  [CANCEL] error: {exc}")
+        self.open_orders = []
 
     def resolve_window(
         self, slug: str, final_price: float | None,
@@ -746,17 +1351,22 @@ class LiveTradeTracker:
                 "bankroll_after": round(self.bankroll, 2),
             })
 
-        # Redeem winning CTF positions on-chain
+        # Redeem winning CTF positions on-chain (background thread so we
+        # don't block trading — on-chain resolution can lag API by 20+ min)
         has_winning = any(
             (f["side"] == "UP" and outcome_up == 1) or
             (f["side"] == "DOWN" and outcome_up == 0)
             for f in self.pending_fills
         )
         if has_winning and self.condition_id:
-            # Wait for on-chain resolution to propagate before attempting redeem
-            print(f"  Waiting 15s for on-chain resolution (conditionId: {self.condition_id[:10]}...)...")
-            _time.sleep(15)
-            self.redeem_positions(self.condition_id)
+            import threading
+            cond_id = self.condition_id
+            print(f"  [REDEEM] Starting background redemption "
+                  f"(conditionId: {cond_id[:10]}...)")
+            t = threading.Thread(
+                target=self.redeem_positions, args=(cond_id,),
+                daemon=True)
+            t.start()
         elif has_winning and not self.condition_id:
             print("  WARNING: Won but no conditionId — cannot auto-redeem. "
                   "Claim manually on Polymarket.")
@@ -771,6 +1381,49 @@ class LiveTradeTracker:
             self.max_dd_pct = dd_pct
 
         self.signal.bankroll = self.bankroll
+
+        # Arb pair summary: detect matched UP+DOWN pairs
+        up_fills = [f for f in self.pending_fills if f["side"] == "UP"]
+        down_fills = [f for f in self.pending_fills if f["side"] == "DOWN"]
+        if up_fills and down_fills:
+            total_cost = sum(f["cost_usd"] for f in self.pending_fills)
+            total_payout = sum(
+                f["shares"] for f in self.pending_fills
+                if (f["side"] == "UP" and outcome_up == 1)
+                or (f["side"] == "DOWN" and outcome_up == 0)
+            )
+            arb_net = total_payout - total_cost
+            n_pairs = min(len(up_fills), len(down_fills))
+            self.arb_pairs_completed += n_pairs
+            self.arb_total_pnl += arb_net
+            self.last_arb_result = (
+                f"{outcome_str} | {n_pairs} pair(s) | "
+                f"cost=${total_cost:.2f} payout=${total_payout:.2f} "
+                f"net=${arb_net:+.4f}"
+            )
+            self._log({
+                "type": "arb_summary",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "market_slug": slug,
+                "outcome": outcome_str,
+                "n_pairs": n_pairs,
+                "total_cost": round(total_cost, 4),
+                "winning_payout": round(total_payout, 4),
+                "arb_net_pnl": round(arb_net, 4),
+                "arb_cumulative_pnl": round(self.arb_total_pnl, 4),
+                "arb_pairs_total": self.arb_pairs_completed,
+                "bankroll_after": round(self.bankroll, 2),
+            })
+            print(
+                f"  Arb: {n_pairs} pair(s) | Cost: ${total_cost:.2f} | "
+                f"Payout: ${total_payout:.2f} | Net: ${arb_net:+.4f} | "
+                f"Cumulative: ${self.arb_total_pnl:+.4f}"
+            )
+        else:
+            # Single-side fill (no arb guarantee)
+            self.last_arb_result = (
+                f"{outcome_str} | single-side only | PnL=${window_pnl:+.2f}"
+            )
 
         print(
             f"  Window resolved: {outcome_str} | "
@@ -802,6 +1455,8 @@ class LiveTradeTracker:
         """Cancel all open orders — called on shutdown."""
         if DRY_RUN:
             return
+        # Refund any tracked open limit orders
+        self._cancel_open_orders()
         try:
             resp = self.client.cancel_all()
             print(f"  Cancelled all open orders: {resp}")
@@ -812,9 +1467,9 @@ class LiveTradeTracker:
                          max_retries: int = 3) -> str | None:
         """Call CTF.redeemPositions() on-chain to convert winning tokens to USDC.
 
-        Routes through the proxy wallet (sig type 1) or direct EOA (sig type 0).
-        Retries on failure since on-chain resolution may still be propagating.
-        Returns the tx hash on success, None on failure.
+        On-chain reportPayouts() can lag the API by 20+ minutes. We poll
+        payoutDenominator(conditionId) (free eth_call) before sending a tx
+        to avoid wasting gas on reverts.
         """
         if DRY_RUN:
             print("  [REDEEM] Skipped (dry run)")
@@ -824,11 +1479,41 @@ class LiveTradeTracker:
             print("  [REDEEM] Skipped (no conditionId)")
             return None
 
+        # Poll on-chain resolution before spending gas (up to 30 min)
+        print(f"  [REDEEM] Waiting for on-chain resolution...")
+        condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+        resolved_on_chain = False
+        for poll in range(60):  # 60 polls * 30s = 30 minutes max
+            try:
+                w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+                ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
+                denom = ctf.functions.payoutDenominator(condition_bytes).call()
+                if denom > 0:
+                    resolved_on_chain = True
+                    print(f"  [REDEEM] On-chain resolution confirmed (poll {poll + 1})")
+                    break
+            except Exception as exc:
+                if DEBUG:
+                    print(f"  [REDEEM] Poll error: {exc}")
+            if poll < 59:
+                _time.sleep(30)
+
+        if not resolved_on_chain:
+            print(f"  [REDEEM] On-chain resolution not found after 30min. "
+                  f"Claim manually on Polymarket.")
+            self._log({
+                "type": "redemption",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "condition_id": condition_id,
+                "status": "timeout_no_onchain_resolution",
+            })
+            return None
+
+        # Now attempt the actual redemption tx
         for attempt in range(max_retries):
             if attempt > 0:
-                delay = 20 * attempt
-                print(f"  [REDEEM] Retry {attempt + 1}/{max_retries} in {delay}s...")
-                _time.sleep(delay)
+                print(f"  [REDEEM] Retry {attempt + 1}/{max_retries} in 10s...")
+                _time.sleep(10)
 
             result = self._try_redeem_once(condition_id)
             if result is not None:
@@ -980,9 +1665,11 @@ class LiveTradeTracker:
         hist = self.ctx.get("price_history", [])
         sigma_per_s = self.signal._compute_vol(hist[-self.signal.vol_lookback_s:]) if len(hist) >= self.signal.vol_lookback_s else 0.0
         tau = snapshot.time_remaining_s
-        dyn_threshold = self.signal.edge_threshold * (
+        window_trade_count = self.ctx.get("window_trade_count", 0)
+        base_for_trade = self.signal.edge_threshold + self.signal.edge_threshold_step * window_trade_count
+        dyn_threshold = base_for_trade * (
             1.0 + self.signal.early_edge_mult * math.sqrt(tau / self.signal.window_duration)
-        ) if tau > 0 else self.signal.edge_threshold
+        ) if tau > 0 else base_for_trade
 
         # Compute edges (same as decide())
         ask_up = snapshot.best_ask_up
@@ -998,16 +1685,24 @@ class LiveTradeTracker:
             spread_up = ask_up - bid_up
             spread_down = ask_down - bid_down
             delta = snapshot.chainlink_price - snapshot.window_start_price
-            z_raw = delta / (sigma_per_s * math.sqrt(tau))
+            z_raw = delta / (sigma_per_s * math.sqrt(tau) * snapshot.chainlink_price)
             from backtest import norm_cdf
             z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
             p_model = norm_cdf(z)
-            p_up_cost = ask_up + poly_fee(ask_up) + self.signal.slippage
-            p_down_cost = ask_down + poly_fee(ask_down) + self.signal.slippage
+            if self.maker_mode:
+                mid_up = (bid_up + ask_up) / 2.0
+                mid_down = (bid_down + ask_down) / 2.0
+                p_up_cost = mid_up
+                p_down_cost = mid_down
+                arb_spread = 1.0 - (mid_up + mid_down)
+            else:
+                p_up_cost = ask_up + poly_fee(ask_up) + self.signal.slippage
+                p_down_cost = ask_down + poly_fee(ask_down) + self.signal.slippage
+                arb_spread = None
             edge_up = p_model - p_up_cost - self.signal.spread_edge_penalty * spread_up
             edge_down = (1.0 - p_model) - p_down_cost - self.signal.spread_edge_penalty * spread_down
 
-        self._log({
+        diag = {
             "type": "diagnostic",
             "ts": datetime.now(timezone.utc).isoformat(),
             "market_slug": snapshot.market_slug,
@@ -1029,7 +1724,11 @@ class LiveTradeTracker:
             "reason": decision.reason,
             "hist_len": len(hist),
             "evals": self.signal_eval_count,
-        })
+        }
+        if arb_spread is not None:
+            diag["arb_spread"] = round(arb_spread, 4)
+            diag["mode"] = "maker_dual"
+        self._log(diag)
 
     def _log_flat_summary(self):
         """Log end-of-window summary of FLAT reason distribution."""
@@ -1059,7 +1758,7 @@ class LiveTradeTracker:
 
     def _log(self, record: dict):
         try:
-            with open(TRADES_LOG, "a") as f:
+            with open(self.trades_log, "a") as f:
                 f.write(json.dumps(record) + "\n")
         except Exception:
             pass
@@ -1081,20 +1780,23 @@ class LiveTradeTracker:
             "max_dd_pct": round(self.max_dd_pct, 4),
             "api_balance": round(self.api_balance, 2) if self.api_balance else None,
             "circuit_breaker": self.circuit_breaker_tripped,
+            "arb_pairs": self.arb_pairs_completed,
+            "arb_pnl": round(self.arb_total_pnl, 4),
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            with open(STATE_FILE, "w") as f:
+            with open(self.state_file, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
 
     @classmethod
-    def load_state(cls) -> dict | None:
-        if not STATE_FILE.exists():
+    def load_state(cls, path: Path | None = None) -> dict | None:
+        p = path or STATE_FILE
+        if not p.exists():
             return None
         try:
-            with open(STATE_FILE) as f:
+            with open(p) as f:
                 return json.load(f)
         except Exception:
             return None
@@ -1399,6 +2101,15 @@ def render_display(
     lines.append(f"  History:  {hist_len}s{vol_str}")
     lines.append("")
 
+    # Open limit orders (maker mode)
+    if tracker.open_orders:
+        for order in tracker.open_orders:
+            lines.append(
+                f"  Open Order:   {order['side']} "
+                f"{order['size']:.1f}sh @ {order['price']:.4f} "
+                f"(~${order['size'] * order['price']:.2f})"
+            )
+
     # Current window fills
     if tracker.pending_fills:
         for fill in tracker.pending_fills:
@@ -1414,7 +2125,9 @@ def render_display(
         lines.append("  This Window:  no trades")
 
     # Last result
-    if tracker.all_results:
+    if tracker.maker_mode and tracker.last_arb_result:
+        lines.append(f"  Last Arb:     {tracker.last_arb_result}")
+    elif tracker.all_results:
         r = tracker.all_results[-1]
         tag = "WON" if r.pnl > 0 else "LOST"
         lines.append(
@@ -1424,20 +2137,31 @@ def render_display(
     lines.append("")
 
     # Session stats
-    wins = [r for r in tracker.all_results if r.pnl > 0]
-    total = len(tracker.all_results)
     total_pnl = sum(r.pnl for r in tracker.all_results)
-    win_count = len(wins)
-    win_str = f"{win_count}/{total} ({win_count / total:.0%})" if total > 0 else "---"
-    lines.append(
-        f"  Session:  {tracker.windows_traded}/{tracker.windows_seen}"
-        f" windows traded  |  Win: {win_str}"
-    )
-    lines.append(
-        f"            PnL: ${total_pnl:+,.2f}"
-        f"  |  Fees: ~${tracker.total_fees:.2f}"
-        f"  |  DD: ${tracker.max_drawdown:.0f} ({tracker.max_dd_pct:.1%})"
-    )
+    if tracker.maker_mode:
+        lines.append(
+            f"  Session:  {tracker.windows_traded}/{tracker.windows_seen}"
+            f" windows  |  Arb pairs: {tracker.arb_pairs_completed}"
+        )
+        lines.append(
+            f"            Arb PnL: ${tracker.arb_total_pnl:+,.4f}"
+            f"  |  Total PnL: ${total_pnl:+,.2f}"
+            f"  |  DD: ${tracker.max_drawdown:.0f} ({tracker.max_dd_pct:.1%})"
+        )
+    else:
+        wins = [r for r in tracker.all_results if r.pnl > 0]
+        total = len(tracker.all_results)
+        win_count = len(wins)
+        win_str = f"{win_count}/{total} ({win_count / total:.0%})" if total > 0 else "---"
+        lines.append(
+            f"  Session:  {tracker.windows_traded}/{tracker.windows_seen}"
+            f" windows traded  |  Win: {win_str}"
+        )
+        lines.append(
+            f"            PnL: ${total_pnl:+,.2f}"
+            f"  |  Fees: ~${tracker.total_fees:.2f}"
+            f"  |  DD: ${tracker.max_drawdown:.0f} ({tracker.max_dd_pct:.1%})"
+        )
     lines.append("")
     lines.append("  Ctrl+C to exit (cancels open orders)")
 
@@ -1463,10 +2187,109 @@ async def display_ticker(
         await asyncio.sleep(1)
 
 
+# ── Multi-Market Display ────────────────────────────────────────────────────
+
+def render_multi_display():
+    """Render a combined display for all active markets."""
+    lines = ["\033[2J\033[H"]
+    mode = "DRY RUN" if DRY_RUN else "LIVE"
+    lines.append("=" * 62)
+    lines.append(f"  [{mode}] Arb Bot  |  Maker (0% fee)")
+    lines.append("=" * 62)
+
+    total_arb_pnl = 0.0
+    total_bankroll = 0.0
+    total_pairs = 0
+
+    for key in sorted(MARKET_DISPLAY_STATES):
+        state = MARKET_DISPLAY_STATES[key]
+        tracker = state["tracker"]
+        price_state = state["price_state"]
+        flat_state = state["flat_state"]
+        config = state["config"]
+        window_end = state["window_end"]
+
+        now = datetime.now(timezone.utc)
+        remaining = (window_end - now).total_seconds()
+
+        price = price_state.get("price")
+        price_str = f"${price:>12,.2f}" if price else "waiting..."
+
+        if remaining > 0:
+            m, s = int(remaining // 60), int(remaining % 60)
+            time_str = f"{m:02d}:{s:02d}"
+        else:
+            time_str = "RESOLVING"
+
+        lines.append("")
+        lines.append(f"  -- {config.display_name} --  {price_str}  |  Time: {time_str}")
+
+        # Book (compact)
+        def fp(k):
+            v = flat_state.get(k)
+            return f"{float(v):.2f}" if v else "---"
+
+        bid_up = fp("up_best_bid")
+        ask_up = fp("up_best_ask")
+        bid_down = fp("down_best_bid")
+        ask_down = fp("down_best_ask")
+        lines.append(f"  UP {bid_up}/{ask_up}  |  DOWN {bid_down}/{ask_down}")
+
+        # Status
+        dec = tracker.last_decision
+        lines.append(f"  {dec.reason[:55]}")
+
+        # Open orders
+        if tracker.open_orders:
+            parts = []
+            for o in tracker.open_orders:
+                parts.append(f"{o['side']} {o['size']:.0f}@{o['price']:.2f}")
+            lines.append(f"  Orders: {' | '.join(parts)}")
+
+        # Pending fills
+        if tracker.pending_fills:
+            parts = []
+            for f in tracker.pending_fills:
+                parts.append(f"{f['side']} {f['shares']:.0f}sh ${f['cost_usd']:.2f}")
+            lines.append(f"  Fills:  {' | '.join(parts)}")
+
+        # Per-market stats
+        lines.append(
+            f"  Pairs: {tracker.arb_pairs_completed}  |  "
+            f"Arb PnL: ${tracker.arb_total_pnl:+.4f}  |  "
+            f"Bankroll: ${tracker.bankroll:,.2f}"
+        )
+
+        total_arb_pnl += tracker.arb_total_pnl
+        total_bankroll += tracker.bankroll
+        total_pairs += tracker.arb_pairs_completed
+
+    lines.append("")
+    lines.append("-" * 62)
+    lines.append(
+        f"  TOTAL:  {total_pairs} arb pairs  |  "
+        f"Arb PnL: ${total_arb_pnl:+.4f}  |  "
+        f"Bankroll: ${total_bankroll:,.2f}"
+    )
+    lines.append("")
+    lines.append("  Ctrl+C to exit (cancels open orders)")
+
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+async def multi_display_ticker(cancel: asyncio.Event):
+    """Single display ticker that renders all active markets."""
+    while not cancel.is_set():
+        if MARKET_DISPLAY_STATES:
+            render_multi_display()
+        await asyncio.sleep(1)
+
+
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
 
 async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
-                     price_state: dict):
+                     price_state: dict, show_display: bool = True):
     """Run a single 15-minute trading window.
 
     price_state is a shared dict continuously updated by the persistent RTDS
@@ -1505,11 +2328,30 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
     book_up = OrderBook()
     book_down = OrderBook()
 
-    # Snapshot the current live RTDS price as this window's start price.
-    # Because RTDS stays connected across window transitions, this is
-    # the most recent oracle price (~1-2s old at most), far more accurate
-    # than the old approach of carrying a stale price across a reconnection gap.
+    # Get the window start price. Priority:
+    # 1. Live RTDS price (most accurate, ~1-2s old)
+    # 2. REST API fallback (if RTDS hasn't connected yet)
     current_price = price_state.get("price")
+    price_source = "RTDS"
+
+    if current_price is None:
+        # RTDS not connected yet — wait up to 10s for it
+        print(f"  Waiting for RTDS price feed...")
+        for _ in range(10):
+            await asyncio.sleep(1)
+            current_price = price_state.get("price")
+            if current_price is not None:
+                break
+
+    if current_price is None:
+        # Still no RTDS — fetch from REST API
+        print(f"  RTDS unavailable, fetching price from REST API...")
+        current_price = fetch_chainlink_price_rest(config)
+        price_source = "REST API"
+        if current_price is not None:
+            price_state["price"] = current_price
+            tracker.last_price_update_ts = _time.time()
+
     price_state["window_start_price"] = current_price
 
     flat_state = {
@@ -1535,10 +2377,21 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
     print(f"  [{mode}] Market: {title}")
     print(f"  Window:   {start.strftime('%H:%M:%S')} -> {end.strftime('%H:%M:%S')} UTC")
     if current_price is not None:
-        print(f"  Start price: ${current_price:,.2f} (live RTDS)")
+        print(f"  Start price: ${current_price:,.2f} ({price_source})")
     else:
-        print(f"  Start price: waiting for RTDS...")
+        print(f"  WARNING: No price available — trading disabled this window")
     print(f"  Bankroll: ${tracker.bankroll:,.2f}  |  Min order: {tracker.min_order_shares:.0f} shares")
+
+    # Update shared display state (for multi-market combined display)
+    MARKET_DISPLAY_STATES[config.data_subdir] = {
+        "tracker": tracker,
+        "price_state": price_state,
+        "flat_state": flat_state,
+        "config": config,
+        "window_start": start,
+        "window_end": end,
+        "market_title": title,
+    }
 
     cancel = asyncio.Event()
     tasks = [
@@ -1552,11 +2405,12 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
                           end, slug, up_token, down_token, cancel,
                           skip_trading=skip_trading)
         ),
-        asyncio.create_task(
+    ]
+    if show_display:
+        tasks.append(asyncio.create_task(
             display_ticker(tracker, price_state, flat_state,
                            title, start, end, cancel, config)
-        ),
-    ]
+        ))
 
     now = datetime.now(timezone.utc)
     await asyncio.sleep(max(0, (end - now).total_seconds()) + 5)
@@ -1580,14 +2434,9 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
 
 
 async def run(tracker: LiveTradeTracker, config: MarketConfig):
-    # Shared price state that persists across windows.
-    # The RTDS websocket continuously updates 'price'; at each window
-    # transition run_window() snapshots it as 'window_start_price'.
-    # Keeping RTDS persistent eliminates the reconnection gap that caused
-    # stale "Price to Beat" values ($20+ errors).
+    """Run a single market."""
     price_state: dict = {"price": None, "window_start_price": None}
 
-    # Persistent RTDS connection — stays alive across window transitions
     rtds_cancel = asyncio.Event()
     rtds_task = asyncio.create_task(
         rtds_ws(price_state, rtds_cancel, config, tracker)
@@ -1602,17 +2451,51 @@ async def run(tracker: LiveTradeTracker, config: MarketConfig):
         await asyncio.gather(rtds_task, return_exceptions=True)
 
 
+async def run_multi(runners: list[tuple[LiveTradeTracker, MarketConfig]]):
+    """Run multiple markets concurrently with a combined display."""
+    display_cancel = asyncio.Event()
+
+    async def market_loop(tracker: LiveTradeTracker, config: MarketConfig):
+        price_state: dict = {"price": None, "window_start_price": None}
+        rtds_cancel = asyncio.Event()
+        rtds_task = asyncio.create_task(
+            rtds_ws(price_state, rtds_cancel, config, tracker)
+        )
+        try:
+            while True:
+                await run_window(tracker, config, price_state,
+                                 show_display=False)
+        finally:
+            rtds_cancel.set()
+            rtds_task.cancel()
+            await asyncio.gather(rtds_task, return_exceptions=True)
+
+    tasks = [
+        asyncio.create_task(market_loop(t, c)) for t, c in runners
+    ]
+    tasks.append(asyncio.create_task(multi_display_ticker(display_cancel)))
+
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        display_cancel.set()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global DEBUG, DRY_RUN, TRADES_LOG, STATE_FILE
+    global DEBUG, DRY_RUN, TRADES_LOG, STATE_FILE, MULTI_MODE
 
     parser = argparse.ArgumentParser(
         description="Live trading bot for Polymarket Up/Down 15-min markets"
     )
     parser.add_argument(
-        "--market", default=DEFAULT_MARKET, choices=list(MARKET_CONFIGS),
-        help="Market to trade (default: btc)",
+        "--market", default=DEFAULT_MARKET,
+        choices=[*MARKET_CONFIGS, "all"],
+        help="Market to trade, or 'all' for both (default: btc)",
     )
     parser.add_argument(
         "--bankroll", type=float, default=None,
@@ -1631,8 +2514,16 @@ def main():
         help="Circuit breaker: max session loss %% (default: 50)",
     )
     parser.add_argument(
-        "--max-trades-per-window", type=int, default=1,
-        help="Max trades per 15-min window (default: 1)",
+        "--max-trades-per-window", type=int, default=4,
+        help="Max trades per 15-min window (default: 4)",
+    )
+    parser.add_argument(
+        "--edge-threshold-step", type=float, default=None,
+        help="Additional edge required per subsequent trade in a window (default: per-market)",
+    )
+    parser.add_argument(
+        "--maker", action="store_true",
+        help="Use GTC limit orders (maker, 0%% fee) instead of FOK market orders",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -1647,69 +2538,32 @@ def main():
     DEBUG = args.debug
     DRY_RUN = args.dry_run
 
-    config = get_config(args.market)
-    TRADES_LOG = Path(f"live_trades_{config.data_subdir}.jsonl")
-    STATE_FILE = Path(f"live_state_{config.data_subdir}.json")
+    multi = args.market == "all"
+    MULTI_MODE = multi
+    markets = list(MARKET_CONFIGS) if multi else [args.market]
 
-    # Build authenticated client
+    # Build authenticated client (shared across markets)
     print(f"\n  {'='*62}")
     mode = "DRY RUN" if DRY_RUN else "LIVE TRADING"
-    print(f"  {mode} -- {config.display_name} Up/Down 15m")
+    maker_tag = " [MAKER]" if args.maker else ""
+    market_label = "BTC + ETH" if multi else get_config(markets[0]).display_name
+    print(f"  {mode}{maker_tag} -- {market_label} Up/Down 15m")
     print(f"  {'='*62}")
 
     client = build_clob_client()
 
-    # Determine bankroll
+    # Determine total bankroll from API
     api_balance = query_usdc_balance(client)
     if api_balance is not None:
         print(f"  API USDC balance: ${api_balance:,.2f}")
 
-    bankroll = args.bankroll
-    saved = None
-    if args.resume:
-        saved = LiveTradeTracker.load_state()
-        if saved:
-            bankroll = saved["bankroll"]
-            print(f"  Resumed: bankroll=${bankroll:,.2f}, "
-                  f"{saved.get('total_trades', 0)} trades, "
-                  f"PnL=${saved.get('total_pnl', 0):+,.2f}")
-
-    if bankroll is None:
+    total_bankroll = args.bankroll
+    if total_bankroll is None:
         if api_balance is not None:
-            bankroll = api_balance
+            total_bankroll = api_balance
         else:
-            bankroll = 10_000.0
-            print(f"  WARNING: Could not query balance, using default ${bankroll:,.0f}")
-
-    # Per-market signal overrides (ETH needs tighter filters due to mean reversion)
-    signal_kw: dict = {}
-    if args.market == "eth":
-        signal_kw = dict(
-            edge_threshold=0.15,        # higher bar (BTC default 0.10)
-            reversion_discount=0.15,    # ETH mean-reverts ~33%, discount p toward 0.5
-            momentum_lookback_s=15,     # shorter lookback (ETH oscillates more)
-            momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
-            spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
-        )
-    signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
-    tracker = LiveTradeTracker(
-        client=client,
-        signal=signal,
-        initial_bankroll=bankroll,
-        latency_ms=args.latency,
-        slippage=args.slippage,
-        max_loss_pct=args.max_loss_pct,
-        max_trades_per_window=args.max_trades_per_window,
-    )
-    tracker.api_balance = api_balance
-
-    if saved:
-        tracker.windows_seen = saved.get("windows_seen", 0)
-        tracker.windows_traded = saved.get("windows_traded", 0)
-        tracker.total_fees = saved.get("total_fees", 0.0)
-        tracker.peak_bankroll = saved.get("peak_bankroll", bankroll)
-        tracker.max_drawdown = saved.get("max_drawdown", 0.0)
-        tracker.max_dd_pct = saved.get("max_dd_pct", 0.0)
+            total_bankroll = 10_000.0
+            print(f"  WARNING: Could not query balance, using default ${total_bankroll:,.0f}")
 
     # Gas balance check for on-chain redemption
     try:
@@ -1730,25 +2584,115 @@ def main():
     except Exception as exc:
         print(f"  WARNING: Gas check failed: {exc}")
 
-    print(f"  Bankroll:        ${bankroll:,.2f}")
+    # Per-market bankroll split (60/40 in multi mode)
+    BANKROLL_SPLIT = {"btc": 0.60, "eth": 0.40}
+
+    def build_signal_kw(market_key: str) -> dict:
+        """Signal kwargs for a given market."""
+        if market_key == "eth":
+            kw = dict(
+                edge_threshold=0.10,
+                edge_threshold_step=0.0,
+                max_bet_fraction=0.10,
+                reversion_discount=0.15,
+                momentum_lookback_s=15,
+                momentum_majority=0.7,
+                spread_edge_penalty=0.2,
+            )
+        else:
+            kw = dict(
+                edge_threshold=0.10,
+                edge_threshold_step=0.0,
+                max_bet_fraction=0.05,
+            )
+        if args.edge_threshold_step is not None:
+            kw["edge_threshold_step"] = args.edge_threshold_step
+        if args.maker:
+            kw["maker_mode"] = True
+            kw["max_bet_fraction"] = 0.03
+        return kw
+
+    def build_tracker(market_key: str, bankroll: float) -> LiveTradeTracker:
+        """Create a tracker for a single market."""
+        config = get_config(market_key)
+        log_path = Path(f"live_trades_{config.data_subdir}.jsonl")
+        state_path = Path(f"live_state_{config.data_subdir}.json")
+
+        signal_kw = build_signal_kw(market_key)
+        signal = DiffusionSignal(
+            bankroll=bankroll, slippage=args.slippage, **signal_kw)
+
+        saved = None
+        if args.resume:
+            saved = LiveTradeTracker.load_state(state_path)
+            if saved:
+                bankroll = saved["bankroll"]
+                print(f"  [{config.display_name}] Resumed: bankroll=${bankroll:,.2f}, "
+                      f"{saved.get('total_trades', 0)} trades, "
+                      f"PnL=${saved.get('total_pnl', 0):+,.2f}")
+
+        tracker = LiveTradeTracker(
+            client=client,
+            signal=signal,
+            initial_bankroll=bankroll,
+            latency_ms=args.latency,
+            slippage=args.slippage,
+            max_loss_pct=args.max_loss_pct,
+            max_trades_per_window=args.max_trades_per_window,
+            maker_mode=args.maker,
+            trades_log=log_path,
+            state_file=state_path,
+            market_key=market_key,
+        )
+        tracker.api_balance = api_balance
+
+        if saved:
+            tracker.windows_seen = saved.get("windows_seen", 0)
+            tracker.windows_traded = saved.get("windows_traded", 0)
+            tracker.total_fees = saved.get("total_fees", 0.0)
+            tracker.peak_bankroll = saved.get("peak_bankroll", bankroll)
+            tracker.max_drawdown = saved.get("max_drawdown", 0.0)
+            tracker.max_dd_pct = saved.get("max_dd_pct", 0.0)
+            tracker.arb_pairs_completed = saved.get("arb_pairs", 0)
+            tracker.arb_total_pnl = saved.get("arb_pnl", 0.0)
+
+        return tracker, config, log_path, state_path
+
+    # Build trackers for each market
+    trackers = []
+    for mkt in markets:
+        if multi:
+            bk = total_bankroll * BANKROLL_SPLIT.get(mkt, 0.5)
+        else:
+            bk = total_bankroll
+        tracker, config, log_path, state_path = build_tracker(mkt, bk)
+        trackers.append((tracker, config))
+
+        order_type = "GTC LIMIT dual-side (maker, 0% fee)" if args.maker else "FOK MARKET (taker)"
+        print(f"  [{config.display_name}] Bankroll: ${bk:,.2f}  |  "
+              f"Log: {log_path}  |  State: {state_path}")
+
+    print(f"  Order type:      {order_type}")
     print(f"  Max loss:        {args.max_loss_pct}%")
     print(f"  Max trades/win:  {args.max_trades_per_window}")
-    print(f"  Trades log:      {TRADES_LOG}")
-    print(f"  State file:      {STATE_FILE}")
     print()
 
     try:
-        asyncio.run(run(tracker, config))
+        if multi:
+            asyncio.run(run_multi(trackers))
+        else:
+            asyncio.run(run(trackers[0][0], trackers[0][1]))
     except KeyboardInterrupt:
         print(f"\n  Shutting down...")
-        if tracker.flat_reason_counts:
-            tracker._log_flat_summary()
-        tracker.cancel_all_orders()
-        tracker.save_state()
-        total_pnl = sum(r.pnl for r in tracker.all_results)
-        print(f"  Session PnL: ${total_pnl:+,.2f}")
-        print(f"  Final bankroll: ${tracker.bankroll:,.2f}")
-        print(f"  State saved to {STATE_FILE}")
+        for tracker, config in trackers:
+            if tracker.flat_reason_counts:
+                tracker._log_flat_summary()
+            tracker.cancel_all_orders()
+            tracker.save_state()
+            total_pnl = sum(r.pnl for r in tracker.all_results)
+            print(f"  [{config.display_name}] PnL: ${total_pnl:+,.2f} | "
+                  f"Arb PnL: ${tracker.arb_total_pnl:+,.4f} | "
+                  f"Bankroll: ${tracker.bankroll:,.2f}")
         print("  Exiting.")
 
 

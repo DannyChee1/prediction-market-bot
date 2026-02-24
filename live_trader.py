@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import json
 import math
 import os
@@ -1243,7 +1244,7 @@ class LiveTradeTracker:
         if sigma_per_s <= 0 or tau <= 0:
             return
 
-        delta = snapshot.chainlink_price - snapshot.window_start_price
+        delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
         z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
         p_model = self.signal._p_model(z, tau)
@@ -1809,7 +1810,7 @@ class LiveTradeTracker:
                 and sigma_per_s > 0 and tau > 0):
             spread_up = ask_up - bid_up
             spread_down = ask_down - bid_down
-            delta = snapshot.chainlink_price - snapshot.window_start_price
+            delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
             z_raw = delta / (sigma_per_s * math.sqrt(tau))
             z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
             p_model = self.signal._p_model(z, tau)
@@ -2051,17 +2052,23 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event,
                         data_arr = payload.get("data")
                         if isinstance(data_arr, list) and data_arr:
                             p = data_arr[-1].get("value")
+                            ts_ms = data_arr[-1].get("timestamp") or payload.get("timestamp")
                             if p is not None:
                                 price_state["price"] = float(p)
                                 tracker.last_price_update_ts = _time.time()
+                                if ts_ms is not None:
+                                    price_state["price_history"].append((int(ts_ms), float(p)))
                                 if price_state["window_start_price"] is None:
                                     price_state["window_start_price"] = float(p)
                             continue
 
                         p = payload.get("value")
+                        ts_ms = payload.get("timestamp")
                         if p is not None:
                             price_state["price"] = float(p)
                             tracker.last_price_update_ts = _time.time()
+                            if ts_ms is not None:
+                                price_state["price_history"].append((int(ts_ms), float(p)))
                             if price_state["window_start_price"] is None:
                                 price_state["window_start_price"] = float(p)
 
@@ -2374,40 +2381,40 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
     book_up = OrderBook()
     book_down = OrderBook()
 
-    # Wait until eventStartTime + 10s for accurate start price.
-    # The RTDS price at function entry can be well before eventStartTime;
-    # waiting gives Chainlink time to update and captures a price close
-    # to the actual resolution reference.
+    # Wait until eventStartTime + 5s so the RTDS buffer has the start price.
     now = datetime.now(timezone.utc)
-    target = start + timedelta(seconds=10)
+    target = start + timedelta(seconds=5)
     wait_s = (target - now).total_seconds()
     if 0 < wait_s <= 120:  # cap at 2 min to avoid hanging
         print(f"  Waiting {wait_s:.0f}s for start price (until {target.strftime('%H:%M:%S')} UTC)...")
         await asyncio.sleep(wait_s)
 
-    # Re-query Gamma API for any updated market info (future-proofing)
-    start_price_from_api = None
-    try:
-        resp = requests.get(
-            f"{GAMMA_API}/events", params={"slug": slug}, timeout=10
-        )
-        api_data = resp.json()
-        if api_data:
-            api_market = api_data[0]["markets"][0]
-            for field in ["startPrice", "referencePrice", "strikePrice"]:
-                val = api_market.get(field)
-                if val is not None:
-                    start_price_from_api = float(val)
-                    break
-    except Exception:
-        pass
+    # Look up exact Chainlink price at eventStartTime from RTDS buffer.
+    # Polymarket's "Price to Beat" = Chainlink price at this exact second.
+    start_ts_ms = int(start.timestamp() * 1000)
+    start_price_exact = None
+    history = price_state.get("price_history", [])
+    if history:
+        # Find exact match or closest within 2s
+        best_entry = None
+        best_diff = float("inf")
+        for ts_ms, px in history:
+            diff = abs(ts_ms - start_ts_ms)
+            if diff < best_diff:
+                best_diff = diff
+                best_entry = (ts_ms, px)
+        if best_entry and best_diff <= 2000:  # within 2 seconds
+            start_price_exact = best_entry[1]
 
-    if start_price_from_api is not None:
-        price_state["window_start_price"] = start_price_from_api
-        print(f"  Start price: ${start_price_from_api:,.2f} (from API)")
+    if start_price_exact is not None:
+        price_state["window_start_price"] = start_price_exact
+        offset_ms = best_entry[0] - start_ts_ms
+        print(f"  Start price: ${start_price_exact:,.2f} (Chainlink @ eventStart{offset_ms:+d}ms)")
     else:
         current_price = price_state.get("price")
         price_state["window_start_price"] = current_price
+        print(f"  Start price: ${current_price:,.2f} (RTDS fallback — no exact match in buffer)"
+              if current_price else "  Start price: waiting for RTDS...")
 
     flat_state = {
         "up_best_bid": None, "up_best_ask": None,
@@ -2431,13 +2438,7 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     print(f"  [{mode}] Market: {title}")
     print(f"  Window:   {start.strftime('%H:%M:%S')} -> {end.strftime('%H:%M:%S')} UTC")
-    start_px = price_state.get("window_start_price")
-    if start_price_from_api is not None:
-        pass  # already printed above
-    elif start_px is not None:
-        print(f"  Start price: ${start_px:,.2f} (RTDS @ {target.strftime('%H:%M:%S')})")
-    else:
-        print(f"  Start price: waiting for RTDS...")
+    # Start price already printed above during lookup
     print(f"  Bankroll: ${tracker.bankroll:,.2f}  |  Min order: {tracker.min_order_shares:.0f} shares")
 
     cancel = asyncio.Event()
@@ -2485,7 +2486,12 @@ async def run(tracker: LiveTradeTracker, config: MarketConfig):
     # transition run_window() snapshots it as 'window_start_price'.
     # Keeping RTDS persistent eliminates the reconnection gap that caused
     # stale "Price to Beat" values ($20+ errors).
-    price_state: dict = {"price": None, "window_start_price": None}
+    # price_history buffers (chainlink_ts_ms, price) for exact Price to Beat lookup.
+    price_state: dict = {
+        "price": None,
+        "window_start_price": None,
+        "price_history": collections.deque(maxlen=600),  # ~10 min at 1/s
+    }
 
     # Persistent RTDS connection — stays alive across window transitions
     rtds_cancel = asyncio.Event()

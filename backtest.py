@@ -169,7 +169,7 @@ def build_calibration_table(
             if sigma <= 0:
                 continue
 
-            delta = row["chainlink_price"] - start_px
+            delta = (row["chainlink_price"] - start_px) / start_px
             z_raw = delta / (sigma * math.sqrt(tau))
             z_capped = max(-max_z, min(max_z, z_raw))
 
@@ -418,6 +418,7 @@ class DiffusionSignal(Signal):
         edge_threshold_step: float = 0.0,
         calibration_table: CalibrationTable | None = None,
         maker_warmup_s: float = 180.0,
+        min_entry_price: float = 0.10,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -442,6 +443,7 @@ class DiffusionSignal(Signal):
         self.edge_threshold_step = edge_threshold_step
         self.calibration_table = calibration_table
         self.maker_warmup_s = maker_warmup_s
+        self.min_entry_price = min_entry_price
 
     def _compute_vol(self, prices: list[float]) -> float:
         """Realized vol from price series, ignoring stale (duplicate) ticks.
@@ -534,7 +536,7 @@ class DiffusionSignal(Signal):
                     f"{self.vol_regime_mult}x baseline {sigma_baseline:.2e})")
 
         # Model probability (z capped to prevent overconfidence)
-        delta = snapshot.chainlink_price - snapshot.window_start_price
+        delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = self._p_model(z, tau)
@@ -657,6 +659,9 @@ class DiffusionSignal(Signal):
         """Shared sizing logic for a single side. Returns a Decision."""
         if eff_price >= 1.0:
             return Decision("FLAT", 0.0, 0.0, "eff price >= 1")
+        if eff_price < self.min_entry_price:
+            return Decision("FLAT", 0.0, 0.0,
+                f"entry {eff_price:.2f} < min {self.min_entry_price:.2f}")
 
         kelly_f = max(0.0, (p_side - eff_price) / (1.0 - eff_price))
         frac = min(self.kelly_fraction * kelly_f, self.max_bet_fraction)
@@ -765,9 +770,9 @@ class DiffusionSignal(Signal):
             1.0 + self.early_edge_mult * math.sqrt(tau / self.window_duration)
         )
 
-        # z normalization: match decide() formula (sigma is already fractional)
+        # z normalization: fractional delta / (sigma * sqrt(tau))
         price = snapshot.chainlink_price
-        delta = price - snapshot.window_start_price
+        delta = (price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = self._p_model(z, tau)
@@ -1307,6 +1312,8 @@ def main():
                         help="Override max trades per window")
     parser.add_argument("--calibrated", action="store_true",
                         help="Use empirically calibrated probabilities instead of Phi(z)")
+    parser.add_argument("--min-entry-price", type=float, default=0.10,
+                        help="Minimum bid/entry price to accept (default 0.10)")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -1372,6 +1379,7 @@ def main():
         "diffusion": lambda: DiffusionSignal(
             bankroll=args.bankroll, slippage=args.slippage,
             calibration_table=cal_table,
+            min_entry_price=args.min_entry_price,
             **{**eth_overrides, **maker_overrides, **calibrated_overrides}),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

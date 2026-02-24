@@ -32,6 +32,9 @@ DATA_DIR = Path(__file__).parent / "data"
 # Windows whose final row has time_remaining_s above this are incomplete
 MIN_FINAL_REMAINING_S = 5.0
 
+# Skip windows where recording started more than this many seconds late
+MAX_START_GAP_S = 30.0
+
 
 # ── Fee & math helpers ──────────────────────────────────────────────────────
 
@@ -47,21 +50,31 @@ def norm_cdf(x: float) -> float:
 
 # ── Calibration table ──────────────────────────────────────────────────────
 
-def _compute_vol_deduped(prices: list[float]) -> float:
+def _compute_vol_deduped(
+    prices: list[float],
+    timestamps: list[int] | None = None,
+) -> float:
     """Realized vol from price series, ignoring stale (duplicate) ticks.
 
     Standalone version of DiffusionSignal._compute_vol for use outside
     the signal class (e.g. build_calibration_table).
+
+    When *timestamps* (ms) are provided, uses real time deltas instead
+    of assuming 1 second per row index.
     """
-    changes: list[tuple[int, float]] = []
+    changes: list[tuple[int, float, int]] = []   # (index, price, ts_ms)
     for i, p in enumerate(prices):
+        ts = timestamps[i] if timestamps is not None else i * 1000
         if p > 0 and (not changes or p != changes[-1][1]):
-            changes.append((i, p))
+            changes.append((i, p, ts))
     if len(changes) < 3:
         return 0.0
     log_rets = []
     for j in range(1, len(changes)):
-        dt = changes[j][0] - changes[j - 1][0]
+        if timestamps is not None:
+            dt = (changes[j][2] - changes[j - 1][2]) / 1000.0   # ms → seconds
+        else:
+            dt = changes[j][0] - changes[j - 1][0]              # index ≈ seconds
         if dt > 0:
             lr = math.log(changes[j][1] / changes[j - 1][1])
             log_rets.append(lr / math.sqrt(dt))
@@ -144,6 +157,15 @@ def build_calibration_table(
             final_remaining = df["time_remaining_s"].iloc[-1]
             if final_remaining > MIN_FINAL_REMAINING_S:
                 continue
+
+        # Skip windows where recording started too late (not a full window)
+        if ("window_start_ms" in df.columns and "window_end_ms" in df.columns
+                and "time_remaining_s" in df.columns):
+            window_dur_s = (df["window_end_ms"].iloc[0] - df["window_start_ms"].iloc[0]) / 1000
+            first_remaining = df["time_remaining_s"].iloc[0]
+            if first_remaining < window_dur_s - MAX_START_GAP_S:
+                continue
+
         windows.append(df)
 
     windows.sort(key=lambda d: d["ts_ms"].iloc[0])
@@ -164,14 +186,27 @@ def build_calibration_table(
 
         # Extract signals every 30 rows after warmup
         prices = df["chainlink_price"].tolist()
+        ts_list = df["ts_ms"].tolist()
         for idx in range(vol_lookback_s, len(df), 30):
             row = df.iloc[idx]
             tau = row["time_remaining_s"]
             if tau <= 0:
                 continue
 
-            price_slice = prices[max(0, idx - vol_lookback_s):idx + 1]
-            sigma = _compute_vol_deduped(price_slice)
+            lo = max(0, idx - vol_lookback_s)
+            price_slice = prices[lo:idx + 1]
+            ts_slice = ts_list[lo:idx + 1]
+
+            # Skip if lookback window has a gap > 5 seconds between rows
+            has_gap = False
+            for k in range(1, len(ts_slice)):
+                if ts_slice[k] - ts_slice[k - 1] > 5000:
+                    has_gap = True
+                    break
+            if has_gap:
+                continue
+
+            sigma = _compute_vol_deduped(price_slice, ts_slice)
             if sigma <= 0:
                 continue
 
@@ -428,6 +463,8 @@ class DiffusionSignal(Signal):
         cal_prior_strength: float = 100.0,
         inventory_skew: float = 0.02,
         maker_withdraw_s: float = 60.0,
+        sigma_ema_alpha: float = 0.15,
+        max_sigma: float | None = None,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -456,20 +493,30 @@ class DiffusionSignal(Signal):
         self.cal_prior_strength = cal_prior_strength
         self.inventory_skew = inventory_skew
         self.maker_withdraw_s = maker_withdraw_s
+        self.sigma_ema_alpha = sigma_ema_alpha
+        self.max_sigma = max_sigma
 
-    def _compute_vol(self, prices: list[float]) -> float:
+    def _compute_vol(
+        self,
+        prices: list[float],
+        timestamps: list[int] | None = None,
+    ) -> float:
         """Realized vol from price series, ignoring stale (duplicate) ticks.
 
         Chainlink oracle updates irregularly. Between updates the same
         price is recorded every tick, producing zero-returns that
         artificially deflate sigma.  We skip consecutive duplicates and
         normalize each return by sqrt(dt) to get per-second volatility.
+
+        When *timestamps* (ms) are provided, uses real time deltas
+        instead of assuming 1 second per row index.
         """
-        # Collect (index, price) for each actual price change
-        changes: list[tuple[int, float]] = []
+        # Collect (index, price, ts_ms) for each actual price change
+        changes: list[tuple[int, float, int]] = []
         for i, p in enumerate(prices):
+            ts = timestamps[i] if timestamps is not None else i * 1000
             if p > 0 and (not changes or p != changes[-1][1]):
-                changes.append((i, p))
+                changes.append((i, p, ts))
 
         if len(changes) < 3:
             return 0.0
@@ -477,14 +524,31 @@ class DiffusionSignal(Signal):
         # Time-normalized log returns
         log_rets = []
         for j in range(1, len(changes)):
-            dt = changes[j][0] - changes[j-1][0]   # ticks ≈ seconds
+            if timestamps is not None:
+                dt = (changes[j][2] - changes[j - 1][2]) / 1000.0   # ms → seconds
+            else:
+                dt = changes[j][0] - changes[j - 1][0]              # index ≈ seconds
             if dt > 0:
-                lr = math.log(changes[j][1] / changes[j-1][1])
+                lr = math.log(changes[j][1] / changes[j - 1][1])
                 log_rets.append(lr / math.sqrt(dt))
 
         if len(log_rets) < 2:
             return 0.0
         return max(float(np.std(log_rets, ddof=1)), self.min_sigma)
+
+    def _smoothed_sigma(self, raw_sigma: float, ctx: dict) -> float:
+        """Apply EMA smoothing and asset-specific cap to raw sigma."""
+        if raw_sigma == 0.0:
+            return 0.0
+        ema = ctx.get("_sigma_ema")
+        if ema is None:
+            ema = raw_sigma
+        else:
+            ema = self.sigma_ema_alpha * raw_sigma + (1 - self.sigma_ema_alpha) * ema
+        ctx["_sigma_ema"] = ema
+        if self.max_sigma is not None:
+            ema = min(ema, self.max_sigma)
+        return ema
 
     def _p_model(self, z_capped: float, tau: float) -> float:
         """Model probability of UP via Bayesian fusion of GBM + calibration.
@@ -504,9 +568,11 @@ class DiffusionSignal(Signal):
         return p_gbm
 
     def decide(self, snapshot: Snapshot, ctx: dict) -> Decision:
-        # Build price history
+        # Build price + timestamp history
         hist = ctx.setdefault("price_history", [])
+        ts_hist = ctx.setdefault("ts_history", [])
         hist.append(snapshot.chainlink_price)
+        ts_hist.append(snapshot.ts_ms)
 
         if len(hist) < max(2, self.vol_lookback_s):
             return Decision("FLAT", 0.0, 0.0,
@@ -545,18 +611,21 @@ class DiffusionSignal(Signal):
         )
 
         # Realized vol (short window for model)
-        sigma_per_s = self._compute_vol(hist[-self.vol_lookback_s:])
-        if sigma_per_s == 0.0:
+        raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
+        if raw_sigma == 0.0:
             return Decision("FLAT", 0.0, 0.0, "zero vol")
 
         # Vol regime filter: compare recent vol to longer baseline
         # If short-term vol > mult * long-term vol, market is stressed
         if len(hist) >= self.vol_regime_lookback_s:
-            sigma_baseline = self._compute_vol(hist[-self.vol_regime_lookback_s:])
-            if sigma_baseline > 0 and sigma_per_s > self.vol_regime_mult * sigma_baseline:
+            sigma_baseline = self._compute_vol(hist[-self.vol_regime_lookback_s:], ts_hist[-self.vol_regime_lookback_s:])
+            if sigma_baseline > 0 and raw_sigma > self.vol_regime_mult * sigma_baseline:
                 return Decision("FLAT", 0.0, 0.0,
-                    f"vol spike ({sigma_per_s:.2e} > "
+                    f"vol spike ({raw_sigma:.2e} > "
                     f"{self.vol_regime_mult}x baseline {sigma_baseline:.2e})")
+
+        # EMA smoothing + asset cap
+        sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
 
         # Model probability (z capped to prevent overconfidence)
         delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
@@ -724,9 +793,11 @@ class DiffusionSignal(Signal):
         """
         flat = Decision("FLAT", 0.0, 0.0, "")
 
-        # Build price history (always, even during warmup, so vol is ready)
+        # Build price + timestamp history (always, even during warmup, so vol is ready)
         hist = ctx.setdefault("price_history", [])
+        ts_hist = ctx.setdefault("ts_history", [])
         hist.append(snapshot.chainlink_price)
+        ts_hist.append(snapshot.ts_ms)
 
         # Maker warmup: no trading in first N seconds of window
         if self.maker_mode:
@@ -777,20 +848,23 @@ class DiffusionSignal(Signal):
                     Decision("FLAT", 0.0, 0.0, reason))
 
         # Vol
-        sigma_per_s = self._compute_vol(hist[-self.vol_lookback_s:])
-        if sigma_per_s == 0.0:
+        raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
+        if raw_sigma == 0.0:
             reason = "zero vol"
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
         # Vol regime filter
         if len(hist) >= self.vol_regime_lookback_s:
-            sigma_baseline = self._compute_vol(hist[-self.vol_regime_lookback_s:])
-            if sigma_baseline > 0 and sigma_per_s > self.vol_regime_mult * sigma_baseline:
-                reason = (f"vol spike ({sigma_per_s:.2e} > "
+            sigma_baseline = self._compute_vol(hist[-self.vol_regime_lookback_s:], ts_hist[-self.vol_regime_lookback_s:])
+            if sigma_baseline > 0 and raw_sigma > self.vol_regime_mult * sigma_baseline:
+                reason = (f"vol spike ({raw_sigma:.2e} > "
                           f"{self.vol_regime_mult}x baseline {sigma_baseline:.2e})")
                 return (Decision("FLAT", 0.0, 0.0, reason),
                         Decision("FLAT", 0.0, 0.0, reason))
+
+        # EMA smoothing + asset cap
+        sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
 
         # Dynamic threshold with optional step for window_trade_count
         window_trades = ctx.get("window_trade_count", 0)
@@ -945,6 +1019,17 @@ class BacktestEngine:
         final_remaining = window_df["time_remaining_s"].iloc[-1]
         if final_remaining > MIN_FINAL_REMAINING_S:
             return None
+
+        # Skip windows where recording started too late (not a full window)
+        if ("window_start_ms" in window_df.columns
+                and "window_end_ms" in window_df.columns):
+            window_dur_s = (
+                window_df["window_end_ms"].iloc[0]
+                - window_df["window_start_ms"].iloc[0]
+            ) / 1000
+            first_remaining = window_df["time_remaining_s"].iloc[0]
+            if first_remaining < window_dur_s - MAX_START_GAP_S:
+                return None
 
         start_price = window_df["window_start_price"].dropna()
         if start_price.empty:
@@ -1392,7 +1477,7 @@ def main():
     if args.market == "eth":
         eth_overrides = dict(
             edge_threshold=0.15,        # higher bar (BTC default 0.10)
-            reversion_discount=0.15,    # ETH mean-reverts ~33%, discount p toward 0.5
+            reversion_discount=0.10,    # ETH mean-reverts, discount p toward 0.5
             momentum_lookback_s=15,     # shorter lookback (ETH oscillates more)
             momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
             spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
@@ -1439,6 +1524,7 @@ def main():
             cal_prior_strength=args.cal_prior_strength,
             inventory_skew=args.inventory_skew,
             maker_withdraw_s=args.maker_withdraw,
+            max_sigma=config.max_sigma,
             **{**eth_overrides, **maker_overrides, **calibrated_overrides}),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

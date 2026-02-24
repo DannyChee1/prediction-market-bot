@@ -613,6 +613,10 @@ class LiveTradeTracker:
             if side_label in self.exited_sides:
                 continue
 
+            # Re-check trade limit each iteration (fills during poll can increment)
+            if self.window_trade_count >= self.max_trades_per_window:
+                break
+
             existing = self._get_open_order(side_label)
 
             if existing is not None:
@@ -1285,12 +1289,17 @@ class LiveTradeTracker:
 
         # Compute current p_model from live price data
         hist = self.ctx.get("price_history", [])
+        ts_hist = self.ctx.get("ts_history", [])
         if len(hist) < max(2, self.signal.vol_lookback_s):
             return
 
-        sigma_per_s = self.signal._compute_vol(hist[-self.signal.vol_lookback_s:])
-        if sigma_per_s <= 0 or tau <= 0:
+        raw_sigma = self.signal._compute_vol(
+            hist[-self.signal.vol_lookback_s:],
+            ts_hist[-self.signal.vol_lookback_s:] if ts_hist else None,
+        )
+        if raw_sigma <= 0 or tau <= 0:
             return
+        sigma_per_s = self.signal._smoothed_sigma(raw_sigma, self.ctx)
 
         delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
@@ -1932,7 +1941,12 @@ class LiveTradeTracker:
     def _log_diagnostic(self, snapshot: Snapshot, decision: Decision):
         """Log a signal diagnostic snapshot every 60s for post-hoc analysis."""
         hist = self.ctx.get("price_history", [])
-        sigma_per_s = self.signal._compute_vol(hist[-self.signal.vol_lookback_s:]) if len(hist) >= self.signal.vol_lookback_s else 0.0
+        ts_hist = self.ctx.get("ts_history", [])
+        raw_sigma = self.signal._compute_vol(
+            hist[-self.signal.vol_lookback_s:],
+            ts_hist[-self.signal.vol_lookback_s:] if ts_hist else None,
+        ) if len(hist) >= self.signal.vol_lookback_s else 0.0
+        sigma_per_s = self.signal._smoothed_sigma(raw_sigma, self.ctx) if raw_sigma > 0 else 0.0
         tau = snapshot.time_remaining_s
         dyn_threshold = self.signal.edge_threshold * (
             1.0 + self.signal.early_edge_mult * math.sqrt(tau / self.signal.window_duration)
@@ -2148,6 +2162,7 @@ async def clob_ws(
 async def rtds_ws(price_state: dict, cancel: asyncio.Event,
                   config: MarketConfig, tracker: LiveTradeTracker):
     backoff = 2
+    STALE_DATA_TIMEOUT = 60  # force reconnect if no price update for 60s
 
     while not cancel.is_set():
         try:
@@ -2172,7 +2187,23 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event,
                     except Exception:
                         pass
 
+                async def stale_watchdog():
+                    """Force-close ws if no price update within timeout."""
+                    try:
+                        while not cancel.is_set():
+                            await asyncio.sleep(10)
+                            if tracker.last_price_update_ts > 0:
+                                age = _time.time() - tracker.last_price_update_ts
+                                if age > STALE_DATA_TIMEOUT:
+                                    print(f"\n  [RTDS] stale data watchdog: "
+                                          f"no update for {age:.0f}s, forcing reconnect")
+                                    await ws.close()
+                                    return
+                    except Exception:
+                        pass
+
                 hb = asyncio.create_task(heartbeat())
+                wd = asyncio.create_task(stale_watchdog())
                 try:
                     async for raw in ws:
                         if cancel.is_set():
@@ -2215,6 +2246,7 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event,
 
                 finally:
                     hb.cancel()
+                    wd.cancel()
 
         except Exception as exc:
             if cancel.is_set():
@@ -2792,7 +2824,7 @@ def main():
     if base_market == "eth":
         signal_kw = dict(
             edge_threshold=0.15,        # higher bar (BTC default 0.10)
-            reversion_discount=0.15,    # ETH mean-reverts ~33%, discount p toward 0.5
+            reversion_discount=0.10,    # ETH mean-reverts, discount p toward 0.5
             momentum_lookback_s=15,     # shorter lookback (ETH oscillates more)
             momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
             spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
@@ -2833,6 +2865,7 @@ def main():
 
     signal_kw["inventory_skew"] = args.inventory_skew
     signal_kw["maker_withdraw_s"] = args.maker_withdraw
+    signal_kw["max_sigma"] = config.max_sigma
     signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
     tracker = LiveTradeTracker(
         client=client,

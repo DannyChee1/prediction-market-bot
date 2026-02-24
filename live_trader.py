@@ -874,7 +874,9 @@ class LiveTradeTracker:
     def _cancel_single_order(self, order: dict, reason: str) -> bool:
         """Cancel one order, refund reserved bankroll, remove from open_orders.
 
-        Returns False if the API cancel fails (order may have already filled).
+        Returns True if actually cancelled.
+        Returns False if cancel API failed OR order was already filled
+        (filled orders are moved to pending_fills automatically).
         """
         order_id = order["order_id"]
         if not DRY_RUN:
@@ -884,6 +886,67 @@ class LiveTradeTracker:
                 if DEBUG:
                     print(f"\n  [CANCEL] error cancelling {order_id[:12]}...: {exc}")
                 return False
+
+            # Verify cancel — order may have filled in the race window
+            try:
+                resp = self.client.get_order(order_id)
+                status = resp.get("status", "unknown")
+                size_matched = float(resp.get("size_matched", 0) or 0)
+                original_size = float(
+                    resp.get("original_size", order["shares"]) or order["shares"]
+                )
+                fill_pct = (
+                    size_matched / original_size if original_size > 0 else 0
+                )
+
+                if status == "MATCHED" or fill_pct >= 0.99:
+                    # Order filled before cancel — treat as a fill
+                    actual_cost = size_matched * order["price"]
+                    drift = order["cost_est"] - actual_cost
+                    self.bankroll += drift
+                    self.signal.bankroll = self.bankroll
+
+                    self.open_orders = [
+                        o for o in self.open_orders
+                        if o["order_id"] != order_id
+                    ]
+
+                    self.pending_fills.append({
+                        "market_slug": order["market_slug"],
+                        "side": order["side"],
+                        "cost_usd": actual_cost,
+                        "shares": size_matched,
+                        "order_id": order_id,
+                        "entry_ts": order["placed_ts"],
+                        "fill_ts_unix": _time.time(),
+                        "time_remaining_s": order["time_remaining_s"],
+                        "chainlink_price": order["chainlink_price"],
+                        "window_start_price": order["window_start_price"],
+                    })
+                    self.window_trade_count += 1
+                    self.position_count += 1
+
+                    entry_px = (
+                        actual_cost / size_matched if size_matched > 0 else 0
+                    )
+                    print(
+                        f"\n  [CANCEL->FILL] {order['side']} "
+                        f"{size_matched:.1f}sh @ {entry_px:.4f} "
+                        f"(${actual_cost:.2f}) — filled before cancel"
+                    )
+                    self._log({
+                        "type": "limit_fill",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "order_id": order_id,
+                        "side": order["side"],
+                        "shares": round(size_matched, 2),
+                        "price": order["price"],
+                        "cost_usd": round(actual_cost, 2),
+                        "note": f"filled_before_cancel: {reason}",
+                    })
+                    return False
+            except Exception:
+                pass  # get_order failed, assume cancel worked
 
         # Refund reserved bankroll
         self.bankroll += order["cost_est"]
@@ -1195,28 +1258,15 @@ class LiveTradeTracker:
         self.open_orders = still_open
 
     def _cancel_open_orders(self):
-        """Cancel all open limit orders and refund reserved bankroll."""
-        for order in self.open_orders:
-            order_id = order["order_id"]
-            if not DRY_RUN:
-                try:
-                    self.client.cancel(order_id)
-                except Exception as exc:
-                    if DEBUG:
-                        print(f"\n  [CANCEL] error: {exc}")
-            # Refund reserved bankroll
-            self.bankroll += order["cost_est"]
-            self.signal.bankroll = self.bankroll
-            self._log({
-                "type": "limit_cancel",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "order_id": order_id,
-                "side": order["side"],
-                "status": "cancelled_by_bot",
-                "refund": round(order["cost_est"], 2),
-            })
-        if self.open_orders:
-            print(f"\n  [CANCEL] Cancelled {len(self.open_orders)} open limit order(s)")
+        """Cancel all open limit orders and refund reserved bankroll.
+
+        Each order is verified after cancel — if it was filled in the race
+        window, it's moved to pending_fills instead of being refunded.
+        """
+        if not self.open_orders:
+            return
+        for order in list(self.open_orders):
+            self._cancel_single_order(order, "end_of_window")
         self.open_orders = []
 
     # ── Early exit methods ─────────────────────────────────────────────────

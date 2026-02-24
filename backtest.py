@@ -82,23 +82,29 @@ class CalibrationTable:
         self.counts = counts  # {(z_bin, tau_idx): n}
 
     def lookup(self, z_capped: float, tau: float) -> float:
+        """Return calibrated p(UP). For fusion mode, use lookup_with_count."""
+        p, _ = self.lookup_with_count(z_capped, tau)
+        return p
+
+    def lookup_with_count(self, z_capped: float, tau: float) -> tuple[float, int]:
+        """Return (p_calibrated, n_observations) for fusion with GBM prior."""
         z_bin = round(z_capped / self.Z_BIN_WIDTH) * self.Z_BIN_WIDTH
         tau_idx = self._tau_idx(tau)
 
         # Try exact (z_bin, tau_idx)
         key = (z_bin, tau_idx)
         if key in self.table and self.counts.get(key, 0) >= self.MIN_OBS:
-            return self.table[key]
+            return self.table[key], self.counts[key]
 
         # Fall back to z-bin only (average across tau buckets)
         z_vals = [(self.table[k], self.counts[k])
                   for k in self.table if k[0] == z_bin and self.counts.get(k, 0) >= 5]
         if z_vals:
             total_n = sum(n for _, n in z_vals)
-            return sum(p * n for p, n in z_vals) / total_n
+            return sum(p * n for p, n in z_vals) / total_n, total_n
 
-        # Final fallback: norm_cdf
-        return norm_cdf(z_capped)
+        # No calibration data for this cell
+        return norm_cdf(z_capped), 0
 
     def _tau_idx(self, tau: float) -> int:
         for i in range(len(self.TAU_EDGES) - 1):
@@ -417,8 +423,9 @@ class DiffusionSignal(Signal):
         maker_mode: bool = False,
         edge_threshold_step: float = 0.0,
         calibration_table: CalibrationTable | None = None,
-        maker_warmup_s: float = 180.0,
+        maker_warmup_s: float = 100.0,
         min_entry_price: float = 0.10,
+        cal_prior_strength: float = 100.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -444,6 +451,7 @@ class DiffusionSignal(Signal):
         self.calibration_table = calibration_table
         self.maker_warmup_s = maker_warmup_s
         self.min_entry_price = min_entry_price
+        self.cal_prior_strength = cal_prior_strength
 
     def _compute_vol(self, prices: list[float]) -> float:
         """Realized vol from price series, ignoring stale (duplicate) ticks.
@@ -475,10 +483,21 @@ class DiffusionSignal(Signal):
         return max(float(np.std(log_rets, ddof=1)), self.min_sigma)
 
     def _p_model(self, z_capped: float, tau: float) -> float:
-        """Model probability of UP, using calibration table if available."""
+        """Model probability of UP via Bayesian fusion of GBM + calibration.
+
+        p = w * p_calibrated + (1 - w) * p_gbm
+        w = n / (n + n0)
+
+        With few observations, leans on GBM prior.
+        With many observations, leans on calibration.
+        """
+        p_gbm = norm_cdf(z_capped)
         if self.calibration_table is not None:
-            return self.calibration_table.lookup(z_capped, tau)
-        return norm_cdf(z_capped)
+            p_cal, n = self.calibration_table.lookup_with_count(z_capped, tau)
+            if n > 0:
+                w = n / (n + self.cal_prior_strength)
+                return w * p_cal + (1 - w) * p_gbm
+        return p_gbm
 
     def decide(self, snapshot: Snapshot, ctx: dict) -> Decision:
         # Build price history
@@ -1314,6 +1333,8 @@ def main():
                         help="Use empirically calibrated probabilities instead of Phi(z)")
     parser.add_argument("--min-entry-price", type=float, default=0.10,
                         help="Minimum bid/entry price to accept (default 0.10)")
+    parser.add_argument("--cal-prior-strength", type=float, default=100.0,
+                        help="Bayesian prior strength n0 for GBM/calibration fusion (default 100)")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -1380,6 +1401,7 @@ def main():
             bankroll=args.bankroll, slippage=args.slippage,
             calibration_table=cal_table,
             min_entry_price=args.min_entry_price,
+            cal_prior_strength=args.cal_prior_strength,
             **{**eth_overrides, **maker_overrides, **calibrated_overrides}),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

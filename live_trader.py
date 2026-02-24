@@ -347,7 +347,7 @@ class LiveTradeTracker:
         max_order_age_s: float = 120.0,
         requote_cooldown_s: float = 3.0,
         max_exposure_pct: float = 20.0,
-        maker_warmup_s: float = 180.0,
+        maker_warmup_s: float = 100.0,
         exit_enabled: bool = False,
         exit_threshold: float = 0.03,
         exit_min_hold_s: float = 30.0,
@@ -382,6 +382,7 @@ class LiveTradeTracker:
         self.last_requote_ts: dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
 
         self.ctx: dict = {}
+        self.cal_data_dir: Path | None = None  # set externally for per-window rebuild
         self.pending_fills: list[dict] = []  # live fills awaiting resolution
         self.all_results: list[TradeResult] = []
         self.last_fill_ts_ms: int = 0
@@ -2097,7 +2098,7 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event,
     while not cancel.is_set():
         try:
             async with websockets.connect(
-                RTDS_WS, ssl=SSL_CTX, ping_interval=None
+                RTDS_WS, ssl=SSL_CTX, ping_interval=20, ping_timeout=10
             ) as ws:
                 backoff = 2
                 await ws.send(json.dumps({
@@ -2435,6 +2436,17 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
     window_start_price, which is much more accurate than carrying a stale
     price from after the previous window's RTDS disconnected.
     """
+    # Rebuild calibration table from latest data (recorder may have added new files)
+    if tracker.cal_data_dir is not None:
+        try:
+            cal_table = build_calibration_table(tracker.cal_data_dir)
+            tracker.signal.calibration_table = cal_table
+            n_obs = sum(cal_table.counts.values())
+            print(f"  Calibration table rebuilt: {len(cal_table.table)} cells, "
+                  f"{n_obs} obs")
+        except Exception as exc:
+            print(f"  WARNING: calibration rebuild failed: {exc}")
+
     win_m = int(config.window_duration_s / 60)
     print(f"  Searching for active {config.display_name} market...")
     event, market = find_market(config)
@@ -2652,8 +2664,8 @@ def main():
     )
     parser.add_argument("--max-exposure-pct", type=float, default=20.0,
                         help="Max %% of initial bankroll committed to open orders (default: 20)")
-    parser.add_argument("--maker-warmup", type=float, default=180.0,
-                        help="Maker: seconds to wait after window opens before trading (default: 180)")
+    parser.add_argument("--maker-warmup", type=float, default=100.0,
+                        help="Maker: seconds to wait after window opens before trading (default: 100)")
     parser.add_argument("--calibrated", action="store_true",
                         help="Use empirically calibrated probabilities")
     parser.add_argument("--early-exit", action="store_true",
@@ -2786,6 +2798,9 @@ def main():
         max_positions=args.max_positions,
     )
     tracker.api_balance = api_balance
+    if args.calibrated:
+        from backtest import DATA_DIR
+        tracker.cal_data_dir = DATA_DIR / config.data_subdir
 
     if saved:
         tracker.windows_seen = saved.get("windows_seen", 0)

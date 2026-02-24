@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Polymarket 15-Min Market Recorder
+Polymarket Market Recorder
 
 Captures 1-second snapshots to parquet for backtesting:
   - Full top-5 book depth for Up and Down outcomes
@@ -8,7 +8,7 @@ Captures 1-second snapshots to parquet for backtesting:
   - Window metadata and time remaining
   - Trade ticks (last_trade_price events)
 
-Outputs one parquet file per 15-minute window under ./data/<market>/
+Outputs one parquet file per window under ./data/<market>/
 
 Run with native Windows Python (has pyarrow):
     py -3 recorder.py                  # BTC (default)
@@ -123,11 +123,12 @@ def _ensure_list(val):
 
 # ── Market discovery ─────────────────────────────────────────────────────────
 def find_market(config: MarketConfig):
+    align = config.window_align_m
     now = datetime.now(timezone.utc)
-    minute = (now.minute // 15) * 15
+    minute = (now.minute // align) * align
     base = now.replace(minute=minute, second=0, microsecond=0)
 
-    for offset in [0, -15, 15, -30, 30]:
+    for offset in [0, -align, align, -2*align, 2*align]:
         candidate = base + timedelta(minutes=offset)
         ts = int(candidate.timestamp())
         slug = f"{config.slug_prefix}-{ts}"
@@ -453,7 +454,7 @@ async def run_window(config: MarketConfig):
     global chainlink_price, window_start_price
     global last_trade_up, last_trade_down
 
-    print(f"  Searching for active {config.display_name} 15-minute market...")
+    print(f"  Searching for active {config.display_name} market...")
     event, market = find_market(config)
 
     if not event or not market:
@@ -565,7 +566,7 @@ async def main(config: MarketConfig):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Record Polymarket 15-min data to parquet"
+        description="Record Polymarket market data to parquet"
     )
     parser.add_argument(
         "--market",

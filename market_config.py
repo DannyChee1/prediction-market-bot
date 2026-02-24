@@ -9,7 +9,7 @@ from dataclasses import dataclass
 class MarketConfig:
     slug_prefix: str       # "btc-updown-15m" / "btc-updown-5m"
     chainlink_symbol: str  # "btc/usd" / "eth/usd"
-    data_subdir: str       # "btc" / "eth" / "btc_5m" / "eth_5m"
+    data_subdir: str       # "btc_15m" / "eth_15m" / "btc_5m" / "eth_5m"
     display_name: str      # "BTC 15m" / "BTC 5m"
     window_duration_s: float = 900.0   # 900 for 15m, 300 for 5m
     window_align_m: int = 15           # minute alignment for find_market
@@ -19,7 +19,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
     "btc": MarketConfig(
         slug_prefix="btc-updown-15m",
         chainlink_symbol="btc/usd",
-        data_subdir="btc",
+        data_subdir="btc_15m",
         display_name="BTC 15m",
         window_duration_s=900.0,
         window_align_m=15,
@@ -27,7 +27,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
     "eth": MarketConfig(
         slug_prefix="eth-updown-15m",
         chainlink_symbol="eth/usd",
-        data_subdir="eth",
+        data_subdir="eth_15m",
         display_name="ETH 15m",
         window_duration_s=900.0,
         window_align_m=15,

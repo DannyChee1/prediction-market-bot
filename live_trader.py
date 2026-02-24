@@ -36,7 +36,11 @@ import websockets
 from dotenv import load_dotenv
 
 from web3 import Web3
-from web3.exceptions import ContractLogicError
+
+from eth_abi import encode as abi_encode
+from eth_account import Account as EthAccount
+from eth_account.messages import encode_defunct
+from py_builder_signing_sdk.signing.hmac import build_hmac_signature
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
@@ -108,27 +112,16 @@ CTF_ABI = [
     },
 ]
 
-PROXY_ABI = [
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"name": "to", "type": "address"},
-                    {"name": "value", "type": "uint256"},
-                    {"name": "data", "type": "bytes"},
-                ],
-                "name": "_calls",
-                "type": "tuple[]",
-            }
-        ],
-        "name": "proxy",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    }
-]
-
 PARENT_COLLECTION_ID = bytes(32)  # 0x0...0
+
+# ── Builder relayer constants (PROXY type) ──────────────────────────────────
+RELAYER_URL = "https://relayer-v2.polymarket.com"
+PROXY_FACTORY = Web3.to_checksum_address("0xaB45c5A4B0c941a2F231C04C3f49182e1A254052")
+RELAY_HUB = Web3.to_checksum_address("0xD216153c06E857cD7f72665E0aF1d7D82172F494")
+PROXY_INIT_CODE_HASH = bytes.fromhex(
+    "d21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
+)
+DEFAULT_RELAY_GAS_LIMIT = 500_000
 
 
 # ── CLOB client builder ─────────────────────────────────────────────────────
@@ -1515,6 +1508,7 @@ class LiveTradeTracker:
             })
 
         # Redeem winning CTF positions on-chain (background thread)
+        # Note: Wait at least 2 hours after market close per Polymarket docs
         has_winning = any(
             (f["side"] == "UP" and outcome_up == 1) or
             (f["side"] == "DOWN" and outcome_up == 0)
@@ -1587,13 +1581,13 @@ class LiveTradeTracker:
                          max_retries: int = 3,
                          max_poll_attempts: int = 60,
                          poll_interval_s: float = 30.0) -> str | None:
-        """Call CTF.redeemPositions() on-chain to convert winning tokens to USDC.
+        """Redeem winning CTF positions via the Polymarket builder relayer.
 
         First polls payoutDenominator on-chain (free eth_call) to wait for
-        the condition to be resolved on-chain before spending gas. On-chain
+        the condition to be resolved on-chain before submitting. On-chain
         resolution can lag the Gamma API by 20+ minutes.
 
-        Routes through the proxy wallet (sig type 1) or direct EOA (sig type 0).
+        Submits via the builder relayer (no POL gas needed).
         Returns the tx hash on success, None on failure.
         """
         if DRY_RUN:
@@ -1609,6 +1603,9 @@ class LiveTradeTracker:
         resolved = False
         try:
             w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+            if not w3.is_connected():
+                print("  [REDEEM] ERROR: Cannot connect to Polygon RPC")
+                return None
             ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
             for poll in range(max_poll_attempts):
                 try:
@@ -1652,130 +1649,206 @@ class LiveTradeTracker:
         return None
 
     def _try_redeem_once(self, condition_id: str) -> str | None:
-        """Single attempt at on-chain CTF redemption."""
-        try:
-            w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
-            if not w3.is_connected():
-                print("  [REDEEM] ERROR: Cannot connect to Polygon RPC")
-                return None
+        """Single attempt at CTF redemption via Polymarket builder relayer (PROXY type).
 
+        Matches the JS RelayerTxType.PROXY flow:
+        1. Encode redeemPositions calldata
+        2. Wrap in proxy((uint8,address,uint256,bytes)[]) call
+        3. Get relay payload (nonce + relay address)
+        4. Create struct hash with "rlx:" prefix and sign (EIP-191)
+        5. POST /submit with HMAC builder auth headers
+        6. Poll /transaction until confirmed
+        """
+        try:
             private_key = os.getenv("PRIVATE_KEY", "")
             if not private_key:
                 print("  [REDEEM] ERROR: PRIVATE_KEY not set")
                 return None
+            if not private_key.startswith("0x"):
+                private_key = "0x" + private_key
 
-            signer = w3.eth.account.from_key(private_key)
-            sig_type = int(os.getenv("SIGNATURE_TYPE", "1"))
-            funder = os.getenv("POLY_FUNDER", "")
-
-            # Check gas balance
-            pol_balance = w3.eth.get_balance(signer.address)
-            if pol_balance < w3.to_wei(0.001, "ether"):
-                print(f"  [REDEEM] ERROR: Insufficient POL for gas "
-                      f"({w3.from_wei(pol_balance, 'ether'):.6f} POL). "
-                      f"Send POL to {signer.address}")
+            builder_key = os.getenv("POLY_BUILDER_API_KEY", "")
+            builder_secret = os.getenv("POLY_BUILDER_SECRET", "")
+            builder_passphrase = os.getenv("POLY_BUILDER_PASSPHRASE", "")
+            if not all([builder_key, builder_secret, builder_passphrase]):
+                print("  [REDEEM] ERROR: Builder API creds not set "
+                      "(POLY_BUILDER_API_KEY, POLY_BUILDER_SECRET, "
+                      "POLY_BUILDER_PASSPHRASE)")
                 return None
 
-            # Encode CTF.redeemPositions(USDC, 0x0, conditionId, [1, 2])
+            signer = EthAccount.from_key(private_key)
+
+            # ── 1. Encode CTF.redeemPositions(USDC, 0x0, conditionId, [1, 2]) ──
+            w3 = Web3()
             ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
             condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
             redeem_data = ctf.encode_abi(
                 "redeemPositions",
-                args=[
-                    USDC_ADDRESS,
-                    PARENT_COLLECTION_ID,
-                    condition_bytes,
-                    [1, 2],  # indexSets: both outcomes
-                ],
+                args=[USDC_ADDRESS, PARENT_COLLECTION_ID, condition_bytes, [1, 2]],
             )
-
-            # Convert encode_abi output to raw bytes reliably.
-            # web3.py may return hex string ("0x...") or HexBytes.
             if isinstance(redeem_data, str):
                 redeem_bytes = bytes.fromhex(
-                    redeem_data[2:] if redeem_data.startswith("0x")
-                    else redeem_data
+                    redeem_data[2:] if redeem_data.startswith("0x") else redeem_data
                 )
             else:
                 redeem_bytes = bytes(redeem_data)
 
-            if sig_type == 0:
-                # EOA: send tx directly to CTF contract
-                tx = {
-                    "to": CTF_ADDRESS,
-                    "data": redeem_data,
-                    "from": signer.address,
-                    "nonce": w3.eth.get_transaction_count(signer.address),
-                    "gas": 200_000,
-                    "maxFeePerGas": w3.eth.gas_price * 2,
-                    "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
-                    "chainId": CHAIN_ID,
-                }
-            else:
-                # Proxy wallet: wrap in proxy([ProxyCall])
-                proxy_addr = Web3.to_checksum_address(funder)
-                proxy_contract = w3.eth.contract(address=proxy_addr, abi=PROXY_ABI)
-                proxy_call_data = proxy_contract.encode_abi(
-                    "proxy",
-                    args=[[(CTF_ADDRESS, 0, redeem_bytes)]],
-                )
-                tx = {
-                    "to": proxy_addr,
-                    "data": proxy_call_data,
-                    "from": signer.address,
-                    "nonce": w3.eth.get_transaction_count(signer.address),
-                    "gas": 300_000,
-                    "maxFeePerGas": w3.eth.gas_price * 2,
-                    "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
-                    "chainId": CHAIN_ID,
-                }
+            # ── 2. Wrap in proxy((uint8,address,uint256,bytes)[]) ──
+            # typeCode=1 (Call), to=CTF, value=0, data=redeemPositions
+            proxy_selector = w3.keccak(
+                b"proxy((uint8,address,uint256,bytes)[])"
+            )[:4]
+            proxy_args = abi_encode(
+                ["(uint8,address,uint256,bytes)[]"],
+                [[(1, CTF_ADDRESS, 0, redeem_bytes)]],
+            )
+            proxy_data = "0x" + (proxy_selector + proxy_args).hex()
 
-            print(f"  [REDEEM] Sending tx (sig_type={sig_type}, "
-                  f"conditionId={condition_id[:10]}...)...")
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            tx_hash_hex = tx_hash.hex()
+            # ── 3. Derive proxy wallet via CREATE2 ──
+            salt = w3.keccak(bytes.fromhex(signer.address[2:].lower()))
+            create2_input = (
+                b"\xff"
+                + bytes.fromhex(PROXY_FACTORY[2:])
+                + salt
+                + PROXY_INIT_CODE_HASH
+            )
+            proxy_wallet = Web3.to_checksum_address(
+                "0x" + w3.keccak(create2_input).hex()[-40:]
+            )
 
-            print(f"  [REDEEM] Tx sent: {tx_hash_hex}")
+            # ── 4. Get relay payload (nonce + relay address) ──
+            headers = self._builder_headers(
+                builder_key, builder_secret, builder_passphrase,
+                "GET", f"/relay-payload?address={signer.address}&type=PROXY",
+            )
+            resp = requests.get(
+                f"{RELAYER_URL}/relay-payload",
+                params={"address": signer.address, "type": "PROXY"},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            relay_address = payload["address"]
+            nonce = payload["nonce"]
+
+            # ── 5. Create struct hash and sign (EIP-191) ──
+            gas_limit = DEFAULT_RELAY_GAS_LIMIT
+            struct_data = (
+                b"rlx:"
+                + bytes.fromhex(signer.address[2:])
+                + bytes.fromhex(PROXY_FACTORY[2:])
+                + bytes.fromhex(proxy_data[2:])
+                + int(0).to_bytes(32, "big")          # txFee
+                + int(0).to_bytes(32, "big")          # gasPrice
+                + int(gas_limit).to_bytes(32, "big")  # gasLimit
+                + int(nonce).to_bytes(32, "big")      # nonce
+                + bytes.fromhex(RELAY_HUB[2:])
+                + bytes.fromhex(relay_address.replace("0x", ""))
+            )
+            struct_hash = w3.keccak(struct_data)
+            msg = encode_defunct(struct_hash)
+            sig = EthAccount.sign_message(msg, private_key)
+            signature = "0x" + sig.signature.hex()
+
+            # ── 6. POST /submit ──
+            body = {
+                "type": "PROXY",
+                "from": signer.address,
+                "to": PROXY_FACTORY,
+                "proxyWallet": proxy_wallet,
+                "data": proxy_data,
+                "nonce": str(nonce),
+                "signature": signature,
+                "signatureParams": {
+                    "gasPrice": "0",
+                    "gasLimit": str(gas_limit),
+                    "relayerFee": "0",
+                    "relayHub": RELAY_HUB,
+                    "relay": relay_address,
+                },
+                "metadata": "Redeem winnings",
+            }
+
+            print(f"  [REDEEM] Submitting via relayer "
+                  f"(conditionId={condition_id[:10]}..., "
+                  f"proxy={proxy_wallet[:10]}...)...")
+
+            submit_headers = self._builder_headers(
+                builder_key, builder_secret, builder_passphrase,
+                "POST", "/submit", body,
+            )
+            submit_headers["Content-Type"] = "application/json"
+            resp = requests.post(
+                f"{RELAYER_URL}/submit",
+                json=body,
+                headers=submit_headers,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            tx_id = result.get("transactionId", "")
+            tx_hash = result.get("transactionHash", "")
+
+            print(f"  [REDEEM] Relayer accepted: id={tx_id}, hash={tx_hash}")
             print(f"  [REDEEM] Waiting for confirmation...")
 
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-            status = receipt.get("status", 0)
+            # ── 7. Poll /transaction until confirmed ──
+            confirmed = False
+            for poll in range(30):
+                _time.sleep(2)
+                poll_headers = self._builder_headers(
+                    builder_key, builder_secret, builder_passphrase,
+                    "GET", f"/transaction?id={tx_id}",
+                )
+                try:
+                    r = requests.get(
+                        f"{RELAYER_URL}/transaction",
+                        params={"id": tx_id},
+                        headers=poll_headers,
+                    )
+                    r.raise_for_status()
+                    tx_data = r.json()
+                    state = ""
+                    if isinstance(tx_data, list) and tx_data:
+                        state = tx_data[0].get("state", "")
+                        tx_hash = tx_data[0].get("transactionHash", tx_hash)
+                    elif isinstance(tx_data, dict):
+                        state = tx_data.get("state", "")
+                        tx_hash = tx_data.get("transactionHash", tx_hash)
 
-            if status == 1:
-                gas_used = receipt.get("gasUsed", 0)
-                print(f"  [REDEEM] Confirmed! Gas used: {gas_used}")
+                    if state in ("STATE_MINED", "STATE_CONFIRMED"):
+                        confirmed = True
+                        print(f"  [REDEEM] Confirmed! (state={state}, "
+                              f"hash={tx_hash})")
+                        break
+                    elif state == "STATE_FAILED":
+                        print(f"  [REDEEM] Relayer tx FAILED (id={tx_id})")
+                        break
+                except Exception as poll_exc:
+                    if DEBUG:
+                        print(f"  [REDEEM] Poll error: {poll_exc}")
+
+            if confirmed:
                 self._log({
                     "type": "redemption",
                     "ts": datetime.now(timezone.utc).isoformat(),
-                    "tx_hash": tx_hash_hex,
+                    "tx_hash": tx_hash,
+                    "tx_id": tx_id,
                     "condition_id": condition_id,
-                    "gas_used": gas_used,
                     "status": "success",
                 })
-                return tx_hash_hex
+                return tx_hash
             else:
-                print(f"  [REDEEM] Tx reverted (hash: {tx_hash_hex}) — "
-                      f"market may not be resolved on-chain yet")
+                print(f"  [REDEEM] Relayer tx not confirmed after 60s "
+                      f"(id={tx_id}, hash={tx_hash})")
                 self._log({
                     "type": "redemption",
                     "ts": datetime.now(timezone.utc).isoformat(),
-                    "tx_hash": tx_hash_hex,
+                    "tx_hash": tx_hash,
+                    "tx_id": tx_id,
                     "condition_id": condition_id,
-                    "status": "reverted",
+                    "status": "relayer_timeout",
                 })
                 return None
-
-        except ContractLogicError as exc:
-            print(f"  [REDEEM] Contract reverted: {exc}")
-            self._log({
-                "type": "redemption",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "condition_id": condition_id,
-                "status": "contract_error",
-                "error": str(exc),
-            })
-            return None
 
         except Exception as exc:
             print(f"  [REDEEM] ERROR: {type(exc).__name__}: {exc}")
@@ -1787,6 +1860,19 @@ class LiveTradeTracker:
                 "error": str(exc),
             })
             return None
+
+    @staticmethod
+    def _builder_headers(key: str, secret: str, passphrase: str,
+                         method: str, path: str, body=None) -> dict:
+        """Generate HMAC auth headers for the Polymarket builder relayer."""
+        ts = str(int(_time.time()))
+        sig = build_hmac_signature(secret, ts, method, path, body)
+        return {
+            "POLY_BUILDER_API_KEY": key,
+            "POLY_BUILDER_PASSPHRASE": passphrase,
+            "POLY_BUILDER_SIGNATURE": sig,
+            "POLY_BUILDER_TIMESTAMP": ts,
+        }
 
     def _log_diagnostic(self, snapshot: Snapshot, decision: Decision):
         """Log a signal diagnostic snapshot every 60s for post-hoc analysis."""
@@ -2593,7 +2679,7 @@ def main():
     if args.max_trades_per_window is not None:
         max_trades = args.max_trades_per_window
     else:
-        max_trades = 4 if args.maker else 1
+        max_trades = 3 if args.maker else 1
 
     # Build authenticated client
     print(f"\n  {'='*62}")
@@ -2650,7 +2736,7 @@ def main():
     if args.maker:
         signal_kw["maker_mode"] = True
         signal_kw["max_bet_fraction"] = 0.02
-        signal_kw["edge_threshold"] = 0.06
+        signal_kw["edge_threshold"] = 0.10
         signal_kw["momentum_majority"] = 0.0
         signal_kw["spread_edge_penalty"] = 0.0  # bid pricing handles spread naturally
         cooldown_ms = 30_000  # no global cooldown in maker (kept for FOK compat)
@@ -2669,10 +2755,10 @@ def main():
         signal_kw["calibration_table"] = cal_table
         # Calibrated edges are smaller/honest — still require meaningful edge
         if args.maker:
-            signal_kw["edge_threshold"] = 0.06
+            signal_kw["edge_threshold"] = 0.10
             signal_kw["early_edge_mult"] = 2.0
         else:
-            signal_kw["edge_threshold"] = 0.06
+            signal_kw["edge_threshold"] = 0.10
             signal_kw["early_edge_mult"] = 2.0
 
     signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)

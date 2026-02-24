@@ -1355,7 +1355,7 @@ def main():
             window_duration=config.window_duration_s,
         )
         if "max_trades_per_window" not in eth_engine_kw:
-            eth_engine_kw["max_trades_per_window"] = 4
+            eth_engine_kw["max_trades_per_window"] = 3
 
     if args.max_trades_per_window is not None:
         eth_engine_kw["max_trades_per_window"] = args.max_trades_per_window
@@ -1371,9 +1371,9 @@ def main():
         print(f"  Calibration table: {n_cells} cells, {n_obs} observations")
         # Calibrated edges are smaller/honest — still require meaningful edge
         if args.maker:
-            calibrated_overrides = dict(edge_threshold=0.06, early_edge_mult=2.0)
+            calibrated_overrides = dict(edge_threshold=0.10, early_edge_mult=2.0)
         else:
-            calibrated_overrides = dict(edge_threshold=0.06, early_edge_mult=2.0)
+            calibrated_overrides = dict(edge_threshold=0.10, early_edge_mult=2.0)
 
     signal_map = {
         "diffusion": lambda: DiffusionSignal(

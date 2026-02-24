@@ -24,6 +24,7 @@ import math
 import os
 import ssl
 import sys
+import threading
 import time as _time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -38,16 +39,16 @@ from web3.exceptions import ContractLogicError
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
-    MarketOrderArgs, OrderType, ApiCreds, BalanceAllowanceParams,
+    MarketOrderArgs, OrderArgs, OrderType, ApiCreds, BalanceAllowanceParams,
     OpenOrderParams,
 )
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
 
 from recorder import OrderBook
 from backtest import (
     Snapshot, Decision, Fill, TradeResult,
     DiffusionSignal, walk_book, poly_fee, BacktestEngine,
-    norm_cdf,
+    norm_cdf, CalibrationTable, build_calibration_table,
 )
 from market_config import MarketConfig, MARKET_CONFIGS, DEFAULT_MARKET, get_config
 
@@ -96,7 +97,14 @@ CTF_ABI = [
         "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function",
-    }
+    },
+    {
+        "inputs": [{"name": "conditionId", "type": "bytes32"}],
+        "name": "payoutDenominator",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 PROXY_ABI = [
@@ -210,10 +218,11 @@ def _try_slug(slug: str):
 
 def find_market(config: MarketConfig):
     now = datetime.now(timezone.utc)
-    minute = (now.minute // 15) * 15
+    align = config.window_align_m
+    minute = (now.minute // align) * align
     window_start = now.replace(minute=minute, second=0, microsecond=0)
 
-    for offset in [0, -15, 15, -30, 30]:
+    for offset in [0, -align, align, -2 * align, 2 * align]:
         candidate = window_start + timedelta(minutes=offset)
         ts = int(candidate.timestamp())
         result = _try_slug(f"{config.slug_prefix}-{ts}")
@@ -338,6 +347,18 @@ class LiveTradeTracker:
         max_trades_per_window: int = 1,
         stale_price_timeout_s: float = 10.0,
         min_balance_usd: float = 5.0,
+        maker_mode: bool = False,
+        window_duration_s: float = 900.0,
+        edge_cancel_threshold: float = 0.02,
+        max_order_age_s: float = 120.0,
+        requote_cooldown_s: float = 3.0,
+        max_exposure_pct: float = 20.0,
+        maker_warmup_s: float = 180.0,
+        exit_enabled: bool = False,
+        exit_threshold: float = 0.03,
+        exit_min_hold_s: float = 30.0,
+        exit_min_remaining_s: float = 60.0,
+        max_positions: int = 4,
     ):
         self.client = client
         self.signal = signal
@@ -355,11 +376,24 @@ class LiveTradeTracker:
         self.circuit_breaker_tripped = False
         self.circuit_breaker_reason = ""
 
+        # Maker mode
+        self.maker_mode = maker_mode
+        self.window_duration_s = window_duration_s
+        self.max_exposure_pct = max_exposure_pct
+        self.maker_warmup_s = maker_warmup_s
+        self.open_orders: list[dict] = []  # resting limit orders
+        self.edge_cancel_threshold = edge_cancel_threshold
+        self.max_order_age_s = max_order_age_s
+        self.requote_cooldown_s = requote_cooldown_s
+        self.last_requote_ts: dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
+
         self.ctx: dict = {}
         self.pending_fills: list[dict] = []  # live fills awaiting resolution
         self.all_results: list[TradeResult] = []
         self.last_fill_ts_ms: int = 0
         self.last_decision: Decision = Decision("FLAT", 0.0, 0.0, "initializing")
+        self.last_up_decision: Decision = Decision("FLAT", 0.0, 0.0, "")
+        self.last_down_decision: Decision = Decision("FLAT", 0.0, 0.0, "")
         self.last_price_update_ts: float = 0.0
         self.window_trade_count: int = 0
         self.min_order_shares: float = 5.0  # Polymarket min_order_size
@@ -379,6 +413,15 @@ class LiveTradeTracker:
         # On-chain redemption
         self.condition_id: str = ""
 
+        # Early exit / position management
+        self.exit_enabled = exit_enabled
+        self.exit_threshold = exit_threshold
+        self.exit_min_hold_s = exit_min_hold_s
+        self.exit_min_remaining_s = exit_min_remaining_s
+        self.max_positions = max_positions
+        self.position_count: int = 0
+        self.exited_sides: set[str] = set()
+
         # Signal diagnostics
         self.flat_reason_counts: dict[str, int] = {}
         self.signal_eval_count: int = 0
@@ -388,15 +431,24 @@ class LiveTradeTracker:
         # Log previous window's FLAT reason summary before resetting
         if self.flat_reason_counts:
             self._log_flat_summary()
+        # Cancel leftover limit orders from previous window
+        if self.open_orders:
+            self._cancel_open_orders()
         self.ctx = {}
         self.pending_fills = []
+        self.open_orders = []
         self.last_fill_ts_ms = 0
         self.last_decision = Decision("FLAT", 0.0, 0.0, "new window")
+        self.last_up_decision = Decision("FLAT", 0.0, 0.0, "")
+        self.last_down_decision = Decision("FLAT", 0.0, 0.0, "")
         self.windows_seen += 1
         self.window_trade_count = 0
+        self.position_count = 0
+        self.exited_sides = set()
         self.flat_reason_counts: dict[str, int] = {}
         self.signal_eval_count = 0
         self.last_diag_ts: float = 0.0
+        self.last_requote_ts = {"UP": 0.0, "DOWN": 0.0}
 
     def _check_circuit_breakers(self) -> str | None:
         """Returns reason string if trading should stop, None if OK."""
@@ -460,6 +512,11 @@ class LiveTradeTracker:
             )
             return self.last_decision
 
+        # ── Maker mode: dual-side limit orders ──
+        if self.maker_mode:
+            return self._evaluate_maker(snapshot, up_token, down_token)
+
+        # ── FOK mode (original path) ──
         # Cooldown
         if (self.last_fill_ts_ms > 0
                 and snapshot.ts_ms - self.last_fill_ts_ms < self.cooldown_ms):
@@ -475,33 +532,7 @@ class LiveTradeTracker:
         self.signal_eval_count += 1
 
         if decision.action == "FLAT":
-            # Bucket the reason for end-of-window summary
-            reason = decision.reason
-            # Normalize to category (strip variable numbers)
-            if reason.startswith("need "):
-                cat = "warmup"
-            elif reason.startswith("no edge"):
-                cat = "no_edge"
-            elif "momentum fail" in reason:
-                cat = "momentum_fail"
-            elif "spread too wide" in reason:
-                cat = "spread_wide"
-            elif "imbalance" in reason:
-                cat = "imbalance"
-            elif "delta velocity" in reason:
-                cat = "delta_velocity"
-            elif "vol spike" in reason:
-                cat = "vol_spike"
-            elif "zero vol" in reason:
-                cat = "zero_vol"
-            elif "missing book" in reason:
-                cat = "missing_book"
-            elif "kelly" in reason:
-                cat = "kelly_zero"
-            else:
-                cat = reason[:30]
-            self.flat_reason_counts[cat] = self.flat_reason_counts.get(cat, 0) + 1
-
+            self._bucket_flat_reason(decision.reason)
             # Periodic diagnostic snapshot (every 60s)
             now = _time.time()
             if now - self.last_diag_ts >= 60:
@@ -511,6 +542,172 @@ class LiveTradeTracker:
             self._place_order(snapshot, decision, up_token, down_token)
 
         return decision
+
+    def _evaluate_maker(
+        self,
+        snapshot: Snapshot,
+        up_token: str,
+        down_token: str,
+    ) -> Decision:
+        """Maker mode: continuous quote management with cancel/replace.
+
+        Every 1s tick:
+        1. Time blackout checks (warmup 60s, end-of-window 30s)
+        2. Poll open orders for fills
+        3. ALWAYS run decide_both_sides() to get current edge at current bid
+        4. For each side: manage existing orders or place new ones
+        5. Bucket FLAT reasons, periodic diagnostics
+        """
+        tau = snapshot.time_remaining_s
+        elapsed = self.window_duration_s - tau
+
+        # Time blackout: no trading in first N seconds (default 180s)
+        if elapsed < self.maker_warmup_s:
+            reason = f"maker warmup ({elapsed:.0f}s < {self.maker_warmup_s:.0f}s)"
+            self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
+            self._bucket_flat_reason(reason)
+            return self.last_decision
+
+        # Time blackout: cancel open orders and stop in last 30s
+        if tau < 30:
+            if self.open_orders:
+                self._cancel_open_orders()
+            reason = f"maker end-of-window ({tau:.0f}s < 30s)"
+            self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
+            self._bucket_flat_reason(reason)
+            return self.last_decision
+
+        # Poll open orders for fills
+        self._poll_open_orders(snapshot)
+
+        # Evaluate early exits on filled positions
+        if self.exit_enabled:
+            self._evaluate_exits(snapshot, up_token, down_token)
+
+        # ALWAYS run dual-side signal to get current edge at current bid
+        self.ctx["window_trade_count"] = self.window_trade_count
+        up_dec, down_dec = self.signal.decide_both_sides(snapshot, self.ctx)
+        self.last_up_decision = up_dec
+        self.last_down_decision = down_dec
+        self.signal_eval_count += 1
+
+        # Use the better-edged side for display
+        if up_dec.action != "FLAT" or down_dec.action != "FLAT":
+            self.last_decision = up_dec if up_dec.edge >= down_dec.edge else down_dec
+        else:
+            self.last_decision = up_dec  # both FLAT, use up's reason
+
+        now = _time.time()
+
+        # Current bids for comparison
+        current_bids = {
+            "UP": snapshot.best_bid_up,
+            "DOWN": snapshot.best_bid_down,
+        }
+
+        # Manage each side independently
+        for dec, token, side_label in [
+            (up_dec, up_token, "UP"),
+            (down_dec, down_token, "DOWN"),
+        ]:
+            # Don't re-enter a side that was early-exited this window
+            if side_label in self.exited_sides:
+                continue
+
+            existing = self._get_open_order(side_label)
+
+            if existing is not None:
+                # Has existing order — check if it should be cancelled or requoted
+                order_age = now - existing.get("placed_ts_unix", now)
+                current_edge = dec.edge if dec.action != "FLAT" else 0.0
+                current_bid = current_bids.get(side_label)
+
+                # Edge decayed below cancel threshold?
+                if current_edge < self.edge_cancel_threshold:
+                    self._cancel_single_order(existing, f"edge_gone ({current_edge:.4f} < {self.edge_cancel_threshold})")
+                    continue
+
+                # Order too old?
+                if order_age > self.max_order_age_s:
+                    cancelled = self._cancel_single_order(
+                        existing, f"age={order_age:.0f}s > {self.max_order_age_s:.0f}s")
+                    # Optionally replace if still has edge
+                    if cancelled and dec.action != "FLAT" and dec.size_usd > 0:
+                        if self.position_count < self.max_positions:
+                            self._place_limit_order(snapshot, dec, token, side_label)
+                    continue
+
+                # Bid improved? Cancel+replace (rate-limited)
+                if (current_bid is not None
+                        and current_bid > existing["price"]
+                        and now - self.last_requote_ts.get(side_label, 0) >= self.requote_cooldown_s):
+                    old_price = existing["price"]
+                    cancelled = self._cancel_single_order(
+                        existing, f"requote_{old_price:.2f}->{current_bid:.2f}")
+                    if cancelled and dec.action != "FLAT" and dec.size_usd > 0:
+                        if self.position_count < self.max_positions:
+                            self._place_limit_order(snapshot, dec, token, side_label)
+                            self.last_requote_ts[side_label] = now
+                    continue
+
+                # Otherwise: keep resting
+
+            else:
+                # No existing order — place if edge exceeds place threshold
+                if (dec.action != "FLAT" and dec.size_usd > 0
+                        and self.position_count < self.max_positions):
+                    # Check total exposure before placing
+                    total_committed = sum(o["cost_est"] for o in self.open_orders)
+                    max_committed = self.initial_bankroll * (self.max_exposure_pct / 100.0)
+                    if total_committed + dec.size_usd > max_committed:
+                        self._bucket_flat_reason("exposure_limit")
+                        continue
+                    self._place_limit_order(snapshot, dec, token, side_label)
+
+        # Bucket FLAT reasons for diagnostics
+        if up_dec.action == "FLAT":
+            self._bucket_flat_reason(up_dec.reason)
+        if down_dec.action == "FLAT":
+            self._bucket_flat_reason(down_dec.reason)
+
+        # Periodic diagnostic
+        if now - self.last_diag_ts >= 60:
+            self.last_diag_ts = now
+            self._log_diagnostic(snapshot, self.last_decision)
+
+        return self.last_decision
+
+    def _bucket_flat_reason(self, reason: str):
+        """Categorize a FLAT reason for end-of-window summary."""
+        if reason.startswith("need "):
+            cat = "warmup"
+        elif reason.startswith("no edge"):
+            cat = "no_edge"
+        elif "momentum fail" in reason:
+            cat = "momentum_fail"
+        elif "spread too wide" in reason:
+            cat = "spread_wide"
+        elif "imbalance" in reason:
+            cat = "imbalance"
+        elif "delta velocity" in reason:
+            cat = "delta_velocity"
+        elif "vol spike" in reason:
+            cat = "vol_spike"
+        elif "zero vol" in reason:
+            cat = "zero_vol"
+        elif "missing book" in reason:
+            cat = "missing_book"
+        elif "kelly" in reason:
+            cat = "kelly_zero"
+        elif "maker warmup" in reason:
+            cat = "maker_warmup"
+        elif "maker end-of-window" in reason:
+            cat = "maker_eow"
+        elif "cooldown" in reason:
+            cat = "cooldown"
+        else:
+            cat = reason[:30]
+        self.flat_reason_counts[cat] = self.flat_reason_counts.get(cat, 0) + 1
 
     def _place_order(
         self,
@@ -576,6 +773,7 @@ class LiveTradeTracker:
             print(
                 f"\n  [DRY RUN] Would place: BUY {side_label} "
                 f"${amount_usd:.2f} on {snapshot.market_slug}"
+                f" | BTC: ${snapshot.chainlink_price:,.2f}"
             )
             return
 
@@ -636,6 +834,7 @@ class LiveTradeTracker:
         self.signal.bankroll = self.bankroll
         self.last_fill_ts_ms = snapshot.ts_ms
         self.window_trade_count += 1
+        self.position_count += 1
 
         # Estimate fee for display (poly_fee on best ask)
         best_ask = (snapshot.best_ask_up if side_label == "UP"
@@ -650,6 +849,7 @@ class LiveTradeTracker:
             "shares": shares,
             "order_id": order_id,
             "entry_ts": now_iso,
+            "fill_ts_unix": _time.time(),
             "time_remaining_s": snapshot.time_remaining_s,
             "chainlink_price": snapshot.chainlink_price,
             "window_start_price": snapshot.window_start_price,
@@ -659,8 +859,575 @@ class LiveTradeTracker:
         print(
             f"\n  [FILLED] BUY {side_label} ${cost_usd:.2f} "
             f"-> {shares:.1f} shares @ {entry_price:.4f} "
+            f"| BTC: ${snapshot.chainlink_price:,.2f} "
             f"| Bankroll: ${self.bankroll:,.2f}"
         )
+
+    # ── Maker mode: limit order methods ────────────────────────────────────
+
+    def _get_open_order(self, side: str) -> dict | None:
+        """Return the open order dict for a given side ("UP"/"DOWN"), or None."""
+        for o in self.open_orders:
+            if o.get("side") == side:
+                return o
+        return None
+
+    def _cancel_single_order(self, order: dict, reason: str) -> bool:
+        """Cancel one order, refund reserved bankroll, remove from open_orders.
+
+        Returns False if the API cancel fails (order may have already filled).
+        """
+        order_id = order["order_id"]
+        if not DRY_RUN:
+            try:
+                self.client.cancel(order_id)
+            except Exception as exc:
+                if DEBUG:
+                    print(f"\n  [CANCEL] error cancelling {order_id[:12]}...: {exc}")
+                return False
+
+        # Refund reserved bankroll
+        self.bankroll += order["cost_est"]
+        self.signal.bankroll = self.bankroll
+
+        # Remove from open_orders
+        self.open_orders = [o for o in self.open_orders if o["order_id"] != order_id]
+
+        self._log({
+            "type": "limit_cancel",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "order_id": order_id,
+            "side": order["side"],
+            "status": "cancelled_by_bot",
+            "reason": reason,
+            "refund": round(order["cost_est"], 2),
+        })
+        print(
+            f"\n  [CANCEL] {order['side']} {order['shares']:.1f}sh "
+            f"@ {order['price']:.4f} — {reason}"
+        )
+        return True
+
+    def _place_limit_order(
+        self,
+        snapshot: Snapshot,
+        decision: Decision,
+        token_id: str,
+        side_label: str,
+    ):
+        """Place a GTC limit order at best bid for maker mode."""
+        if decision.action == "BUY_UP":
+            best_bid = snapshot.best_bid_up
+        else:
+            best_bid = snapshot.best_bid_down
+
+        if best_bid is None or best_bid <= 0:
+            return
+
+        limit_price = best_bid
+        if limit_price <= 0 or limit_price >= 1.0:
+            return
+
+        # Convert USD size to shares
+        shares = round(decision.size_usd / limit_price, 1)
+        if shares < self.min_order_shares:
+            shares = self.min_order_shares
+
+        cost_est = shares * limit_price
+        if cost_est > self.bankroll:
+            shares = round((self.bankroll - 0.01) / limit_price, 1)
+            if shares < self.min_order_shares:
+                return
+            cost_est = shares * limit_price
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        now_unix = _time.time()
+        trade_record = {
+            "type": "limit_order",
+            "ts": now_iso,
+            "market_slug": snapshot.market_slug,
+            "side": side_label,
+            "price": limit_price,
+            "shares": shares,
+            "cost_est": round(cost_est, 2),
+            "edge": round(decision.edge, 4),
+            "signal_reason": decision.reason,
+            "bankroll_before": round(self.bankroll, 2),
+            "chainlink_price": round(snapshot.chainlink_price, 2),
+        }
+
+        if DRY_RUN:
+            trade_record["dry_run"] = True
+            trade_record["status"] = "dry_run"
+            self._log(trade_record)
+            print(
+                f"\n  [DRY RUN] Would place limit: BUY {side_label} "
+                f"{shares:.1f}sh @ {limit_price:.4f} (${cost_est:.2f})"
+                f" | BTC: ${snapshot.chainlink_price:,.2f}"
+            )
+            # Simulate resting order in dry run (not immediate fill)
+            self.bankroll -= cost_est
+            self.signal.bankroll = self.bankroll
+            self.open_orders.append({
+                "order_id": f"dry_{side_label}_{int(now_unix)}",
+                "side": side_label,
+                "price": limit_price,
+                "shares": shares,
+                "cost_est": cost_est,
+                "market_slug": snapshot.market_slug,
+                "placed_ts": now_iso,
+                "placed_ts_unix": now_unix,
+                "time_remaining_s": snapshot.time_remaining_s,
+                "chainlink_price": snapshot.chainlink_price,
+                "window_start_price": snapshot.window_start_price,
+            })
+            return
+
+        # Place GTC limit order
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=shares,
+                side=BUY,
+            )
+            signed_order = self.client.create_order(order_args)
+            resp = self.client.post_order(signed_order, OrderType.GTC)
+        except Exception as exc:
+            trade_record["status"] = "error"
+            trade_record["error"] = str(exc)
+            self._log(trade_record)
+            print(f"\n  [LIMIT ORDER ERROR] {exc}")
+            return
+
+        success = resp.get("success", False)
+        order_id = resp.get("orderID") or resp.get("id", "")
+        status = resp.get("status", "unknown")
+
+        trade_record["order_id"] = order_id
+        trade_record["status"] = status
+        trade_record["success"] = success
+        trade_record["response"] = resp
+
+        if not success:
+            trade_record["filled"] = False
+            self._log(trade_record)
+            err_msg = resp.get("errorMsg", "")
+            print(
+                f"\n  [LIMIT] {side_label} {shares:.1f}sh @ {limit_price:.4f} "
+                f"-> REJECTED (status={status}, err={err_msg})"
+            )
+            return
+
+        self._log(trade_record)
+
+        # Check if the order was immediately filled (status=matched + takingAmount)
+        taking = resp.get("takingAmount", "")
+        making = resp.get("makingAmount", "")
+        if status == "matched" and taking:
+            # Immediately filled — go straight to pending_fills, no resting order
+            filled_shares = float(taking)
+            actual_cost = float(making) if making else filled_shares * limit_price
+            self.bankroll -= actual_cost
+            self.signal.bankroll = self.bankroll
+
+            self.pending_fills.append({
+                "market_slug": snapshot.market_slug,
+                "side": side_label,
+                "cost_usd": actual_cost,
+                "shares": filled_shares,
+                "order_id": order_id,
+                "entry_ts": now_iso,
+                "fill_ts_unix": _time.time(),
+                "time_remaining_s": snapshot.time_remaining_s,
+                "chainlink_price": snapshot.chainlink_price,
+                "window_start_price": snapshot.window_start_price,
+            })
+            self.last_fill_ts_ms = snapshot.ts_ms
+            self.window_trade_count += 1
+            self.position_count += 1
+
+            entry_px = actual_cost / filled_shares if filled_shares > 0 else 0
+            print(
+                f"\n  [LIMIT FILLED] BUY {side_label} {filled_shares:.1f}sh "
+                f"@ {entry_px:.4f} (${actual_cost:.2f})"
+                f" | BTC: ${snapshot.chainlink_price:,.2f}"
+            )
+            return
+
+        # Reserve bankroll for resting order
+        self.bankroll -= cost_est
+        self.signal.bankroll = self.bankroll
+
+        # Track the open order
+        self.open_orders.append({
+            "order_id": order_id,
+            "side": side_label,
+            "price": limit_price,
+            "shares": shares,
+            "cost_est": cost_est,
+            "market_slug": snapshot.market_slug,
+            "placed_ts": now_iso,
+            "placed_ts_unix": now_unix,
+            "time_remaining_s": snapshot.time_remaining_s,
+            "chainlink_price": snapshot.chainlink_price,
+            "window_start_price": snapshot.window_start_price,
+        })
+
+        print(
+            f"\n  [LIMIT] BUY {side_label} {shares:.1f}sh @ {limit_price:.4f} "
+            f"(${cost_est:.2f}) -> resting (id={order_id[:12]}...)"
+        )
+
+    def _poll_open_orders(self, snapshot: Snapshot):
+        """Check open limit orders for fills or cancellations."""
+        if not self.open_orders:
+            return
+
+        still_open = []
+        for order in self.open_orders:
+            order_id = order["order_id"]
+
+            # Dry-run: simulate fill after 5s resting
+            if DRY_RUN and order_id.startswith("dry_"):
+                age = _time.time() - order.get("placed_ts_unix", _time.time())
+                if age >= 5.0:
+                    actual_cost = order["shares"] * order["price"]
+                    drift = order["cost_est"] - actual_cost
+                    self.bankroll += drift
+                    self.signal.bankroll = self.bankroll
+                    self.pending_fills.append({
+                        "market_slug": order["market_slug"],
+                        "side": order["side"],
+                        "cost_usd": actual_cost,
+                        "shares": order["shares"],
+                        "order_id": order_id,
+                        "entry_ts": order["placed_ts"],
+                        "fill_ts_unix": _time.time(),
+                        "time_remaining_s": order["time_remaining_s"],
+                        "chainlink_price": order["chainlink_price"],
+                        "window_start_price": order["window_start_price"],
+                    })
+                    self.last_fill_ts_ms = snapshot.ts_ms
+                    self.window_trade_count += 1
+                    self.position_count += 1
+                    entry_px = actual_cost / order["shares"] if order["shares"] > 0 else 0
+                    print(
+                        f"\n  [DRY FILL] {order['side']} {order['shares']:.1f}sh "
+                        f"@ {entry_px:.4f} (${actual_cost:.2f})"
+                    )
+                else:
+                    still_open.append(order)
+                continue
+
+            try:
+                resp = self.client.get_order(order_id)
+            except Exception as exc:
+                if DEBUG:
+                    print(f"\n  [POLL] error checking {order_id[:12]}...: {exc}")
+                still_open.append(order)
+                continue
+
+            status = resp.get("status", "unknown")
+            size_matched = float(resp.get("size_matched", 0) or 0)
+            original_size = float(resp.get("original_size", order["shares"]) or order["shares"])
+            fill_pct = size_matched / original_size if original_size > 0 else 0
+
+            if status == "MATCHED" or fill_pct >= 0.99:
+                # Fully filled — move to pending_fills
+                actual_cost = size_matched * order["price"]
+                # Adjust bankroll: we reserved cost_est, actual may differ
+                drift = order["cost_est"] - actual_cost
+                self.bankroll += drift
+                self.signal.bankroll = self.bankroll
+
+                self.pending_fills.append({
+                    "market_slug": order["market_slug"],
+                    "side": order["side"],
+                    "cost_usd": actual_cost,
+                    "shares": size_matched,
+                    "order_id": order_id,
+                    "entry_ts": order["placed_ts"],
+                    "fill_ts_unix": _time.time(),
+                    "time_remaining_s": order["time_remaining_s"],
+                    "chainlink_price": order["chainlink_price"],
+                    "window_start_price": order["window_start_price"],
+                })
+                self.last_fill_ts_ms = snapshot.ts_ms
+                self.window_trade_count += 1
+                self.position_count += 1
+
+                entry_px = actual_cost / size_matched if size_matched > 0 else 0
+                print(
+                    f"\n  [LIMIT FILLED] {order['side']} {size_matched:.1f}sh "
+                    f"@ {entry_px:.4f} (${actual_cost:.2f})"
+                )
+                self._log({
+                    "type": "limit_fill",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "order_id": order_id,
+                    "side": order["side"],
+                    "shares": round(size_matched, 2),
+                    "price": order["price"],
+                    "cost_usd": round(actual_cost, 2),
+                })
+
+            elif status in ("CANCELLED", "EXPIRED"):
+                # Refund reserved bankroll
+                self.bankroll += order["cost_est"]
+                self.signal.bankroll = self.bankroll
+                print(
+                    f"\n  [LIMIT {status}] {order['side']} "
+                    f"{order['shares']:.1f}sh @ {order['price']:.4f} "
+                    f"— refunded ${order['cost_est']:.2f}"
+                )
+                self._log({
+                    "type": "limit_cancel",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "order_id": order_id,
+                    "side": order["side"],
+                    "status": status,
+                    "refund": round(order["cost_est"], 2),
+                })
+            else:
+                # Still open
+                still_open.append(order)
+
+        self.open_orders = still_open
+
+    def _cancel_open_orders(self):
+        """Cancel all open limit orders and refund reserved bankroll."""
+        for order in self.open_orders:
+            order_id = order["order_id"]
+            if not DRY_RUN:
+                try:
+                    self.client.cancel(order_id)
+                except Exception as exc:
+                    if DEBUG:
+                        print(f"\n  [CANCEL] error: {exc}")
+            # Refund reserved bankroll
+            self.bankroll += order["cost_est"]
+            self.signal.bankroll = self.bankroll
+            self._log({
+                "type": "limit_cancel",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "order_id": order_id,
+                "side": order["side"],
+                "status": "cancelled_by_bot",
+                "refund": round(order["cost_est"], 2),
+            })
+        if self.open_orders:
+            print(f"\n  [CANCEL] Cancelled {len(self.open_orders)} open limit order(s)")
+        self.open_orders = []
+
+    # ── Early exit methods ─────────────────────────────────────────────────
+
+    def _evaluate_exits(self, snapshot: Snapshot, up_token: str, down_token: str):
+        """Evaluate filled positions for early exit based on EV comparison."""
+        if not self.pending_fills:
+            return
+
+        tau = snapshot.time_remaining_s
+        now = _time.time()
+
+        # Don't exit when too close to expiry — let resolution handle it
+        if tau < self.exit_min_remaining_s:
+            return
+
+        # Compute current p_model from live price data
+        hist = self.ctx.get("price_history", [])
+        if len(hist) < max(2, self.signal.vol_lookback_s):
+            return
+
+        sigma_per_s = self.signal._compute_vol(hist[-self.signal.vol_lookback_s:])
+        if sigma_per_s <= 0 or tau <= 0:
+            return
+
+        delta = snapshot.chainlink_price - snapshot.window_start_price
+        z_raw = delta / (sigma_per_s * math.sqrt(tau))
+        z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
+        p_model = self.signal._p_model(z, tau)
+
+        token_map = {"UP": up_token, "DOWN": down_token}
+        bid_map = {
+            "UP": snapshot.best_bid_up,
+            "DOWN": snapshot.best_bid_down,
+        }
+
+        exits_to_process = []
+        for fill in self.pending_fills:
+            side = fill["side"]
+
+            # Skip if already exited this side
+            if side in self.exited_sides:
+                continue
+
+            # Min hold time
+            fill_age = now - fill.get("fill_ts_unix", now)
+            if fill_age < self.exit_min_hold_s:
+                continue
+
+            best_bid = bid_map.get(side)
+            if best_bid is None or best_bid <= 0:
+                continue
+
+            # EV calculations
+            entry_price = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
+            ev_hold = p_model if side == "UP" else (1.0 - p_model)
+            ev_sell = best_bid  # 0% maker fee for selling at bid
+
+            # Hard stop-loss: exit if bid < 50% of entry price
+            hard_stop = best_bid < entry_price * 0.50
+
+            # EV-based exit
+            ev_edge = ev_sell - ev_hold
+            should_exit = hard_stop or ev_edge > self.exit_threshold
+
+            if should_exit:
+                token_id = token_map.get(side, "")
+                reason = "hard_stop" if hard_stop else "ev_edge"
+                exits_to_process.append((fill, token_id, best_bid, ev_hold, ev_sell, reason))
+
+        # Process exits (separate loop to avoid mutating pending_fills during iteration)
+        for fill, token_id, sell_price, ev_hold, ev_sell, reason in exits_to_process:
+            success = self._execute_exit(fill, snapshot, token_id, sell_price, ev_hold, ev_sell, reason)
+            if success:
+                self.exited_sides.add(fill["side"])
+                self.pending_fills = [f for f in self.pending_fills if f is not fill]
+                self.position_count = max(0, self.position_count - 1)
+
+    def _execute_exit(
+        self, fill: dict, snapshot: Snapshot, token_id: str,
+        sell_price: float, ev_hold: float, ev_sell: float, reason: str,
+    ) -> bool:
+        """Execute a FOK market sell to exit a position. Returns True if filled."""
+        shares = fill["shares"]
+        entry_price = fill["cost_usd"] / shares if shares > 0 else 0
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if DRY_RUN:
+            proceeds = shares * sell_price
+            exit_pnl = proceeds - fill["cost_usd"]
+            self.bankroll += proceeds
+            self.signal.bankroll = self.bankroll
+
+            self._log({
+                "type": "early_exit",
+                "ts": now_iso,
+                "market_slug": fill["market_slug"],
+                "side": fill["side"],
+                "shares": round(shares, 2),
+                "entry_price": round(entry_price, 4),
+                "sell_price": round(sell_price, 4),
+                "proceeds": round(proceeds, 2),
+                "pnl": round(exit_pnl, 2),
+                "ev_hold": round(ev_hold, 4),
+                "ev_sell": round(ev_sell, 4),
+                "reason": reason,
+                "dry_run": True,
+            })
+            print(
+                f"\n  [DRY EXIT] {fill['side']} {shares:.1f}sh "
+                f"@ {sell_price:.4f} (entry {entry_price:.4f}) "
+                f"PnL=${exit_pnl:+.2f} | EV: hold={ev_hold:.3f} sell={ev_sell:.3f} "
+                f"({reason})"
+            )
+            self._record_exit_result(fill, proceeds, exit_pnl)
+            return True
+
+        # Live: place FOK market sell
+        try:
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=shares,
+                side=SELL,
+            )
+            signed_order = self.client.create_market_order(order_args)
+            resp = self.client.post_order(signed_order, OrderType.FOK)
+        except Exception as exc:
+            print(f"\n  [EXIT ERROR] {fill['side']}: {exc}")
+            self._log({
+                "type": "early_exit",
+                "ts": now_iso,
+                "side": fill["side"],
+                "status": "error",
+                "error": str(exc),
+            })
+            return False
+
+        success = resp.get("success", False)
+        status = resp.get("status", "unknown")
+
+        if not success or status not in ("matched", "live"):
+            if DEBUG:
+                print(f"\n  [EXIT] {fill['side']} FOK not filled (status={status})")
+            return False
+
+        # FOK filled: takingAmount = USDC received
+        taking = resp.get("takingAmount", "")
+        proceeds = float(taking) if taking else shares * sell_price
+        exit_pnl = proceeds - fill["cost_usd"]
+
+        self.bankroll += proceeds
+        self.signal.bankroll = self.bankroll
+
+        self._log({
+            "type": "early_exit",
+            "ts": now_iso,
+            "market_slug": fill["market_slug"],
+            "side": fill["side"],
+            "shares": round(shares, 2),
+            "entry_price": round(entry_price, 4),
+            "sell_price": round(sell_price, 4),
+            "proceeds": round(proceeds, 2),
+            "pnl": round(exit_pnl, 2),
+            "ev_hold": round(ev_hold, 4),
+            "ev_sell": round(ev_sell, 4),
+            "reason": reason,
+            "bankroll_after": round(self.bankroll, 2),
+        })
+        print(
+            f"\n  [EXIT] {fill['side']} {shares:.1f}sh "
+            f"@ {sell_price:.4f} (entry {entry_price:.4f}) "
+            f"PnL=${exit_pnl:+.2f} | EV: hold={ev_hold:.3f} sell={ev_sell:.3f}"
+        )
+        self._record_exit_result(fill, proceeds, exit_pnl)
+        return True
+
+    def _record_exit_result(self, fill: dict, proceeds: float, exit_pnl: float):
+        """Record an early exit as a TradeResult for session stats."""
+        entry_price = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
+        fake_fill = Fill(
+            market_slug=fill["market_slug"],
+            side=fill["side"],
+            entry_ts_ms=int(_time.time() * 1000),
+            time_remaining_s=fill["time_remaining_s"],
+            entry_price=entry_price,
+            fee_per_share=0.0,
+            shares=fill["shares"],
+            cost_usd=fill["cost_usd"],
+            signal_name="diffusion",
+            decision_reason="early_exit",
+        )
+        pnl_pct = exit_pnl / fill["cost_usd"] if fill["cost_usd"] > 0 else 0.0
+        result = TradeResult(
+            fill=fake_fill,
+            outcome_up=-1,  # sentinel: early exit, not resolution
+            final_btc=0.0,
+            payout=proceeds,
+            pnl=exit_pnl,
+            pnl_pct=pnl_pct,
+        )
+        self.all_results.append(result)
+
+        # Update drawdown
+        if self.bankroll > self.peak_bankroll:
+            self.peak_bankroll = self.bankroll
+        dd = self.peak_bankroll - self.bankroll
+        dd_pct = dd / self.peak_bankroll if self.peak_bankroll > 0 else 0
+        if dd > self.max_drawdown:
+            self.max_drawdown = dd
+            self.max_dd_pct = dd_pct
 
     def resolve_window(
         self, slug: str, final_price: float | None,
@@ -746,17 +1513,21 @@ class LiveTradeTracker:
                 "bankroll_after": round(self.bankroll, 2),
             })
 
-        # Redeem winning CTF positions on-chain
+        # Redeem winning CTF positions on-chain (background thread)
         has_winning = any(
             (f["side"] == "UP" and outcome_up == 1) or
             (f["side"] == "DOWN" and outcome_up == 0)
             for f in self.pending_fills
         )
         if has_winning and self.condition_id:
-            # Wait for on-chain resolution to propagate before attempting redeem
-            print(f"  Waiting 15s for on-chain resolution (conditionId: {self.condition_id[:10]}...)...")
-            _time.sleep(15)
-            self.redeem_positions(self.condition_id)
+            cond_id = self.condition_id
+            t = threading.Thread(
+                target=self.redeem_positions, args=(cond_id,),
+                daemon=True,
+            )
+            t.start()
+            print(f"  [REDEEM] Started background redemption thread "
+                  f"(conditionId: {cond_id[:10]}...)")
         elif has_winning and not self.condition_id:
             print("  WARNING: Won but no conditionId — cannot auto-redeem. "
                   "Claim manually on Polymarket.")
@@ -800,6 +1571,9 @@ class LiveTradeTracker:
 
     def cancel_all_orders(self):
         """Cancel all open orders — called on shutdown."""
+        # Cancel tracked limit orders first (refund bankroll)
+        if self.open_orders:
+            self._cancel_open_orders()
         if DRY_RUN:
             return
         try:
@@ -809,11 +1583,16 @@ class LiveTradeTracker:
             print(f"  Warning: cancel_all failed: {exc}")
 
     def redeem_positions(self, condition_id: str,
-                         max_retries: int = 3) -> str | None:
+                         max_retries: int = 3,
+                         max_poll_attempts: int = 60,
+                         poll_interval_s: float = 30.0) -> str | None:
         """Call CTF.redeemPositions() on-chain to convert winning tokens to USDC.
 
+        First polls payoutDenominator on-chain (free eth_call) to wait for
+        the condition to be resolved on-chain before spending gas. On-chain
+        resolution can lag the Gamma API by 20+ minutes.
+
         Routes through the proxy wallet (sig type 1) or direct EOA (sig type 0).
-        Retries on failure since on-chain resolution may still be propagating.
         Returns the tx hash on success, None on failure.
         """
         if DRY_RUN:
@@ -824,6 +1603,39 @@ class LiveTradeTracker:
             print("  [REDEEM] Skipped (no conditionId)")
             return None
 
+        # Poll payoutDenominator until on-chain resolution arrives
+        condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+        resolved = False
+        try:
+            w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+            ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
+            for poll in range(max_poll_attempts):
+                try:
+                    denom = ctf.functions.payoutDenominator(condition_bytes).call()
+                    if denom > 0:
+                        resolved = True
+                        print(f"  [REDEEM] On-chain resolution confirmed "
+                              f"(payoutDenominator={denom}, poll #{poll + 1})")
+                        break
+                except Exception as exc:
+                    if DEBUG:
+                        print(f"  [REDEEM] payoutDenominator poll error: {exc}")
+                if poll < max_poll_attempts - 1:
+                    if poll == 0:
+                        print(f"  [REDEEM] Waiting for on-chain resolution "
+                              f"(polling every {poll_interval_s:.0f}s, "
+                              f"up to {max_poll_attempts * poll_interval_s / 60:.0f}m)...")
+                    _time.sleep(poll_interval_s)
+        except Exception as exc:
+            print(f"  [REDEEM] RPC connection error: {exc}")
+
+        if not resolved:
+            print(f"  [REDEEM] On-chain resolution not found after "
+                  f"{max_poll_attempts * poll_interval_s / 60:.0f}m. "
+                  f"Claim manually on Polymarket.")
+            return None
+
+        # On-chain resolution confirmed — now send the actual redeem tx
         for attempt in range(max_retries):
             if attempt > 0:
                 delay = 20 * attempt
@@ -834,7 +1646,7 @@ class LiveTradeTracker:
             if result is not None:
                 return result
 
-        print(f"  [REDEEM] Failed after {max_retries} attempts. "
+        print(f"  [REDEEM] Failed after {max_retries} tx attempts. "
               f"Claim manually on Polymarket.")
         return None
 
@@ -999,13 +1811,18 @@ class LiveTradeTracker:
             spread_down = ask_down - bid_down
             delta = snapshot.chainlink_price - snapshot.window_start_price
             z_raw = delta / (sigma_per_s * math.sqrt(tau))
-            from backtest import norm_cdf
             z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
-            p_model = norm_cdf(z)
-            p_up_cost = ask_up + poly_fee(ask_up) + self.signal.slippage
-            p_down_cost = ask_down + poly_fee(ask_down) + self.signal.slippage
-            edge_up = p_model - p_up_cost - self.signal.spread_edge_penalty * spread_up
-            edge_down = (1.0 - p_model) - p_down_cost - self.signal.spread_edge_penalty * spread_down
+            p_model = self.signal._p_model(z, tau)
+            if self.maker_mode:
+                # Maker mode: edge at bid, 0% fee
+                edge_up = p_model - bid_up - self.signal.spread_edge_penalty * spread_up
+                edge_down = (1.0 - p_model) - bid_down - self.signal.spread_edge_penalty * spread_down
+            else:
+                # Taker mode: edge at ask + fee
+                p_up_cost = ask_up + poly_fee(ask_up) + self.signal.slippage
+                p_down_cost = ask_down + poly_fee(ask_down) + self.signal.slippage
+                edge_up = p_model - p_up_cost - self.signal.spread_edge_penalty * spread_up
+                edge_down = (1.0 - p_model) - p_down_cost - self.signal.spread_edge_penalty * spread_down
 
         self._log({
             "type": "diagnostic",
@@ -1299,19 +2116,22 @@ def render_display(
     config: MarketConfig,
 ):
     lines = ["\033[2J\033[H"]
-    mode = "DRY RUN" if DRY_RUN else "LIVE"
+    mode_str = "DRY RUN" if DRY_RUN else "LIVE"
+    order_mode = "MAKER" if tracker.maker_mode else "FOK"
+    exit_tag = "+EXIT" if tracker.exit_enabled else ""
     lines.append("=" * 62)
-    lines.append(f"  [{mode}] {config.display_name} Up/Down 15m: {market_title}")
+    lines.append(f"  [{mode_str}] [{order_mode}{exit_tag}] {config.display_name} Up/Down: {market_title}")
     lines.append("=" * 62)
     lines.append("")
 
     now = datetime.now(timezone.utc)
     remaining = (window_end - now).total_seconds()
+    win_dur = tracker.window_duration_s
 
     if remaining > 0:
         m, s = int(remaining // 60), int(remaining % 60)
         bar_len = 30
-        filled = max(0, min(bar_len, int((remaining / 900) * bar_len)))
+        filled = max(0, min(bar_len, int((remaining / win_dur) * bar_len)))
         lines.append(
             f"  Time Remaining:  {m:02d}:{s:02d}  "
             f"[{'#' * filled}{'-' * (bar_len - filled)}]"
@@ -1361,7 +2181,7 @@ def render_display(
     lines.append("")
 
     # Trading section
-    lines.append(f"  -- {mode} Trading (DiffusionSignal) " + "-" * 20)
+    lines.append(f"  -- {mode_str} Trading ({order_mode}) " + "-" * 24)
 
     dec = tracker.last_decision
     status = dec.action if dec.action != "FLAT" else "FLAT"
@@ -1372,6 +2192,17 @@ def render_display(
         bal_str += f"  (API: ${tracker.api_balance:,.2f})"
     lines.append(f"  Bankroll: {bal_str}  |  Status: {status}")
     lines.append(f"  Reason:   {dec.reason[:60]}")
+
+    # Maker mode: show dual-side status
+    if tracker.maker_mode:
+        up_d = tracker.last_up_decision
+        dn_d = tracker.last_down_decision
+        up_tag = up_d.action if up_d.action != "FLAT" else "FLAT"
+        dn_tag = dn_d.action if dn_d.action != "FLAT" else "FLAT"
+        lines.append(
+            f"  Up: {up_tag} (edge={up_d.edge:.4f})"
+            f"  |  Down: {dn_tag} (edge={dn_d.edge:.4f})"
+        )
 
     # Show top FLAT reason distribution this window
     if tracker.flat_reason_counts and tracker.signal_eval_count > 0:
@@ -1399,8 +2230,44 @@ def render_display(
     lines.append(f"  History:  {hist_len}s{vol_str}")
     lines.append("")
 
-    # Current window fills
-    if tracker.pending_fills:
+    # Open limit orders (maker mode)
+    if tracker.maker_mode and tracker.open_orders:
+        lines.append("  -- Open Limit Orders " + "-" * 36)
+        for o in tracker.open_orders:
+            age_s = int(_time.time() - o.get("placed_ts_unix", _time.time()))
+            lines.append(
+                f"    {o['side']:>4s}  {o['shares']:.1f}sh @ {o['price']:.4f}"
+                f"  (${o['cost_est']:.2f})  age={age_s}s"
+                f"  id={o['order_id'][:12]}..."
+            )
+        lines.append("")
+
+    # Positions display (early exit mode)
+    if tracker.exit_enabled and tracker.pending_fills:
+        lines.append(
+            f"  -- Positions ({tracker.position_count}/{tracker.max_positions}) "
+            + "-" * 36
+        )
+        bid_map = {
+            "UP": flat_state.get("up_best_bid"),
+            "DOWN": flat_state.get("down_best_bid"),
+        }
+        for fill in tracker.pending_fills:
+            entry_px = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
+            bid_val = bid_map.get(fill["side"])
+            bid_f = float(bid_val) if bid_val else 0.0
+            upnl = (bid_f - entry_px) * fill["shares"]
+            hold_s = int(_time.time() - fill.get("fill_ts_unix", _time.time()))
+            lines.append(
+                f"    {fill['side']:>4s}  {fill['shares']:.1f}sh "
+                f"@ {entry_px:.4f}  bid={bid_f:.2f}  "
+                f"uPnL=${upnl:+.2f}  hold={hold_s}s"
+            )
+        if tracker.exited_sides:
+            lines.append(f"    Exited: {', '.join(sorted(tracker.exited_sides))}")
+        lines.append("")
+    elif tracker.pending_fills:
+        # Standard fill display
         for fill in tracker.pending_fills:
             entry_px = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
             rem_m = int(fill["time_remaining_s"]) // 60
@@ -1429,9 +2296,10 @@ def render_display(
     total_pnl = sum(r.pnl for r in tracker.all_results)
     win_count = len(wins)
     win_str = f"{win_count}/{total} ({win_count / total:.0%})" if total > 0 else "---"
+    open_str = f"  |  Open: {len(tracker.open_orders)}" if tracker.maker_mode else ""
     lines.append(
         f"  Session:  {tracker.windows_traded}/{tracker.windows_seen}"
-        f" windows traded  |  Win: {win_str}"
+        f" windows traded  |  Win: {win_str}{open_str}"
     )
     lines.append(
         f"            PnL: ${total_pnl:+,.2f}"
@@ -1467,18 +2335,19 @@ async def display_ticker(
 
 async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
                      price_state: dict):
-    """Run a single 15-minute trading window.
+    """Run a single trading window.
 
     price_state is a shared dict continuously updated by the persistent RTDS
     websocket. At window start we snapshot the current live price as the
     window_start_price, which is much more accurate than carrying a stale
     price from after the previous window's RTDS disconnected.
     """
-    print(f"  Searching for active {config.display_name} 15-minute market...")
+    win_m = int(config.window_duration_s / 60)
+    print(f"  Searching for active {config.display_name} market...")
     event, market = find_market(config)
 
     if not event or not market:
-        print(f"  No active {config.display_name} 15-minute market found. Retrying in 30s...")
+        print(f"  No active {config.display_name} market found. Retrying in 30s...")
         await asyncio.sleep(30)
         return
 
@@ -1505,12 +2374,40 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
     book_up = OrderBook()
     book_down = OrderBook()
 
-    # Snapshot the current live RTDS price as this window's start price.
-    # Because RTDS stays connected across window transitions, this is
-    # the most recent oracle price (~1-2s old at most), far more accurate
-    # than the old approach of carrying a stale price across a reconnection gap.
-    current_price = price_state.get("price")
-    price_state["window_start_price"] = current_price
+    # Wait until eventStartTime + 10s for accurate start price.
+    # The RTDS price at function entry can be well before eventStartTime;
+    # waiting gives Chainlink time to update and captures a price close
+    # to the actual resolution reference.
+    now = datetime.now(timezone.utc)
+    target = start + timedelta(seconds=10)
+    wait_s = (target - now).total_seconds()
+    if 0 < wait_s <= 120:  # cap at 2 min to avoid hanging
+        print(f"  Waiting {wait_s:.0f}s for start price (until {target.strftime('%H:%M:%S')} UTC)...")
+        await asyncio.sleep(wait_s)
+
+    # Re-query Gamma API for any updated market info (future-proofing)
+    start_price_from_api = None
+    try:
+        resp = requests.get(
+            f"{GAMMA_API}/events", params={"slug": slug}, timeout=10
+        )
+        api_data = resp.json()
+        if api_data:
+            api_market = api_data[0]["markets"][0]
+            for field in ["startPrice", "referencePrice", "strikePrice"]:
+                val = api_market.get(field)
+                if val is not None:
+                    start_price_from_api = float(val)
+                    break
+    except Exception:
+        pass
+
+    if start_price_from_api is not None:
+        price_state["window_start_price"] = start_price_from_api
+        print(f"  Start price: ${start_price_from_api:,.2f} (from API)")
+    else:
+        current_price = price_state.get("price")
+        price_state["window_start_price"] = current_price
 
     flat_state = {
         "up_best_bid": None, "up_best_ask": None,
@@ -1534,8 +2431,11 @@ async def run_window(tracker: LiveTradeTracker, config: MarketConfig,
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     print(f"  [{mode}] Market: {title}")
     print(f"  Window:   {start.strftime('%H:%M:%S')} -> {end.strftime('%H:%M:%S')} UTC")
-    if current_price is not None:
-        print(f"  Start price: ${current_price:,.2f} (live RTDS)")
+    start_px = price_state.get("window_start_price")
+    if start_price_from_api is not None:
+        pass  # already printed above
+    elif start_px is not None:
+        print(f"  Start price: ${start_px:,.2f} (RTDS @ {target.strftime('%H:%M:%S')})")
     else:
         print(f"  Start price: waiting for RTDS...")
     print(f"  Bankroll: ${tracker.bankroll:,.2f}  |  Min order: {tracker.min_order_shares:.0f} shares")
@@ -1608,7 +2508,7 @@ def main():
     global DEBUG, DRY_RUN, TRADES_LOG, STATE_FILE
 
     parser = argparse.ArgumentParser(
-        description="Live trading bot for Polymarket Up/Down 15-min markets"
+        description="Live trading bot for Polymarket Up/Down markets"
     )
     parser.add_argument(
         "--market", default=DEFAULT_MARKET, choices=list(MARKET_CONFIGS),
@@ -1631,8 +2531,12 @@ def main():
         help="Circuit breaker: max session loss %% (default: 50)",
     )
     parser.add_argument(
-        "--max-trades-per-window", type=int, default=1,
-        help="Max trades per 15-min window (default: 1)",
+        "--max-trades-per-window", type=int, default=None,
+        help="Max trades per window (default: 1 for FOK, 4 for maker)",
+    )
+    parser.add_argument(
+        "--maker", action="store_true",
+        help="Enable maker mode: GTC limit orders, dual-side evaluation, 0%% fee",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -1642,6 +2546,34 @@ def main():
         "--resume", action="store_true",
         help="Resume from saved state file",
     )
+    parser.add_argument(
+        "--edge-cancel-threshold", type=float, default=0.02,
+        help="Maker: cancel open orders when edge drops below this (default: 0.02)",
+    )
+    parser.add_argument(
+        "--max-order-age", type=float, default=120.0,
+        help="Maker: auto-cancel orders resting longer than this (seconds, default: 120)",
+    )
+    parser.add_argument(
+        "--requote-cooldown", type=float, default=3.0,
+        help="Maker: min seconds between cancel+replace on same side (default: 3)",
+    )
+    parser.add_argument("--max-exposure-pct", type=float, default=20.0,
+                        help="Max %% of initial bankroll committed to open orders (default: 20)")
+    parser.add_argument("--maker-warmup", type=float, default=180.0,
+                        help="Maker: seconds to wait after window opens before trading (default: 180)")
+    parser.add_argument("--calibrated", action="store_true",
+                        help="Use empirically calibrated probabilities")
+    parser.add_argument("--early-exit", action="store_true",
+                        help="Enable early exit of positions based on EV")
+    parser.add_argument("--exit-threshold", type=float, default=0.03,
+                        help="Min EV edge to trigger exit (default: 0.03)")
+    parser.add_argument("--exit-min-hold", type=float, default=30.0,
+                        help="Min seconds after fill before evaluating exit (default: 30)")
+    parser.add_argument("--exit-min-remaining", type=float, default=60.0,
+                        help="Don't exit when < this many seconds remain (default: 60)")
+    parser.add_argument("--max-positions", type=int, default=4,
+                        help="Max simultaneous filled positions (default: 4)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     DEBUG = args.debug
@@ -1651,10 +2583,21 @@ def main():
     TRADES_LOG = Path(f"live_trades_{config.data_subdir}.jsonl")
     STATE_FILE = Path(f"live_state_{config.data_subdir}.json")
 
+    # Default max trades depends on mode
+    if args.max_trades_per_window is not None:
+        max_trades = args.max_trades_per_window
+    else:
+        max_trades = 4 if args.maker else 1
+
     # Build authenticated client
     print(f"\n  {'='*62}")
     mode = "DRY RUN" if DRY_RUN else "LIVE TRADING"
-    print(f"  {mode} -- {config.display_name} Up/Down 15m")
+    order_mode = "MAKER" if args.maker else "FOK"
+    if args.calibrated:
+        order_mode += "+CAL"
+    if args.early_exit:
+        order_mode += "+EXIT"
+    print(f"  {mode} [{order_mode}] -- {config.display_name} Up/Down")
     print(f"  {'='*62}")
 
     client = build_clob_client()
@@ -1683,7 +2626,8 @@ def main():
 
     # Per-market signal overrides (ETH needs tighter filters due to mean reversion)
     signal_kw: dict = {}
-    if args.market == "eth":
+    base_market = args.market.replace("_5m", "")
+    if base_market == "eth":
         signal_kw = dict(
             edge_threshold=0.15,        # higher bar (BTC default 0.10)
             reversion_discount=0.15,    # ETH mean-reverts ~33%, discount p toward 0.5
@@ -1691,6 +2635,40 @@ def main():
             momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
             spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
         )
+
+    # Maker mode signal overrides
+    signal_kw["window_duration"] = config.window_duration_s
+    cooldown_ms = 30_000
+    stale_timeout = 10.0
+
+    if args.maker:
+        signal_kw["maker_mode"] = True
+        signal_kw["max_bet_fraction"] = 0.02
+        signal_kw["edge_threshold"] = 0.06
+        signal_kw["momentum_majority"] = 0.0
+        signal_kw["spread_edge_penalty"] = 0.0  # bid pricing handles spread naturally
+        cooldown_ms = 30_000  # no global cooldown in maker (kept for FOK compat)
+        stale_timeout = 60.0
+
+    # Calibration: build empirical lookup table and adjust thresholds
+    cal_table = None
+    if args.calibrated:
+        from backtest import DATA_DIR
+        cal_data_dir = DATA_DIR / config.data_subdir
+        print(f"  Building calibration table from {cal_data_dir} ...")
+        cal_table = build_calibration_table(cal_data_dir)
+        n_cells = len(cal_table.table)
+        n_obs = sum(cal_table.counts.values())
+        print(f"  Calibration table: {n_cells} cells, {n_obs} observations")
+        signal_kw["calibration_table"] = cal_table
+        # Calibrated edges are smaller/honest — still require meaningful edge
+        if args.maker:
+            signal_kw["edge_threshold"] = 0.06
+            signal_kw["early_edge_mult"] = 2.0
+        else:
+            signal_kw["edge_threshold"] = 0.06
+            signal_kw["early_edge_mult"] = 2.0
+
     signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
     tracker = LiveTradeTracker(
         client=client,
@@ -1698,8 +2676,22 @@ def main():
         initial_bankroll=bankroll,
         latency_ms=args.latency,
         slippage=args.slippage,
+        cooldown_ms=cooldown_ms,
         max_loss_pct=args.max_loss_pct,
-        max_trades_per_window=args.max_trades_per_window,
+        max_trades_per_window=max_trades,
+        stale_price_timeout_s=stale_timeout,
+        maker_mode=args.maker,
+        window_duration_s=config.window_duration_s,
+        edge_cancel_threshold=args.edge_cancel_threshold,
+        max_order_age_s=args.max_order_age,
+        requote_cooldown_s=args.requote_cooldown,
+        max_exposure_pct=args.max_exposure_pct,
+        maker_warmup_s=args.maker_warmup,
+        exit_enabled=args.early_exit,
+        exit_threshold=args.exit_threshold,
+        exit_min_hold_s=args.exit_min_hold,
+        exit_min_remaining_s=args.exit_min_remaining,
+        max_positions=args.max_positions,
     )
     tracker.api_balance = api_balance
 
@@ -1731,8 +2723,19 @@ def main():
         print(f"  WARNING: Gas check failed: {exc}")
 
     print(f"  Bankroll:        ${bankroll:,.2f}")
+    print(f"  Mode:            {order_mode}")
     print(f"  Max loss:        {args.max_loss_pct}%")
-    print(f"  Max trades/win:  {args.max_trades_per_window}")
+    print(f"  Max trades/win:  {max_trades}")
+    if args.maker:
+        print(f"  Max exposure:    {args.max_exposure_pct}%")
+        print(f"  Maker warmup:    {args.maker_warmup:.0f}s")
+    if args.early_exit:
+        print(f"  Early exit:      ON (threshold={args.exit_threshold}, "
+              f"min_hold={args.exit_min_hold:.0f}s, "
+              f"min_remaining={args.exit_min_remaining:.0f}s)")
+        print(f"  Max positions:   {args.max_positions}")
+    print(f"  Cooldown:        {cooldown_ms / 1000:.0f}s")
+    print(f"  Stale timeout:   {stale_timeout:.0f}s")
     print(f"  Trades log:      {TRADES_LOG}")
     print(f"  State file:      {STATE_FILE}")
     print()

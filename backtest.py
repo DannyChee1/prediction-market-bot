@@ -45,6 +45,170 @@ def norm_cdf(x: float) -> float:
     return 0.5 * math.erfc(-x / math.sqrt(2.0))
 
 
+# ── Calibration table ──────────────────────────────────────────────────────
+
+def _compute_vol_deduped(prices: list[float]) -> float:
+    """Realized vol from price series, ignoring stale (duplicate) ticks.
+
+    Standalone version of DiffusionSignal._compute_vol for use outside
+    the signal class (e.g. build_calibration_table).
+    """
+    changes: list[tuple[int, float]] = []
+    for i, p in enumerate(prices):
+        if p > 0 and (not changes or p != changes[-1][1]):
+            changes.append((i, p))
+    if len(changes) < 3:
+        return 0.0
+    log_rets = []
+    for j in range(1, len(changes)):
+        dt = changes[j][0] - changes[j - 1][0]
+        if dt > 0:
+            lr = math.log(changes[j][1] / changes[j - 1][1])
+            log_rets.append(lr / math.sqrt(dt))
+    if len(log_rets) < 2:
+        return 0.0
+    return float(np.std(log_rets, ddof=1))
+
+
+class CalibrationTable:
+    """Walk-forward calibrated p(UP) lookup by (z_bin, tau_bin)."""
+
+    Z_BIN_WIDTH = 0.5       # bins: -2.0, -1.5, ..., +2.0
+    TAU_EDGES = [0, 120, 300, 600, 900]  # 4 buckets
+    MIN_OBS = 20             # minimum observations per cell
+
+    def __init__(self, table: dict, counts: dict):
+        self.table = table    # {(z_bin, tau_idx): p_up}
+        self.counts = counts  # {(z_bin, tau_idx): n}
+
+    def lookup(self, z_capped: float, tau: float) -> float:
+        z_bin = round(z_capped / self.Z_BIN_WIDTH) * self.Z_BIN_WIDTH
+        tau_idx = self._tau_idx(tau)
+
+        # Try exact (z_bin, tau_idx)
+        key = (z_bin, tau_idx)
+        if key in self.table and self.counts.get(key, 0) >= self.MIN_OBS:
+            return self.table[key]
+
+        # Fall back to z-bin only (average across tau buckets)
+        z_vals = [(self.table[k], self.counts[k])
+                  for k in self.table if k[0] == z_bin and self.counts.get(k, 0) >= 5]
+        if z_vals:
+            total_n = sum(n for _, n in z_vals)
+            return sum(p * n for p, n in z_vals) / total_n
+
+        # Final fallback: norm_cdf
+        return norm_cdf(z_capped)
+
+    def _tau_idx(self, tau: float) -> int:
+        for i in range(len(self.TAU_EDGES) - 1):
+            if self.TAU_EDGES[i] <= tau < self.TAU_EDGES[i + 1]:
+                return i
+        return len(self.TAU_EDGES) - 2  # clamp to last bucket
+
+
+def build_calibration_table(
+    data_dir: Path,
+    max_z: float = 2.0,
+    vol_lookback_s: int = 20,
+) -> CalibrationTable:
+    """Build a walk-forward calibration table from all complete parquet windows.
+
+    For each window, extracts signals every 30 rows (matching
+    analyze_calibration.py), records (z_capped, tau, outcome_up) tuples,
+    and builds the lookup from ALL past observations.
+    """
+    # Load and sort all complete windows
+    files = sorted(data_dir.glob("*.parquet"))
+    windows: list[pd.DataFrame] = []
+    for f in files:
+        df = pd.read_parquet(f)
+        if df.empty:
+            continue
+        if "chainlink_btc" in df.columns and "chainlink_price" not in df.columns:
+            df.rename(columns={"chainlink_btc": "chainlink_price"}, inplace=True)
+        # Check completeness: need window_end_ms
+        if "window_end_ms" in df.columns:
+            end_ms = df["window_end_ms"].iloc[0]
+            last_ts = df["ts_ms"].iloc[-1]
+            if last_ts < end_ms:
+                continue  # incomplete
+        else:
+            # Fall back to time_remaining_s check
+            final_remaining = df["time_remaining_s"].iloc[-1]
+            if final_remaining > MIN_FINAL_REMAINING_S:
+                continue
+        windows.append(df)
+
+    windows.sort(key=lambda d: d["ts_ms"].iloc[0])
+
+    # Walk-forward: accumulate observations, build table from all past data
+    all_obs: list[tuple[float, float, int]] = []  # (z_capped, tau, outcome_up)
+
+    for df in windows:
+        # Determine outcome
+        start_prices = df["window_start_price"].dropna()
+        if start_prices.empty:
+            continue
+        start_px = float(start_prices.iloc[0])
+        final_px = float(df["chainlink_price"].iloc[-1])
+        if pd.isna(start_px) or pd.isna(final_px) or start_px == 0:
+            continue
+        outcome = 1 if final_px >= start_px else 0
+
+        # Extract signals every 30 rows after warmup
+        prices = df["chainlink_price"].tolist()
+        for idx in range(vol_lookback_s, len(df), 30):
+            row = df.iloc[idx]
+            tau = row["time_remaining_s"]
+            if tau <= 0:
+                continue
+
+            price_slice = prices[max(0, idx - vol_lookback_s):idx + 1]
+            sigma = _compute_vol_deduped(price_slice)
+            if sigma <= 0:
+                continue
+
+            delta = row["chainlink_price"] - start_px
+            z_raw = delta / (sigma * math.sqrt(tau))
+            z_capped = max(-max_z, min(max_z, z_raw))
+
+            all_obs.append((z_capped, tau, outcome))
+
+    # Build final table from all observations
+    return _build_table_from_obs(all_obs)
+
+
+def _build_table_from_obs(
+    obs: list[tuple[float, float, int]],
+) -> CalibrationTable:
+    """Build a CalibrationTable from a list of (z_capped, tau, outcome) tuples."""
+    from collections import defaultdict
+
+    cell_outcomes: dict[tuple[float, int], list[int]] = defaultdict(list)
+    z_bin_width = CalibrationTable.Z_BIN_WIDTH
+    tau_edges = CalibrationTable.TAU_EDGES
+
+    def tau_idx(tau: float) -> int:
+        for i in range(len(tau_edges) - 1):
+            if tau_edges[i] <= tau < tau_edges[i + 1]:
+                return i
+        return len(tau_edges) - 2
+
+    for z_capped, tau, outcome in obs:
+        z_bin = round(z_capped / z_bin_width) * z_bin_width
+        ti = tau_idx(tau)
+        cell_outcomes[(z_bin, ti)].append(outcome)
+
+    table: dict[tuple[float, int], float] = {}
+    counts: dict[tuple[float, int], int] = {}
+    for key, outcomes in cell_outcomes.items():
+        table[key] = sum(outcomes) / len(outcomes)
+        counts[key] = len(outcomes)
+
+    return CalibrationTable(table, counts)
+
+
 # ── Dataclasses ─────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +414,10 @@ class DiffusionSignal(Signal):
         max_entry_time_s: float | None = None,
         reversion_discount: float = 0.0,
         momentum_majority: float = 1.0,
+        maker_mode: bool = False,
+        edge_threshold_step: float = 0.0,
+        calibration_table: CalibrationTable | None = None,
+        maker_warmup_s: float = 180.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -270,6 +438,10 @@ class DiffusionSignal(Signal):
         self.max_entry_time_s = max_entry_time_s
         self.reversion_discount = reversion_discount
         self.momentum_majority = momentum_majority
+        self.maker_mode = maker_mode
+        self.edge_threshold_step = edge_threshold_step
+        self.calibration_table = calibration_table
+        self.maker_warmup_s = maker_warmup_s
 
     def _compute_vol(self, prices: list[float]) -> float:
         """Realized vol from price series, ignoring stale (duplicate) ticks.
@@ -299,6 +471,12 @@ class DiffusionSignal(Signal):
         if len(log_rets) < 2:
             return 0.0
         return max(float(np.std(log_rets, ddof=1)), self.min_sigma)
+
+    def _p_model(self, z_capped: float, tau: float) -> float:
+        """Model probability of UP, using calibration table if available."""
+        if self.calibration_table is not None:
+            return self.calibration_table.lookup(z_capped, tau)
+        return norm_cdf(z_capped)
 
     def decide(self, snapshot: Snapshot, ctx: dict) -> Decision:
         # Build price history
@@ -359,7 +537,7 @@ class DiffusionSignal(Signal):
         delta = snapshot.chainlink_price - snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
         z = max(-self.max_z, min(self.max_z, z_raw))
-        p_model = norm_cdf(z)
+        p_model = self._p_model(z, tau)
 
         # Mean-reversion discount: pull p_model toward 0.5
         if self.reversion_discount > 0:
@@ -470,6 +648,178 @@ class DiffusionSignal(Signal):
         )
         return Decision(side, edge, size_usd, reason)
 
+    def _size_decision(
+        self, side: str, edge: float, eff_price: float,
+        p_side: float, snapshot: Snapshot, sigma_per_s: float,
+        tau: float, z: float, z_raw: float, p_model: float,
+        dyn_threshold: float, spread: float,
+    ) -> Decision:
+        """Shared sizing logic for a single side. Returns a Decision."""
+        if eff_price >= 1.0:
+            return Decision("FLAT", 0.0, 0.0, "eff price >= 1")
+
+        kelly_f = max(0.0, (p_side - eff_price) / (1.0 - eff_price))
+        frac = min(self.kelly_fraction * kelly_f, self.max_bet_fraction)
+        if frac <= 0:
+            return Decision("FLAT", 0.0, 0.0, "kelly <= 0")
+
+        size_usd = self.bankroll * frac
+        min_usd = self.min_order_shares * eff_price
+        if size_usd < min_usd:
+            if self.bankroll >= min_usd:
+                size_usd = min_usd
+            else:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"bankroll ${self.bankroll:.2f} < min order ${min_usd:.2f}")
+
+        # Store expected range
+        price = snapshot.chainlink_price
+        move_1sig = sigma_per_s * math.sqrt(tau) * price
+        # (caller should capture _expected_range from ctx if needed)
+
+        reason = (
+            f"p={p_model:.4f} sig={sigma_per_s:.2e} z={z:.2f}"
+            f"{'(cap)' if abs(z_raw) > self.max_z else ''} "
+            f"tau={tau:.0f}s edge={edge:.4f} thresh={dyn_threshold:.4f} "
+            f"spread={spread:.3f} kelly={kelly_f:.4f} ${size_usd:.0f}"
+        )
+        return Decision(side, edge, size_usd, reason)
+
+    def decide_both_sides(
+        self, snapshot: Snapshot, ctx: dict,
+    ) -> tuple[Decision, Decision]:
+        """Evaluate Up and Down independently for maker mode.
+
+        Returns (up_decision, down_decision) — both can be non-FLAT.
+        Skips momentum, imbalance, and velocity filters.
+        Uses mid-price with 0% fee for cost calculation.
+        """
+        flat = Decision("FLAT", 0.0, 0.0, "")
+
+        # Build price history (always, even during warmup, so vol is ready)
+        hist = ctx.setdefault("price_history", [])
+        hist.append(snapshot.chainlink_price)
+
+        # Maker warmup: no trading in first N seconds of window
+        if self.maker_mode:
+            tau = snapshot.time_remaining_s
+            elapsed = self.window_duration - tau
+            if elapsed < self.maker_warmup_s:
+                reason = f"maker warmup ({elapsed:.0f}s < {self.maker_warmup_s:.0f}s)"
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+
+        if len(hist) < max(2, self.vol_lookback_s):
+            reason = f"need {self.vol_lookback_s}s history ({len(hist)})"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        ask_up = snapshot.best_ask_up
+        ask_down = snapshot.best_ask_down
+        bid_up = snapshot.best_bid_up
+        bid_down = snapshot.best_bid_down
+        if ask_up is None or ask_down is None or bid_up is None or bid_down is None:
+            reason = "missing book"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+        if ask_up <= 0 or ask_up >= 1 or ask_down <= 0 or ask_down >= 1:
+            reason = "invalid asks"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # Spread gate
+        spread_up = ask_up - bid_up
+        spread_down = ask_down - bid_down
+        if spread_up > self.max_spread or spread_down > self.max_spread:
+            reason = (f"spread too wide (up={spread_up:.3f} down={spread_down:.3f} "
+                      f"max={self.max_spread})")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        tau = snapshot.time_remaining_s
+        if tau <= 0:
+            reason = "window expired"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # Vol
+        sigma_per_s = self._compute_vol(hist[-self.vol_lookback_s:])
+        if sigma_per_s == 0.0:
+            reason = "zero vol"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # Vol regime filter
+        if len(hist) >= self.vol_regime_lookback_s:
+            sigma_baseline = self._compute_vol(hist[-self.vol_regime_lookback_s:])
+            if sigma_baseline > 0 and sigma_per_s > self.vol_regime_mult * sigma_baseline:
+                reason = (f"vol spike ({sigma_per_s:.2e} > "
+                          f"{self.vol_regime_mult}x baseline {sigma_baseline:.2e})")
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+
+        # Dynamic threshold with optional step for window_trade_count
+        window_trades = ctx.get("window_trade_count", 0)
+        base_threshold = self.edge_threshold + self.edge_threshold_step * window_trades
+        dyn_threshold = base_threshold * (
+            1.0 + self.early_edge_mult * math.sqrt(tau / self.window_duration)
+        )
+
+        # z normalization: match decide() formula (sigma is already fractional)
+        price = snapshot.chainlink_price
+        delta = price - snapshot.window_start_price
+        z_raw = delta / (sigma_per_s * math.sqrt(tau))
+        z = max(-self.max_z, min(self.max_z, z_raw))
+        p_model = self._p_model(z, tau)
+
+        if self.reversion_discount > 0:
+            p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
+
+        # Bid-price costs (maker places at bid: 0% fee, no slippage)
+        cost_up = bid_up
+        cost_down = bid_down
+
+        # Edges — bid pricing already accounts for spread naturally
+        edge_up = p_model - cost_up - self.spread_edge_penalty * spread_up
+        edge_down = (1.0 - p_model) - cost_down - self.spread_edge_penalty * spread_down
+
+        # Store expected range in ctx
+        move_1sig = sigma_per_s * math.sqrt(tau) * price
+        ctx["_expected_range"] = {
+            "btc_at_fill": price,
+            "start_price": snapshot.window_start_price,
+            "expected_low": snapshot.window_start_price - move_1sig,
+            "expected_high": snapshot.window_start_price + move_1sig,
+        }
+
+        # Evaluate each side independently
+        up_dec = flat
+        down_dec = flat
+
+        if edge_up > dyn_threshold:
+            up_dec = self._size_decision(
+                "BUY_UP", edge_up, cost_up, p_model,
+                snapshot, sigma_per_s, tau, z, z_raw, p_model,
+                dyn_threshold, spread_up,
+            )
+
+        if edge_down > dyn_threshold:
+            down_dec = self._size_decision(
+                "BUY_DOWN", edge_down, cost_down, 1.0 - p_model,
+                snapshot, sigma_per_s, tau, z, z_raw, p_model,
+                dyn_threshold, spread_down,
+            )
+
+        # If neither has edge, report combined reason
+        if up_dec.action == "FLAT" and down_dec.action == "FLAT":
+            if edge_up <= dyn_threshold and edge_down <= dyn_threshold:
+                reason = (f"no edge (up={edge_up:.4f} down={edge_down:.4f} "
+                          f"thresh={dyn_threshold:.4f})")
+                up_dec = Decision("FLAT", 0.0, 0.0, reason)
+                down_dec = Decision("FLAT", 0.0, 0.0, reason)
+
+        return (up_dec, down_dec)
+
 
 # ── Book walking ────────────────────────────────────────────────────────────
 
@@ -570,35 +920,53 @@ class BacktestEngine:
                       ctx: dict) -> Optional[Fill]:
         if decision.action == "BUY_UP":
             side, ask_levels, best_ask = "UP", snap.ask_levels_up, snap.best_ask_up
+            best_bid = snap.best_bid_up
         elif decision.action == "BUY_DOWN":
             side, ask_levels, best_ask = "DOWN", snap.ask_levels_down, snap.best_ask_down
+            best_bid = snap.best_bid_down
         else:
             return None
 
         if not ask_levels or best_ask is None or best_ask <= 0:
             return None
 
-        eff_est = best_ask + poly_fee(best_ask) + self.slippage
-        if eff_est <= 0 or eff_est >= 1.0:
-            return None
+        # Maker mode: fill at bid with 0% fee
+        maker_mode = getattr(self.signal, "maker_mode", False)
+        if maker_mode and best_bid is not None and best_bid > 0:
+            entry_price = best_bid  # maker fills at bid: 0% fee
+            if entry_price <= 0 or entry_price >= 1.0:
+                return None
+            desired_shares = decision.size_usd / entry_price
+            filled = round(desired_shares, 1)
+            if filled < 5.0:
+                return None  # below exchange minimum
+            total_cost = filled * entry_price
+            if total_cost > self.bankroll:
+                return None  # can't afford
+            fee_avg = 0.0
+        else:
+            eff_est = best_ask + poly_fee(best_ask) + self.slippage
+            if eff_est <= 0 or eff_est >= 1.0:
+                return None
 
-        desired_shares = decision.size_usd / eff_est
-        filled, total_cost, avg_price = walk_book(ask_levels, desired_shares, self.slippage)
+            desired_shares = decision.size_usd / eff_est
+            filled, total_cost, avg_price = walk_book(ask_levels, desired_shares, self.slippage)
 
-        if filled <= 0 or total_cost <= 0:
-            return None
+            if filled <= 0 or total_cost <= 0:
+                return None
 
-        # Compute average raw price for fee reporting
-        raw_total = 0.0
-        temp = 0.0
-        for px, sz in ask_levels:
-            take = min(sz, desired_shares - temp)
-            if take <= 0:
-                break
-            raw_total += take * px
-            temp += take
-        raw_avg = raw_total / temp if temp > 0 else 0
-        fee_avg = avg_price - raw_avg - self.slippage
+            entry_price = avg_price
+            # Compute average raw price for fee reporting
+            raw_total = 0.0
+            temp = 0.0
+            for px, sz in ask_levels:
+                take = min(sz, desired_shares - temp)
+                if take <= 0:
+                    break
+                raw_total += take * px
+                temp += take
+            raw_avg = raw_total / temp if temp > 0 else 0
+            fee_avg = entry_price - raw_avg - self.slippage
 
         # Expected price range from signal (if available)
         rng = ctx.get("_expected_range", {})
@@ -608,7 +976,7 @@ class BacktestEngine:
             side=side,
             entry_ts_ms=snap.ts_ms,
             time_remaining_s=snap.time_remaining_s,
-            entry_price=avg_price,
+            entry_price=entry_price,
             fee_per_share=fee_avg,
             shares=filled,
             cost_usd=total_cost,
@@ -629,6 +997,9 @@ class BacktestEngine:
         results: list[TradeResult] = []
         last_fill_ts: int = 0
         cooldown_ms = 30_000  # minimum 30s between bets
+        maker_mode = getattr(self.signal, "maker_mode", False)
+        if maker_mode:
+            cooldown_ms = 5_000
 
         for _, row in window_df.iterrows():
             snap = Snapshot.from_row(row)
@@ -646,6 +1017,7 @@ class BacktestEngine:
                         if hasattr(self.signal, "bankroll"):
                             self.signal.bankroll = self.bankroll
                         last_fill_ts = snap.ts_ms
+                        ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
                     pending = None
 
             # Cooldown between bets
@@ -656,7 +1028,24 @@ class BacktestEngine:
             if self.max_trades_per_window is not None and len(results) >= self.max_trades_per_window:
                 break
 
-            # Run signal
+            # Maker mode: evaluate both sides independently
+            if maker_mode and hasattr(self.signal, "decide_both_sides"):
+                up_dec, down_dec = self.signal.decide_both_sides(snap, ctx)
+                for decision in [up_dec, down_dec]:
+                    if decision.action != "FLAT" and decision.size_usd > 0:
+                        if self.max_trades_per_window is not None and len(results) >= self.max_trades_per_window:
+                            break
+                        fill = self._execute_fill(snap, decision, ctx)
+                        if fill is not None:
+                            results.append(self._resolve_fill(fill, outcome_up, final_btc))
+                            self.bankroll += results[-1].pnl
+                            if hasattr(self.signal, "bankroll"):
+                                self.signal.bankroll = self.bankroll
+                            last_fill_ts = snap.ts_ms
+                            ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
+                continue
+
+            # FOK mode: run single-side signal
             decision = self.signal.decide(snap, ctx)
             if decision.action != "FLAT" and decision.size_usd > 0:
                 if self.latency_ms <= 0:
@@ -667,6 +1056,7 @@ class BacktestEngine:
                         if hasattr(self.signal, "bankroll"):
                             self.signal.bankroll = self.bankroll
                         last_fill_ts = snap.ts_ms
+                        ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
                 else:
                     pending = (snap.ts_ms + self.latency_ms, decision)
 
@@ -911,6 +1301,12 @@ def main():
     parser.add_argument("--slippage", type=float, default=0.0)
     parser.add_argument("--sensitivity", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--maker", action="store_true",
+                        help="Use maker (limit order) mode: 0%% fee, dual-side evaluation")
+    parser.add_argument("--max-trades-per-window", type=int, default=None,
+                        help="Override max trades per window")
+    parser.add_argument("--calibrated", action="store_true",
+                        help="Use empirically calibrated probabilities instead of Phi(z)")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -940,9 +1336,43 @@ def main():
         )
         eth_engine_kw = dict(max_trades_per_window=1)
 
+    # Maker mode overrides
+    maker_overrides = {}
+    if args.maker:
+        maker_overrides = dict(
+            maker_mode=True,
+            max_bet_fraction=0.02,
+            edge_threshold=0.06,
+            momentum_majority=0.0,
+            spread_edge_penalty=0.0,  # bid pricing handles spread naturally
+            window_duration=config.window_duration_s,
+        )
+        if "max_trades_per_window" not in eth_engine_kw:
+            eth_engine_kw["max_trades_per_window"] = 4
+
+    if args.max_trades_per_window is not None:
+        eth_engine_kw["max_trades_per_window"] = args.max_trades_per_window
+
+    # Calibration: build empirical lookup table and adjust thresholds
+    cal_table = None
+    calibrated_overrides = {}
+    if args.calibrated:
+        print(f"  Building calibration table from {data_dir} ...")
+        cal_table = build_calibration_table(data_dir)
+        n_cells = len(cal_table.table)
+        n_obs = sum(cal_table.counts.values())
+        print(f"  Calibration table: {n_cells} cells, {n_obs} observations")
+        # Calibrated edges are smaller/honest — still require meaningful edge
+        if args.maker:
+            calibrated_overrides = dict(edge_threshold=0.06, early_edge_mult=2.0)
+        else:
+            calibrated_overrides = dict(edge_threshold=0.06, early_edge_mult=2.0)
+
     signal_map = {
         "diffusion": lambda: DiffusionSignal(
-            bankroll=args.bankroll, slippage=args.slippage, **eth_overrides),
+            bankroll=args.bankroll, slippage=args.slippage,
+            calibration_table=cal_table,
+            **{**eth_overrides, **maker_overrides, **calibrated_overrides}),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),
         "random": lambda: RandomCoinFlip(bankroll=args.bankroll, seed=args.seed),
@@ -951,6 +1381,9 @@ def main():
     names = ["always_up", "always_down", "random", "diffusion"] \
         if args.signal == "all" else [args.signal]
 
+    mode_str = "MAKER" if args.maker else "FOK"
+    if args.calibrated:
+        mode_str += "+CAL"
     for name in names:
         signal = signal_map[name]()
         engine = BacktestEngine(
@@ -962,7 +1395,7 @@ def main():
             **eth_engine_kw,
         )
         print(f"\n{'='*62}")
-        print(f"  Running: {signal.name} ({config.display_name})")
+        print(f"  Running: {signal.name} ({config.display_name}) [{mode_str}]")
         print(f"{'='*62}")
         _, metrics, trades_df = engine.run()
         print_summary(metrics, trades_df)

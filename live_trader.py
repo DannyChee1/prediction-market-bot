@@ -353,6 +353,7 @@ class LiveTradeTracker:
         exit_min_hold_s: float = 30.0,
         exit_min_remaining_s: float = 60.0,
         max_positions: int = 4,
+        maker_withdraw_s: float = 60.0,
     ):
         self.client = client
         self.signal = signal
@@ -372,6 +373,7 @@ class LiveTradeTracker:
 
         # Maker mode
         self.maker_mode = maker_mode
+        self.maker_withdraw_s = maker_withdraw_s
         self.window_duration_s = window_duration_s
         self.max_exposure_pct = max_exposure_pct
         self.maker_warmup_s = maker_warmup_s
@@ -563,11 +565,11 @@ class LiveTradeTracker:
             self._bucket_flat_reason(reason)
             return self.last_decision
 
-        # Time blackout: cancel open orders and stop in last 30s
-        if tau < 30:
+        # End-of-window withdrawal: cancel open orders and stop
+        if tau < self.maker_withdraw_s:
             if self.open_orders:
                 self._cancel_open_orders()
-            reason = f"maker end-of-window ({tau:.0f}s < 30s)"
+            reason = f"maker end-of-window ({tau:.0f}s < {self.maker_withdraw_s:.0f}s)"
             self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
             self._bucket_flat_reason(reason)
             return self.last_decision
@@ -581,6 +583,8 @@ class LiveTradeTracker:
 
         # ALWAYS run dual-side signal to get current edge at current bid
         self.ctx["window_trade_count"] = self.window_trade_count
+        self.ctx["inventory_up"] = sum(1 for f in self.pending_fills if f["side"] == "UP")
+        self.ctx["inventory_down"] = sum(1 for f in self.pending_fills if f["side"] == "DOWN")
         up_dec, down_dec = self.signal.decide_both_sides(snapshot, self.ctx)
         self.last_up_decision = up_dec
         self.last_down_decision = down_dec
@@ -2678,6 +2682,10 @@ def main():
                         help="Don't exit when < this many seconds remain (default: 60)")
     parser.add_argument("--max-positions", type=int, default=4,
                         help="Max simultaneous filled positions (default: 4)")
+    parser.add_argument("--inventory-skew", type=float, default=0.02,
+                        help="Edge penalty per same-side position (default 0.02)")
+    parser.add_argument("--maker-withdraw", type=float, default=60.0,
+                        help="Stop new orders when tau < N seconds (default 60)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     DEBUG = args.debug
@@ -2773,6 +2781,8 @@ def main():
             signal_kw["edge_threshold"] = 0.10
             signal_kw["early_edge_mult"] = 2.0
 
+    signal_kw["inventory_skew"] = args.inventory_skew
+    signal_kw["maker_withdraw_s"] = args.maker_withdraw
     signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
     tracker = LiveTradeTracker(
         client=client,
@@ -2791,6 +2801,7 @@ def main():
         requote_cooldown_s=args.requote_cooldown,
         max_exposure_pct=args.max_exposure_pct,
         maker_warmup_s=args.maker_warmup,
+        maker_withdraw_s=args.maker_withdraw,
         exit_enabled=args.early_exit,
         exit_threshold=args.exit_threshold,
         exit_min_hold_s=args.exit_min_hold,

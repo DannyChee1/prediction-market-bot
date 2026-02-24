@@ -426,6 +426,8 @@ class DiffusionSignal(Signal):
         maker_warmup_s: float = 100.0,
         min_entry_price: float = 0.10,
         cal_prior_strength: float = 100.0,
+        inventory_skew: float = 0.02,
+        maker_withdraw_s: float = 60.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -452,6 +454,8 @@ class DiffusionSignal(Signal):
         self.maker_warmup_s = maker_warmup_s
         self.min_entry_price = min_entry_price
         self.cal_prior_strength = cal_prior_strength
+        self.inventory_skew = inventory_skew
+        self.maker_withdraw_s = maker_withdraw_s
 
     def _compute_vol(self, prices: list[float]) -> float:
         """Realized vol from price series, ignoring stale (duplicate) ticks.
@@ -733,6 +737,12 @@ class DiffusionSignal(Signal):
                 return (Decision("FLAT", 0.0, 0.0, reason),
                         Decision("FLAT", 0.0, 0.0, reason))
 
+            # End-of-window withdrawal: stop new orders when tau < threshold
+            if tau < self.maker_withdraw_s:
+                reason = f"end-of-window ({tau:.0f}s < {self.maker_withdraw_s:.0f}s)"
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+
         if len(hist) < max(2, self.vol_lookback_s):
             reason = f"need {self.vol_lookback_s}s history ({len(hist)})"
             return (Decision("FLAT", 0.0, 0.0, reason),
@@ -806,6 +816,15 @@ class DiffusionSignal(Signal):
         # Edges — bid pricing already accounts for spread naturally
         edge_up = p_model - cost_up - self.spread_edge_penalty * spread_up
         edge_down = (1.0 - p_model) - cost_down - self.spread_edge_penalty * spread_down
+
+        # Inventory skew: penalize adding to an existing side
+        if self.inventory_skew > 0:
+            n_up = ctx.get("inventory_up", 0)
+            n_down = ctx.get("inventory_down", 0)
+            edge_up -= self.inventory_skew * n_up
+            edge_up += self.inventory_skew * n_down
+            edge_down -= self.inventory_skew * n_down
+            edge_down += self.inventory_skew * n_up
 
         # Store expected range in ctx
         move_1sig = sigma_per_s * math.sqrt(tau) * price
@@ -1016,7 +1035,7 @@ class BacktestEngine:
         self, window_df: pd.DataFrame, outcome_up: int,
         final_btc: float,
     ) -> list[TradeResult]:
-        ctx: dict = {}
+        ctx: dict = {"inventory_up": 0, "inventory_down": 0}
         pending: Optional[tuple[int, Decision]] = None
         results: list[TradeResult] = []
         last_fill_ts: int = 0
@@ -1042,6 +1061,10 @@ class BacktestEngine:
                             self.signal.bankroll = self.bankroll
                         last_fill_ts = snap.ts_ms
                         ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
+                        if "UP" in decision.action:
+                            ctx["inventory_up"] = ctx.get("inventory_up", 0) + 1
+                        elif "DOWN" in decision.action:
+                            ctx["inventory_down"] = ctx.get("inventory_down", 0) + 1
                     pending = None
 
             # Cooldown between bets
@@ -1067,6 +1090,10 @@ class BacktestEngine:
                                 self.signal.bankroll = self.bankroll
                             last_fill_ts = snap.ts_ms
                             ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
+                            if "UP" in decision.action:
+                                ctx["inventory_up"] = ctx.get("inventory_up", 0) + 1
+                            elif "DOWN" in decision.action:
+                                ctx["inventory_down"] = ctx.get("inventory_down", 0) + 1
                 continue
 
             # FOK mode: run single-side signal
@@ -1081,6 +1108,10 @@ class BacktestEngine:
                             self.signal.bankroll = self.bankroll
                         last_fill_ts = snap.ts_ms
                         ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
+                        if "UP" in decision.action:
+                            ctx["inventory_up"] = ctx.get("inventory_up", 0) + 1
+                        elif "DOWN" in decision.action:
+                            ctx["inventory_down"] = ctx.get("inventory_down", 0) + 1
                 else:
                     pending = (snap.ts_ms + self.latency_ms, decision)
 
@@ -1335,6 +1366,10 @@ def main():
                         help="Minimum bid/entry price to accept (default 0.10)")
     parser.add_argument("--cal-prior-strength", type=float, default=100.0,
                         help="Bayesian prior strength n0 for GBM/calibration fusion (default 100)")
+    parser.add_argument("--inventory-skew", type=float, default=0.02,
+                        help="Edge penalty per same-side position (default 0.02)")
+    parser.add_argument("--maker-withdraw", type=float, default=60.0,
+                        help="Stop new orders when tau < N seconds (default 60)")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -1402,6 +1437,8 @@ def main():
             calibration_table=cal_table,
             min_entry_price=args.min_entry_price,
             cal_prior_strength=args.cal_prior_strength,
+            inventory_skew=args.inventory_skew,
+            maker_withdraw_s=args.maker_withdraw,
             **{**eth_overrides, **maker_overrides, **calibrated_overrides}),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

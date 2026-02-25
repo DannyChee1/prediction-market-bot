@@ -162,6 +162,7 @@ async def clob_ws(
                                             trade_state["bars"].append(
                                                 (bar["buy_vol"], bar["sell_vol"])
                                             )
+                                            trade_state["total_bars"] = trade_state.get("total_bars", 0) + 1
                                             bar["buy_vol"] = 0.0
                                             bar["sell_vol"] = 0.0
                                             bar["start_ts"] = now_ts

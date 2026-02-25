@@ -131,13 +131,18 @@ def render_display(
     trade_bars = tracker.ctx.get("_trade_bars")
     vpin_window = getattr(tracker.signal, "vpin_window", 20)
     n_bars = len(trade_bars) if trade_bars is not None else 0
-    if n_bars > 0:
+    # Total bars collected (persists across windows via trade_state)
+    total_bars = tracker.ctx.get("_trade_total_bars", 0)
+    target_bars = 1440  # 24h at 60s/bar
+    if n_bars > 0 or total_bars > 0:
         if n_bars < vpin_window:
-            lines.append(f"  VPIN:      warming up ({n_bars}/{vpin_window} bars)")
+            lines.append(f"  VPIN:      warming up ({n_bars}/{vpin_window} bars)"
+                         f"  |  collected: {total_bars}/{target_bars} (24h)")
         else:
             vpin_bar = "#" * int(vpin * 10)
             vpin_label = "LOW" if vpin < 0.40 else ("MED" if vpin <= 0.55 else "HIGH")
-            lines.append(f"  VPIN:      {vpin:.2f} [{vpin_bar:<10s}] {vpin_label}")
+            lines.append(f"  VPIN:      {vpin:.2f} [{vpin_bar:<10s}] {vpin_label}"
+                         f"  |  collected: {total_bars}/{target_bars} (24h)")
 
     # Circuit breaker warning
     if tracker.circuit_breaker_tripped:

@@ -70,6 +70,7 @@ async def signal_ticker(
         if snap is not None and not skip_trading:
             if trade_state is not None:
                 tracker.ctx["_trade_bars"] = trade_state["bars"]
+                tracker.ctx["_trade_total_bars"] = trade_state.get("total_bars", 0)
             tracker.evaluate(snap, up_token, down_token)
 
         tracker.check_api_balance()
@@ -230,6 +231,7 @@ async def run(tracker: LiveTradeTracker, config):
         "bars": collections.deque(maxlen=200),
         "current_bar": {"buy_vol": 0.0, "sell_vol": 0.0, "start_ts": 0},
         "bar_duration_s": vpin_bar_s,
+        "total_bars": 0,
     }
 
     rtds_cancel = asyncio.Event()

@@ -1521,7 +1521,8 @@ class BacktestEngine:
             base.update(n_trades=0, total_pnl=0.0, total_fees=0.0,
                         win_rate=0.0, avg_pnl=0.0, avg_win=0.0,
                         avg_loss=0.0, max_drawdown=0.0, max_dd_pct=0.0,
-                        sharpe=0.0)
+                        sharpe=0.0, sharpe_deflated=0.0,
+                        n_trials=getattr(self, "n_trials", 1))
             return base
 
         pnls = [r.pnl for r in results]
@@ -1547,6 +1548,17 @@ class BacktestEngine:
         std_pnl = float(np.std(pnls, ddof=1)) if len(pnls) > 1 else 0.0
         sharpe = (mean_pnl / std_pnl) * math.sqrt(96) if std_pnl > 0 else 0.0
 
+        # Deflated Sharpe (Bailey & Lopez de Prado, 2014)
+        # Penalizes for multiple testing: SR* = SR - sqrt(2 * log(N) / T)
+        # where N = number of parameter configs tried, T = number of trades.
+        # N_trials is set by the caller via the engine; defaults to 1 (no penalty).
+        n_trials = getattr(self, "n_trials", 1)
+        if n_trials > 1 and len(pnls) > 1:
+            haircut = math.sqrt(2.0 * math.log(n_trials) / len(pnls)) * math.sqrt(96)
+            sharpe_deflated = sharpe - haircut
+        else:
+            sharpe_deflated = sharpe
+
         base.update(
             n_trades=len(results),
             total_pnl=round(sum(pnls), 2),
@@ -1558,6 +1570,8 @@ class BacktestEngine:
             max_drawdown=round(max_dd, 2),
             max_dd_pct=round(max_dd_pct, 4),
             sharpe=round(sharpe, 2),
+            sharpe_deflated=round(sharpe_deflated, 2),
+            n_trials=n_trials,
         )
         return base
 
@@ -1591,6 +1605,7 @@ def run_sensitivity(
                 slippage=slip,
                 initial_bankroll=initial_bankroll,
             )
+            engine.n_trials = total
             _, metrics, _ = engine.run()
             rows.append(metrics)
 
@@ -1636,6 +1651,9 @@ def print_summary(metrics: dict, trades_df: pd.DataFrame):
     print(f"  Avg loss:       ${metrics['avg_loss']:+.2f}")
     print(f"  Max drawdown:   ${metrics['max_drawdown']:.2f} ({metrics['max_dd_pct']:.1%})")
     print(f"  Sharpe (ann.):  {metrics['sharpe']:.2f}")
+    if metrics.get("n_trials", 1) > 1:
+        print(f"  Sharpe (defl.): {metrics['sharpe_deflated']:.2f}  "
+              f"(N={metrics['n_trials']} trials)")
     print(f"{'='*62}")
 
 
@@ -1677,7 +1695,7 @@ def main():
         print("  SENSITIVITY GRID (DiffusionSignal)")
         print(f"{'='*62}")
         cols = ["latency_ms", "slippage", "n_trades", "total_pnl",
-                "win_rate", "sharpe", "final_bankroll"]
+                "win_rate", "sharpe", "sharpe_deflated", "final_bankroll"]
         print(sens_df[cols].to_string(index=False))
         return
 

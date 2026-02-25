@@ -24,6 +24,8 @@ import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 from dotenv import load_dotenv
 from web3 import Web3
 
@@ -299,8 +301,18 @@ def main():
                         help="Max simultaneous filled positions (default: 4)")
     parser.add_argument("--inventory-skew", type=float, default=0.02,
                         help="Edge penalty per same-side position (default 0.02)")
-    parser.add_argument("--maker-withdraw", type=float, default=60.0,
-                        help="Stop new orders when tau < N seconds (default 60)")
+    parser.add_argument("--maker-withdraw", type=float, default=120.0,
+                        help="Stop new orders when tau < N seconds (default 120)")
+    parser.add_argument("--toxicity-threshold", type=float, default=0.75,
+                        help="Toxicity score above which edge threshold widens (default: 0.75)")
+    parser.add_argument("--toxicity-edge-mult", type=float, default=1.5,
+                        help="Max edge threshold multiplier at toxicity=1.0 (default: 1.5)")
+    parser.add_argument("--vol-kill-sigma", type=float, default=None,
+                        help="Absolute sigma ceiling — pause quoting above this (default: None)")
+    parser.add_argument("--down-edge-bonus", type=float, default=0.15,
+                        help="Fraction to reduce DOWN edge threshold (optimism tax, default: 0.15)")
+    parser.add_argument("--regime-z-scale", action="store_true",
+                        help="Scale z-scores by sigma_ema / sigma_calibration (requires --calibrated)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -387,6 +399,44 @@ def main():
     signal_kw["maker_withdraw_s"] = args.maker_withdraw
     signal_kw["max_sigma"] = config.max_sigma
     signal_kw["min_sigma"] = config.min_sigma
+    signal_kw["toxicity_threshold"] = args.toxicity_threshold
+    signal_kw["toxicity_edge_mult"] = args.toxicity_edge_mult
+    if args.vol_kill_sigma is not None:
+        signal_kw["vol_kill_sigma"] = args.vol_kill_sigma
+    signal_kw["down_edge_bonus"] = args.down_edge_bonus
+    signal_kw["regime_z_scale"] = args.regime_z_scale
+
+    # Compute sigma_calibration from recorded data when regime-z-scale is on
+    if args.regime_z_scale and args.calibrated:
+        from backtest import DATA_DIR, _compute_vol_deduped
+        cal_data_dir_for_sigma = DATA_DIR / config.data_subdir
+        MAX_CAL_FILES = 200      # cap to recent windows to keep startup fast
+        MIN_SIGMA_CAL = 1e-7     # floor to prevent z-scaling explosion in quiet regimes
+        try:
+            sigmas = []
+            files = sorted(cal_data_dir_for_sigma.glob("*.parquet"))
+            files = files[-MAX_CAL_FILES:]  # use most recent N windows
+            for f in files:
+                df = pd.read_parquet(f)
+                if df.empty:
+                    continue
+                pcol = "chainlink_price" if "chainlink_price" in df.columns else "chainlink_btc"
+                if pcol not in df.columns:
+                    continue
+                prices = df[pcol].tolist()
+                ts_list = df["ts_ms"].tolist() if "ts_ms" in df.columns else None
+                s = _compute_vol_deduped(prices, ts_list)
+                if s > 0:
+                    sigmas.append(s)
+            if sigmas:
+                sigma_cal = max(float(np.median(sigmas)), MIN_SIGMA_CAL)
+                signal_kw["sigma_calibration"] = sigma_cal
+                print(f"  Regime-z-scale: sigma_calibration={sigma_cal:.2e} "
+                      f"(median of {len(sigmas)} windows, last {len(files)} files)")
+            else:
+                print("  WARNING: regime-z-scale enabled but no valid sigma data found")
+        except Exception as exc:
+            print(f"  WARNING: sigma_calibration computation failed: {exc}")
 
     # VAMP: BTC uses cost-based, ETH uses filter-based
     if base_market == "btc":

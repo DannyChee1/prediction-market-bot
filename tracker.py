@@ -360,6 +360,10 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             cat = "maker_eow"
         elif "cooldown" in reason:
             cat = "cooldown"
+        elif "vol kill" in reason:
+            cat = "vol_kill"
+        elif "toxicity" in reason:
+            cat = "toxicity"
         else:
             cat = reason[:30]
         self.flat_reason_counts[cat] = self.flat_reason_counts.get(cat, 0) + 1
@@ -661,8 +665,13 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "edge_up": round(edge_up, 4),
             "edge_down": round(edge_down, 4),
             "dyn_threshold": round(dyn_threshold, 4),
+            "dyn_threshold_down": round(self.ctx.get("_dyn_threshold_down", dyn_threshold), 4),
             "best_edge": round(max(edge_up, edge_down), 4),
             "edge_gap": round(max(edge_up, edge_down) - dyn_threshold, 4),
+            "toxicity": round(self.ctx.get("_toxicity", 0.0), 4),
+            "regime_z_factor": round(self.ctx.get("_regime_z_factor", 1.0), 4),
+            "down_bonus_active": self.ctx.get("_down_bonus_active", False),
+            "down_share": round(self.ctx.get("_down_share", 0.5), 4),
             "reason": decision.reason,
             "hist_len": len(hist),
             "evals": self.signal_eval_count,

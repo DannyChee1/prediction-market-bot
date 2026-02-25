@@ -492,6 +492,17 @@ class DiffusionSignal(Signal):
         vamp_mode: str = "none",
         vamp_filter_threshold: float = 0.03,
         max_entry_price: float = 1.0,
+        # NO/DOWN bias: reduce edge threshold for DOWN by this fraction
+        # of base threshold (optimism tax — YES/UP tends to be overpriced)
+        down_edge_bonus: float = 0.0,
+        # Microstructure toxicity filter
+        toxicity_threshold: float = 0.75,
+        toxicity_edge_mult: float = 1.5,
+        # Volatility kill switch (absolute EMA ceiling)
+        vol_kill_sigma: float | None = None,
+        # Regime-scaled z: scale z by sigma_ema / sigma_calibration
+        regime_z_scale: bool = False,
+        sigma_calibration: float | None = None,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -525,6 +536,12 @@ class DiffusionSignal(Signal):
         self.vamp_mode = vamp_mode                    # "none", "cost", "filter"
         self.vamp_filter_threshold = vamp_filter_threshold
         self.max_entry_price = max_entry_price
+        self.down_edge_bonus = down_edge_bonus
+        self.toxicity_threshold = toxicity_threshold
+        self.toxicity_edge_mult = toxicity_edge_mult
+        self.vol_kill_sigma = vol_kill_sigma
+        self.regime_z_scale = regime_z_scale
+        self.sigma_calibration = sigma_calibration
 
     def _compute_vol(
         self,
@@ -582,6 +599,49 @@ class DiffusionSignal(Signal):
             ema = max(ema, self.min_sigma)  # only enforce if explicitly set above default
         return ema
 
+    @staticmethod
+    def _compute_toxicity(snapshot: "Snapshot", max_spread: float) -> float:
+        """Composite toxicity score in [0, 1] from microstructure signals.
+
+        Components (each normalized to [0, 1]):
+          1. Spread width:   avg(spread_up, spread_down) / max_spread
+          2. Book imbalance: abs(total_bid_depth - total_ask_depth) / total_depth
+          3. Mid-oracle gap: abs(book_mid - chainlink) / chainlink
+
+        Final score = weighted average (40% spread, 30% imbalance, 30% gap).
+        """
+        bid_up = snapshot.best_bid_up or 0.0
+        ask_up = snapshot.best_ask_up or 1.0
+        bid_down = snapshot.best_bid_down or 0.0
+        ask_down = snapshot.best_ask_down or 1.0
+
+        # 1. Normalized spread
+        spread_up = ask_up - bid_up
+        spread_down = ask_down - bid_down
+        avg_spread = (spread_up + spread_down) / 2.0
+        spread_score = min(1.0, avg_spread / max_spread) if max_spread > 0 else 0.0
+
+        # 2. Book imbalance across all levels
+        bid_depth_up = sum(sz for _, sz in snapshot.bid_levels_up)
+        ask_depth_up = sum(sz for _, sz in snapshot.ask_levels_up)
+        bid_depth_down = sum(sz for _, sz in snapshot.bid_levels_down)
+        ask_depth_down = sum(sz for _, sz in snapshot.ask_levels_down)
+        total_bid = bid_depth_up + bid_depth_down
+        total_ask = ask_depth_up + ask_depth_down
+        total_depth = total_bid + total_ask
+        imbalance_score = abs(total_bid - total_ask) / total_depth if total_depth > 0 else 0.0
+
+        # 3. Mid–oracle deviation
+        # Book mid = average of up-mid and (1 - down-mid) — they should agree
+        mid_up = (bid_up + ask_up) / 2.0
+        mid_down = (bid_down + ask_down) / 2.0
+        # Implied probability from up and down mids should sum to ~1.0
+        # Deviation from this parity signals mispricing / toxic flow
+        parity_gap = abs((mid_up + mid_down) - 1.0)
+        gap_score = min(1.0, parity_gap / 0.10)  # normalize: 0.10 gap = score 1.0
+
+        return 0.40 * spread_score + 0.30 * imbalance_score + 0.30 * gap_score
+
     def _p_model(self, z_capped: float, tau: float) -> float:
         """Model probability of UP via Bayesian fusion of GBM + calibration.
 
@@ -627,6 +687,10 @@ class DiffusionSignal(Signal):
                 f"spread too wide (up={spread_up:.3f} down={spread_down:.3f} "
                 f"max={self.max_spread})")
 
+        # Microstructure toxicity
+        toxicity = self._compute_toxicity(snapshot, self.max_spread)
+        ctx["_toxicity"] = toxicity
+
         tau = snapshot.time_remaining_s
         if tau <= 0:
             return Decision("FLAT", 0.0, 0.0, "window expired")
@@ -637,10 +701,14 @@ class DiffusionSignal(Signal):
                 f"too early ({tau:.0f}s left > {self.max_entry_time_s:.0f}s gate)")
 
         # Dynamic edge threshold: higher early, decays with sqrt(tau)
-        # At tau=900s: base * (1 + mult), at tau=0: base
         dyn_threshold = self.edge_threshold * (
             1.0 + self.early_edge_mult * math.sqrt(tau / self.window_duration)
         )
+
+        # Toxicity penalty: widen threshold in adverse microstructure
+        if toxicity > self.toxicity_threshold:
+            excess = (toxicity - self.toxicity_threshold) / (1.0 - self.toxicity_threshold)
+            dyn_threshold *= 1.0 + self.toxicity_edge_mult * excess
 
         # Realized vol (short window for model)
         raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
@@ -648,7 +716,6 @@ class DiffusionSignal(Signal):
             return Decision("FLAT", 0.0, 0.0, "zero vol")
 
         # Vol regime filter: compare recent vol to longer baseline
-        # If short-term vol > mult * long-term vol, market is stressed
         if len(hist) >= self.vol_regime_lookback_s:
             sigma_baseline = self._compute_vol(hist[-self.vol_regime_lookback_s:], ts_hist[-self.vol_regime_lookback_s:])
             if sigma_baseline > 0 and raw_sigma > self.vol_regime_mult * sigma_baseline:
@@ -659,9 +726,25 @@ class DiffusionSignal(Signal):
         # EMA smoothing + asset cap
         sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
 
+        # Vol kill switch
+        if self.vol_kill_sigma is not None and sigma_per_s > self.vol_kill_sigma:
+            return Decision("FLAT", 0.0, 0.0,
+                f"vol kill switch (sigma={sigma_per_s:.2e} "
+                f"> {self.vol_kill_sigma:.2e})")
+
         # Model probability (z capped to prevent overconfidence)
         delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
+
+        # Regime-scaled z (same as decide_both_sides)
+        regime_z_factor = 1.0
+        if self.regime_z_scale and self.sigma_calibration and self.sigma_calibration > 0:
+            scale = sigma_per_s / self.sigma_calibration
+            scale = max(0.5, min(2.0, scale))
+            z_raw *= scale
+            regime_z_factor = scale
+        ctx["_regime_z_factor"] = regime_z_factor
+
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = self._p_model(z, tau)
 
@@ -899,6 +982,13 @@ class DiffusionSignal(Signal):
                 return (Decision("FLAT", 0.0, 0.0, reason),
                         Decision("FLAT", 0.0, 0.0, reason))
 
+        # Microstructure toxicity filter: composite score from spread,
+        # book imbalance, and mid-parity gap.  Rather than a hard cutoff,
+        # toxicity widens the edge threshold proportionally so we still
+        # trade in mildly toxic regimes but at a higher bar.
+        toxicity = self._compute_toxicity(snapshot, self.max_spread)
+        ctx["_toxicity"] = toxicity
+
         tau = snapshot.time_remaining_s
         if tau <= 0:
             reason = "window expired"
@@ -924,6 +1014,16 @@ class DiffusionSignal(Signal):
         # EMA smoothing + asset cap
         sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
 
+        # Volatility kill switch: hard pause when EMA sigma exceeds
+        # an absolute ceiling.  Distinct from the relative regime filter
+        # above — this catches sustained high-vol episodes where the
+        # baseline itself has drifted up.
+        if self.vol_kill_sigma is not None and sigma_per_s > self.vol_kill_sigma:
+            reason = (f"vol kill switch (sigma={sigma_per_s:.2e} "
+                      f"> {self.vol_kill_sigma:.2e})")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
         # Dynamic threshold with optional step for window_trade_count
         window_trades = ctx.get("window_trade_count", 0)
         base_threshold = self.edge_threshold + self.edge_threshold_step * window_trades
@@ -931,10 +1031,33 @@ class DiffusionSignal(Signal):
             1.0 + self.early_edge_mult * math.sqrt(tau / self.window_duration)
         )
 
+        # Toxicity penalty: widen edge threshold proportionally when
+        # microstructure is adverse.  The multiplier ramps linearly from
+        # 1.0 at toxicity <= threshold to (1 + toxicity_edge_mult) at
+        # toxicity = 1.0, so we still trade in mild conditions but
+        # demand much more edge in toxic ones.
+        if toxicity > self.toxicity_threshold:
+            excess = (toxicity - self.toxicity_threshold) / (1.0 - self.toxicity_threshold)
+            dyn_threshold *= 1.0 + self.toxicity_edge_mult * excess
+
         # z normalization: fractional delta / (sigma * sqrt(tau))
         price = snapshot.chainlink_price
         delta = (price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
+
+        # Regime-scaled z: adjust z for current vol regime relative to
+        # the calibration-period vol.  High-vol regimes shrink z (wider
+        # distribution → less confident directional signal), low-vol
+        # regimes amplify it.  Clamped to [0.5, 2.0] to avoid extreme
+        # suppression or overconfidence from a single bar.
+        regime_z_factor = 1.0
+        if self.regime_z_scale and self.sigma_calibration and self.sigma_calibration > 0:
+            scale = sigma_per_s / self.sigma_calibration
+            scale = max(0.5, min(2.0, scale))
+            z_raw *= scale
+            regime_z_factor = scale
+        ctx["_regime_z_factor"] = regime_z_factor
+
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = self._p_model(z, tau)
 
@@ -971,6 +1094,30 @@ class DiffusionSignal(Signal):
             "expected_high": snapshot.window_start_price + move_1sig,
         }
 
+        # NO/DOWN bias (optimism tax): YES/UP tends to be overpriced
+        # on prediction markets, so we lower the threshold for DOWN.
+        # Only applies when the book isn't already heavily one-sided
+        # (imbalance < 0.5) to avoid over-concentrating risk when
+        # the market clearly disagrees with our model.
+        dyn_threshold_down = dyn_threshold
+        down_bonus_active = False
+        down_share = 0.5
+        if self.down_edge_bonus > 0:
+            bid_depth_up = sum(sz for _, sz in snapshot.bid_levels_up)
+            ask_depth_up = sum(sz for _, sz in snapshot.ask_levels_up)
+            bid_depth_down = sum(sz for _, sz in snapshot.bid_levels_down)
+            ask_depth_down = sum(sz for _, sz in snapshot.ask_levels_down)
+            total_d = bid_depth_up + ask_depth_up + bid_depth_down + ask_depth_down
+            down_d = bid_depth_down + ask_depth_down
+            down_share = down_d / total_d if total_d > 0 else 0.5
+            # Only apply bonus when book is reasonably balanced (30-70% range)
+            if 0.3 <= down_share <= 0.7:
+                dyn_threshold_down = dyn_threshold * (1.0 - self.down_edge_bonus)
+                down_bonus_active = True
+        ctx["_down_bonus_active"] = down_bonus_active
+        ctx["_down_share"] = down_share
+        ctx["_dyn_threshold_down"] = dyn_threshold_down
+
         # Evaluate each side independently
         up_dec = flat
         down_dec = flat
@@ -982,18 +1129,19 @@ class DiffusionSignal(Signal):
                 dyn_threshold, spread_up,
             )
 
-        if edge_down > dyn_threshold:
+        if edge_down > dyn_threshold_down:
             down_dec = self._size_decision(
                 "BUY_DOWN", edge_down, cost_down, 1.0 - p_model,
                 snapshot, sigma_per_s, tau, z, z_raw, p_model,
-                dyn_threshold, spread_down,
+                dyn_threshold_down, spread_down,
             )
 
         # If neither has edge, report combined reason
         if up_dec.action == "FLAT" and down_dec.action == "FLAT":
-            if edge_up <= dyn_threshold and edge_down <= dyn_threshold:
+            if edge_up <= dyn_threshold and edge_down <= dyn_threshold_down:
                 reason = (f"no edge (up={edge_up:.4f} down={edge_down:.4f} "
-                          f"thresh={dyn_threshold:.4f})")
+                          f"thresh={dyn_threshold:.4f}"
+                          f"{f' down_thresh={dyn_threshold_down:.4f}' if dyn_threshold_down != dyn_threshold else ''})")
                 up_dec = Decision("FLAT", 0.0, 0.0, reason)
                 down_dec = Decision("FLAT", 0.0, 0.0, reason)
 

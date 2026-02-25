@@ -119,6 +119,13 @@ def render_display(
         top_str = "  |  ".join(f"{k}:{v}" for k, v in top[:3])
         lines.append(f"  FLAT dist: {top_str}")
 
+    # Toxicity indicator
+    toxicity = tracker.ctx.get("_toxicity", 0.0)
+    if toxicity > 0:
+        tox_bar = "#" * int(toxicity * 10)
+        tox_label = "LOW" if toxicity < 0.3 else ("MED" if toxicity < 0.6 else "HIGH")
+        lines.append(f"  Toxicity:  {toxicity:.2f} [{tox_bar:<10s}] {tox_label}")
+
     # Circuit breaker warning
     if tracker.circuit_breaker_tripped:
         lines.append(f"  *** {tracker.circuit_breaker_reason} ***")

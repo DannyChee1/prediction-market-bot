@@ -19,6 +19,7 @@ Run with native Windows Python (has pyarrow):
 
 import argparse
 import asyncio
+import collections
 import json
 import os
 import ssl
@@ -101,6 +102,7 @@ book_up = OrderBook()
 book_down = OrderBook()
 chainlink_price: float | None = None
 window_start_price: float | None = None
+price_history: collections.deque = collections.deque(maxlen=600)  # (ts_ms, price)
 
 # Metadata set per window
 meta = {
@@ -335,7 +337,8 @@ async def clob_ws(up_token: str, down_token: str, cancel: asyncio.Event):
 
 # ── RTDS WebSocket ───────────────────────────────────────────────────────────
 async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
-    global chainlink_price, window_start_price
+    """Persistent RTDS websocket — runs across windows, buffers (ts_ms, price)."""
+    global chainlink_price
     backoff = 2
 
     while not cancel.is_set():
@@ -386,20 +389,29 @@ async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
                         if symbol is None or symbol != config.chainlink_symbol:
                             continue
 
-                        # Single streaming update
-                        price = payload.get("value")
-                        if price is not None:
-                            chainlink_price = float(price)
-                            if window_start_price is None:
-                                window_start_price = chainlink_price
-                            continue
-
-                        # Initial batch
+                        # Initial batch — buffer all entries with timestamps
                         data_arr = payload.get("data")
                         if isinstance(data_arr, list) and data_arr:
-                            chainlink_price = float(data_arr[-1]["value"])
-                            if window_start_price is None:
-                                window_start_price = chainlink_price
+                            for entry in data_arr:
+                                p = entry.get("value")
+                                ts_ms = entry.get("timestamp")
+                                if p is not None:
+                                    chainlink_price = float(p)
+                                    if ts_ms is not None:
+                                        price_history.append(
+                                            (int(ts_ms), float(p))
+                                        )
+                            continue
+
+                        # Single streaming update
+                        price = payload.get("value")
+                        ts_ms = payload.get("timestamp")
+                        if price is not None:
+                            chainlink_price = float(price)
+                            if ts_ms is not None:
+                                price_history.append(
+                                    (int(ts_ms), float(price))
+                                )
 
                 finally:
                     hb.cancel()
@@ -495,12 +507,46 @@ async def run_window(config: MarketConfig):
     print(f"  Window:    {start.strftime('%H:%M:%S')} -> {end.strftime('%H:%M:%S')} UTC")
     print(f"  Slug:      {slug}")
 
+    # Wait until eventStartTime + 5s so RTDS buffer has the start price
+    now = datetime.now(timezone.utc)
+    target = start + timedelta(seconds=5)
+    wait_s = (target - now).total_seconds()
+    if 0 < wait_s <= 120:
+        print(f"  Waiting {wait_s:.0f}s for start price...")
+        await asyncio.sleep(wait_s)
+
+    # Look up exact Chainlink price at eventStartTime from RTDS buffer
+    # (matches live_trader.py logic — Polymarket's "Price to Beat")
+    start_ts_ms = int(start.timestamp() * 1000)
+    start_price_exact = None
+    if price_history:
+        best_entry = None
+        best_diff = float("inf")
+        for ts_ms, px in price_history:
+            diff = abs(ts_ms - start_ts_ms)
+            if diff < best_diff:
+                best_diff = diff
+                best_entry = (ts_ms, px)
+        if best_entry and best_diff <= 2000:  # within 2 seconds
+            start_price_exact = best_entry[1]
+
+    if start_price_exact is not None:
+        window_start_price = start_price_exact
+        offset_ms = best_entry[0] - start_ts_ms
+        print(f"  Start price: ${start_price_exact:,.2f} (Chainlink @ eventStart{offset_ms:+d}ms)")
+    else:
+        window_start_price = chainlink_price
+        if chainlink_price:
+            print(f"  Start price: ${chainlink_price:,.2f} (RTDS fallback)")
+        else:
+            print("  Start price: waiting for RTDS...")
+
     rows: list[dict] = []
     cancel = asyncio.Event()
 
+    # RTDS is persistent (started in main), only start CLOB + sampler here
     tasks = [
         asyncio.create_task(clob_ws(up_token, down_token, cancel)),
-        asyncio.create_task(rtds_ws(cancel, config)),
         asyncio.create_task(sampler(rows, cancel)),
     ]
 
@@ -559,9 +605,19 @@ _current_window_task: asyncio.Task | None = None
 
 async def main(config: MarketConfig):
     global _current_window_task
-    while True:
-        _current_window_task = asyncio.current_task()
-        await run_window(config)
+
+    # Start persistent RTDS websocket (runs across windows)
+    rtds_cancel = asyncio.Event()
+    rtds_task = asyncio.create_task(rtds_ws(rtds_cancel, config))
+
+    try:
+        while True:
+            _current_window_task = asyncio.current_task()
+            await run_window(config)
+    finally:
+        rtds_cancel.set()
+        rtds_task.cancel()
+        await asyncio.gather(rtds_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

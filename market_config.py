@@ -13,6 +13,8 @@ class MarketConfig:
     display_name: str      # "BTC 15m" / "BTC 5m"
     window_duration_s: float = 900.0   # 900 for 15m, 300 for 5m
     window_align_m: int = 15           # minute alignment for find_market
+    max_sigma: float = 8e-05           # per-second sigma ceiling
+    min_sigma: float = 1e-6            # per-second sigma floor
 
 
 MARKET_CONFIGS: dict[str, MarketConfig] = {
@@ -31,6 +33,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         display_name="ETH 15m",
         window_duration_s=900.0,
         window_align_m=15,
+        max_sigma=5e-05,
     ),
     "btc_5m": MarketConfig(
         slug_prefix="btc-updown-5m",
@@ -47,6 +50,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         display_name="ETH 5m",
         window_duration_s=300.0,
         window_align_m=5,
+        max_sigma=5e-05,
     ),
 }
 

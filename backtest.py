@@ -128,8 +128,8 @@ class CalibrationTable:
 
 def build_calibration_table(
     data_dir: Path,
-    max_z: float = 2.0,
-    vol_lookback_s: int = 20,
+    max_z: float = 1.5,
+    vol_lookback_s: int = 90,
 ) -> CalibrationTable:
     """Build a walk-forward calibration table from all complete parquet windows.
 
@@ -427,6 +427,30 @@ class RandomCoinFlip(Signal):
         return Decision(side, 0.0, self.bankroll * 0.05, f"coin flip -> {side}")
 
 
+def compute_vamp(
+    bid_levels: tuple[tuple[float, float], ...],
+    ask_levels: tuple[tuple[float, float], ...],
+) -> float | None:
+    """Volume Adjusted Mid Price from bid+ask depth levels.
+
+    VAMP = Σ(price × size) / Σ(size)  across both sides of the book.
+    Returns None if no depth available.
+    """
+    total_value = 0.0
+    total_size = 0.0
+    for px, sz in bid_levels:
+        if sz > 0:
+            total_value += px * sz
+            total_size += sz
+    for px, sz in ask_levels:
+        if sz > 0:
+            total_value += px * sz
+            total_size += sz
+    if total_size == 0:
+        return None
+    return total_value / total_size
+
+
 class DiffusionSignal(Signal):
     """
     Models BTC as GBM. p_model = Phi(delta / (sigma * sqrt(tau))).
@@ -437,7 +461,7 @@ class DiffusionSignal(Signal):
     def __init__(
         self,
         bankroll: float,
-        vol_lookback_s: int = 20,
+        vol_lookback_s: int = 90,
         min_sigma: float = 1e-6,
         edge_threshold: float = 0.10,
         early_edge_mult: float = 4.0,
@@ -446,11 +470,11 @@ class DiffusionSignal(Signal):
         min_order_shares: float = 5.0,
         kelly_fraction: float = 0.25,
         slippage: float = 0.0,
-        max_z: float = 2.0,
+        max_z: float = 1.5,
         momentum_lookback_s: int = 30,
         max_spread: float = 0.05,
         spread_edge_penalty: float = 1.0,
-        vol_regime_lookback_s: int = 120,
+        vol_regime_lookback_s: int = 300,
         vol_regime_mult: float = 3.0,
         max_entry_time_s: float | None = None,
         reversion_discount: float = 0.0,
@@ -463,8 +487,11 @@ class DiffusionSignal(Signal):
         cal_prior_strength: float = 100.0,
         inventory_skew: float = 0.02,
         maker_withdraw_s: float = 60.0,
-        sigma_ema_alpha: float = 0.15,
+        sigma_ema_alpha: float = 0.30,
         max_sigma: float | None = None,
+        vamp_mode: str = "none",
+        vamp_filter_threshold: float = 0.03,
+        max_entry_price: float = 1.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -495,6 +522,9 @@ class DiffusionSignal(Signal):
         self.maker_withdraw_s = maker_withdraw_s
         self.sigma_ema_alpha = sigma_ema_alpha
         self.max_sigma = max_sigma
+        self.vamp_mode = vamp_mode                    # "none", "cost", "filter"
+        self.vamp_filter_threshold = vamp_filter_threshold
+        self.max_entry_price = max_entry_price
 
     def _compute_vol(
         self,
@@ -534,7 +564,7 @@ class DiffusionSignal(Signal):
 
         if len(log_rets) < 2:
             return 0.0
-        return max(float(np.std(log_rets, ddof=1)), self.min_sigma)
+        return float(np.std(log_rets, ddof=1))
 
     def _smoothed_sigma(self, raw_sigma: float, ctx: dict) -> float:
         """Apply EMA smoothing and asset-specific cap to raw sigma."""
@@ -548,6 +578,8 @@ class DiffusionSignal(Signal):
         ctx["_sigma_ema"] = ema
         if self.max_sigma is not None:
             ema = min(ema, self.max_sigma)
+        if self.min_sigma > 1e-6:
+            ema = max(ema, self.min_sigma)  # only enforce if explicitly set above default
         return ema
 
     def _p_model(self, z_capped: float, tau: float) -> float:
@@ -654,6 +686,10 @@ class DiffusionSignal(Signal):
                             f"no edge (up={edge_up:.4f} down={edge_down:.4f} "
                             f"thresh={dyn_threshold:.4f})")
 
+        if eff_price > self.max_entry_price:
+            return Decision("FLAT", 0.0, 0.0,
+                f"entry {eff_price:.3f} > max {self.max_entry_price:.2f}")
+
         # Momentum confirmation: majority of recent prices must be on
         # the same side of start price — prevents whipsawing when price
         # oscillates near the start price.
@@ -751,6 +787,9 @@ class DiffusionSignal(Signal):
         """Shared sizing logic for a single side. Returns a Decision."""
         if eff_price >= 1.0:
             return Decision("FLAT", 0.0, 0.0, "eff price >= 1")
+        if eff_price > self.max_entry_price:
+            return Decision("FLAT", 0.0, 0.0,
+                f"entry {eff_price:.3f} > max {self.max_entry_price:.2f}")
         if eff_price < self.min_entry_price:
             return Decision("FLAT", 0.0, 0.0,
                 f"entry {eff_price:.2f} < min {self.min_entry_price:.2f}")
@@ -841,6 +880,25 @@ class DiffusionSignal(Signal):
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
+        # VAMP computation
+        vamp_up = compute_vamp(snapshot.bid_levels_up, snapshot.ask_levels_up)
+        vamp_down = compute_vamp(snapshot.bid_levels_down, snapshot.ask_levels_down)
+
+        # VAMP filter: skip when book is too gappy (large gap between VAMP and best bid)
+        if self.vamp_mode == "filter":
+            if (vamp_up is not None and
+                    abs(vamp_up - bid_up) > self.vamp_filter_threshold):
+                reason = (f"vamp filter (up gap={abs(vamp_up - bid_up):.3f} "
+                          f"> {self.vamp_filter_threshold})")
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+            if (vamp_down is not None and
+                    abs(vamp_down - bid_down) > self.vamp_filter_threshold):
+                reason = (f"vamp filter (down gap={abs(vamp_down - bid_down):.3f} "
+                          f"> {self.vamp_filter_threshold})")
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+
         tau = snapshot.time_remaining_s
         if tau <= 0:
             reason = "window expired"
@@ -883,9 +941,13 @@ class DiffusionSignal(Signal):
         if self.reversion_discount > 0:
             p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
 
-        # Bid-price costs (maker places at bid: 0% fee, no slippage)
-        cost_up = bid_up
-        cost_down = bid_down
+        # Cost basis: VAMP (volume-weighted mid) or best bid
+        if self.vamp_mode == "cost":
+            cost_up = vamp_up if vamp_up is not None else bid_up
+            cost_down = vamp_down if vamp_down is not None else bid_down
+        else:
+            cost_up = bid_up
+            cost_down = bid_down
 
         # Edges — bid pricing already accounts for spread naturally
         edge_up = p_model - cost_up - self.spread_edge_penalty * spread_up
@@ -1516,6 +1578,32 @@ def main():
         else:
             calibrated_overrides = dict(edge_threshold=0.10, early_edge_mult=2.0)
 
+    # VAMP mode: BTC uses cost-based, ETH uses filter-based
+    vamp_kw = {}
+    base_market = args.market.replace("_5m", "")
+    if base_market == "btc":
+        vamp_kw = dict(vamp_mode="cost")
+    elif base_market == "eth":
+        vamp_kw = dict(vamp_mode="filter", vamp_filter_threshold=0.03)
+
+    # 5m market overrides: scale timing for 300s windows
+    is_5m = "_5m" in args.market
+    maker_warmup = 100.0
+    maker_withdraw = args.maker_withdraw
+    five_m_kw = {}
+    if is_5m:
+        if base_market == "btc":
+            maker_warmup = 70.0
+            maker_withdraw = 30.0
+        elif base_market == "eth":
+            maker_warmup = 30.0
+            maker_withdraw = 20.0
+            five_m_kw["edge_threshold"] = 0.12
+            five_m_kw["early_edge_mult"] = 2.5   # grid search: 2.5 >> 2.0 for Sharpe
+            five_m_kw["reversion_discount"] = 0.10
+            eth_engine_kw["max_trades_per_window"] = 2  # fewer trades = higher Sharpe
+        print(f"  5m overrides: warmup={maker_warmup:.0f}s, withdraw={maker_withdraw:.0f}s")
+
     signal_map = {
         "diffusion": lambda: DiffusionSignal(
             bankroll=args.bankroll, slippage=args.slippage,
@@ -1523,9 +1611,11 @@ def main():
             min_entry_price=args.min_entry_price,
             cal_prior_strength=args.cal_prior_strength,
             inventory_skew=args.inventory_skew,
-            maker_withdraw_s=args.maker_withdraw,
+            maker_warmup_s=maker_warmup,
+            maker_withdraw_s=maker_withdraw,
             max_sigma=config.max_sigma,
-            **{**eth_overrides, **maker_overrides, **calibrated_overrides}),
+            min_sigma=config.min_sigma,
+            **{**eth_overrides, **maker_overrides, **calibrated_overrides, **vamp_kw, **five_m_kw}),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),
         "random": lambda: RandomCoinFlip(bankroll=args.bankroll, seed=args.seed),

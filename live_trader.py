@@ -54,6 +54,7 @@ async def signal_ticker(
     market_slug: str, up_token: str, down_token: str,
     cancel: asyncio.Event,
     skip_trading: bool = False,
+    trade_state: dict | None = None,
 ):
     while not cancel.is_set():
         await asyncio.sleep(1)
@@ -67,6 +68,8 @@ async def signal_ticker(
             window_end, market_slug,
         )
         if snap is not None and not skip_trading:
+            if trade_state is not None:
+                tracker.ctx["_trade_bars"] = trade_state["bars"]
             tracker.evaluate(snap, up_token, down_token)
 
         tracker.check_api_balance()
@@ -74,7 +77,8 @@ async def signal_ticker(
 
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
 
-async def run_window(tracker: LiveTradeTracker, config, price_state: dict):
+async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
+                     trade_state: dict | None = None):
     """Run a single trading window."""
     # Rebuild calibration table from latest data
     if tracker.cal_data_dir is not None:
@@ -175,12 +179,14 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict):
     tasks = [
         asyncio.create_task(
             clob_ws(up_token, down_token, book_up, book_down,
-                    flat_state, cancel, debug=tracker.debug)
+                    flat_state, cancel, debug=tracker.debug,
+                    trade_state=trade_state)
         ),
         asyncio.create_task(
             signal_ticker(tracker, book_up, book_down, price_state,
                           end, slug, up_token, down_token, cancel,
-                          skip_trading=skip_trading)
+                          skip_trading=skip_trading,
+                          trade_state=trade_state)
         ),
         asyncio.create_task(
             display_ticker(tracker, price_state, flat_state,
@@ -218,6 +224,14 @@ async def run(tracker: LiveTradeTracker, config):
         "price_history": collections.deque(maxlen=600),
     }
 
+    # Trade state persists across windows — VPIN needs 20+ min history
+    vpin_bar_s = tracker.signal.vpin_bar_s
+    trade_state: dict = {
+        "bars": collections.deque(maxlen=200),
+        "current_bar": {"buy_vol": 0.0, "sell_vol": 0.0, "start_ts": 0},
+        "bar_duration_s": vpin_bar_s,
+    }
+
     rtds_cancel = asyncio.Event()
     rtds_task = asyncio.create_task(
         rtds_ws(price_state, rtds_cancel, config, tracker,
@@ -226,7 +240,7 @@ async def run(tracker: LiveTradeTracker, config):
 
     try:
         while True:
-            await run_window(tracker, config, price_state)
+            await run_window(tracker, config, price_state, trade_state)
     finally:
         rtds_cancel.set()
         rtds_task.cancel()
@@ -313,6 +327,14 @@ def main():
                         help="Fraction to reduce DOWN edge threshold (optimism tax, default: 0.15)")
     parser.add_argument("--regime-z-scale", action="store_true",
                         help="Scale z-scores by sigma_ema / sigma_calibration (requires --calibrated)")
+    parser.add_argument("--vpin-threshold", type=float, default=0.50,
+                        help="VPIN above which edge threshold widens (default: 0.50)")
+    parser.add_argument("--vpin-edge-mult", type=float, default=1.5,
+                        help="Max edge threshold multiplier at VPIN=1.0 (default: 1.5)")
+    parser.add_argument("--vpin-window", type=int, default=20,
+                        help="Number of completed trade bars for VPIN (default: 20)")
+    parser.add_argument("--vpin-bar-s", type=float, default=60.0,
+                        help="Trade bar duration in seconds (default: 60)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -405,6 +427,10 @@ def main():
         signal_kw["vol_kill_sigma"] = args.vol_kill_sigma
     signal_kw["down_edge_bonus"] = args.down_edge_bonus
     signal_kw["regime_z_scale"] = args.regime_z_scale
+    signal_kw["vpin_threshold"] = args.vpin_threshold
+    signal_kw["vpin_edge_mult"] = args.vpin_edge_mult
+    signal_kw["vpin_window"] = args.vpin_window
+    signal_kw["vpin_bar_s"] = args.vpin_bar_s
 
     # Compute sigma_calibration from recorded data when regime-z-scale is on
     if args.regime_z_scale and args.calibrated:
@@ -549,6 +575,8 @@ def main():
         print(f"  Max positions:   {args.max_positions}")
     print(f"  Cooldown:        {cooldown_ms / 1000:.0f}s")
     print(f"  Stale timeout:   {stale_timeout:.0f}s")
+    print(f"  VPIN:            thresh={args.vpin_threshold} mult={args.vpin_edge_mult} "
+          f"window={args.vpin_window} bar={args.vpin_bar_s:.0f}s")
     print(f"  Trades log:      {trades_log}")
     print(f"  State file:      {state_file}")
     print()

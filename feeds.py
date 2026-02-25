@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import time as _time
 from datetime import datetime, timezone
@@ -73,6 +74,7 @@ async def clob_ws(
     book_up: OrderBook, book_down: OrderBook,
     flat_state: dict, cancel: asyncio.Event,
     debug: bool = False,
+    trade_state: dict | None = None,
 ):
     token_map = {up_token: "up", down_token: "down"}
     book_map = {"up": book_up, "down": book_down}
@@ -140,6 +142,31 @@ async def clob_ws(
                                         ba = book_map[s].best_ask
                                         flat_state[f"{s}_best_bid"] = str(bb) if bb else None
                                         flat_state[f"{s}_best_ask"] = str(ba) if ba else None
+
+                            elif etype == "last_trade_price" and trade_state is not None:
+                                try:
+                                    size = float(msg.get("size", 0))
+                                    trade_side = msg.get("side", "").upper()
+                                    if size > 0 and trade_side in ("BUY", "SELL"):
+                                        bar = trade_state["current_bar"]
+                                        now_ts = _time.time()
+                                        if bar["start_ts"] == 0:
+                                            bar["start_ts"] = now_ts
+                                        if trade_side == "BUY":
+                                            bar["buy_vol"] += size
+                                        else:
+                                            bar["sell_vol"] += size
+                                        # Rotate bar when elapsed >= bar_duration_s
+                                        bar_dur = trade_state.get("bar_duration_s", 60.0)
+                                        if now_ts - bar["start_ts"] >= bar_dur:
+                                            trade_state["bars"].append(
+                                                (bar["buy_vol"], bar["sell_vol"])
+                                            )
+                                            bar["buy_vol"] = 0.0
+                                            bar["sell_vol"] = 0.0
+                                            bar["start_ts"] = now_ts
+                                except (TypeError, ValueError, KeyError):
+                                    pass
 
                 finally:
                     hb.cancel()

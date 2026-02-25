@@ -503,6 +503,11 @@ class DiffusionSignal(Signal):
         # Regime-scaled z: scale z by sigma_ema / sigma_calibration
         regime_z_scale: bool = False,
         sigma_calibration: float | None = None,
+        # VPIN flow toxicity filter
+        vpin_threshold: float = 0.50,
+        vpin_edge_mult: float = 1.5,
+        vpin_window: int = 20,
+        vpin_bar_s: float = 60.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -542,6 +547,10 @@ class DiffusionSignal(Signal):
         self.vol_kill_sigma = vol_kill_sigma
         self.regime_z_scale = regime_z_scale
         self.sigma_calibration = sigma_calibration
+        self.vpin_threshold = vpin_threshold
+        self.vpin_edge_mult = vpin_edge_mult
+        self.vpin_window = vpin_window
+        self.vpin_bar_s = vpin_bar_s
 
     def _compute_vol(
         self,
@@ -642,6 +651,24 @@ class DiffusionSignal(Signal):
 
         return 0.40 * spread_score + 0.30 * imbalance_score + 0.30 * gap_score
 
+    @staticmethod
+    def _compute_vpin(bars, window: int) -> float:
+        """VPIN from trade bars: mean |sell - buy| / total over last W bars.
+
+        Returns 0.0 when insufficient bars (graceful warmup).
+        """
+        if len(bars) < window:
+            return 0.0
+        recent = list(bars)[-window:]
+        total_sum = 0.0
+        imbalance_sum = 0.0
+        for buy_vol, sell_vol in recent:
+            total = buy_vol + sell_vol
+            if total > 0:
+                imbalance_sum += abs(sell_vol - buy_vol) / total
+            # Empty bars (no trades) contribute 0
+        return imbalance_sum / window
+
     def _p_model(self, z_capped: float, tau: float) -> float:
         """Model probability of UP via Bayesian fusion of GBM + calibration.
 
@@ -709,6 +736,14 @@ class DiffusionSignal(Signal):
         if toxicity > self.toxicity_threshold:
             excess = (toxicity - self.toxicity_threshold) / (1.0 - self.toxicity_threshold)
             dyn_threshold *= 1.0 + self.toxicity_edge_mult * excess
+
+        # VPIN flow toxicity penalty
+        trade_bars = ctx.get("_trade_bars", [])
+        vpin = self._compute_vpin(trade_bars, self.vpin_window)
+        ctx["_vpin"] = vpin
+        if vpin > self.vpin_threshold:
+            vpin_excess = (vpin - self.vpin_threshold) / (1.0 - self.vpin_threshold)
+            dyn_threshold *= 1.0 + self.vpin_edge_mult * vpin_excess
 
         # Realized vol (short window for model)
         raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
@@ -1039,6 +1074,15 @@ class DiffusionSignal(Signal):
         if toxicity > self.toxicity_threshold:
             excess = (toxicity - self.toxicity_threshold) / (1.0 - self.toxicity_threshold)
             dyn_threshold *= 1.0 + self.toxicity_edge_mult * excess
+
+        # VPIN flow toxicity penalty (before DOWN bonus derivation
+        # so DOWN bonus sees the VPIN-widened threshold)
+        trade_bars = ctx.get("_trade_bars", [])
+        vpin = self._compute_vpin(trade_bars, self.vpin_window)
+        ctx["_vpin"] = vpin
+        if vpin > self.vpin_threshold:
+            vpin_excess = (vpin - self.vpin_threshold) / (1.0 - self.vpin_threshold)
+            dyn_threshold *= 1.0 + self.vpin_edge_mult * vpin_excess
 
         # z normalization: fractional delta / (sigma * sqrt(tau))
         price = snapshot.chainlink_price

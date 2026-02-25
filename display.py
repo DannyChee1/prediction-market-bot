@@ -126,6 +126,19 @@ def render_display(
         tox_label = "LOW" if toxicity < 0.3 else ("MED" if toxicity < 0.6 else "HIGH")
         lines.append(f"  Toxicity:  {toxicity:.2f} [{tox_bar:<10s}] {tox_label}")
 
+    # VPIN flow toxicity indicator
+    vpin = tracker.ctx.get("_vpin", 0.0)
+    trade_bars = tracker.ctx.get("_trade_bars")
+    vpin_window = getattr(tracker.signal, "vpin_window", 20)
+    n_bars = len(trade_bars) if trade_bars is not None else 0
+    if n_bars > 0:
+        if n_bars < vpin_window:
+            lines.append(f"  VPIN:      warming up ({n_bars}/{vpin_window} bars)")
+        else:
+            vpin_bar = "#" * int(vpin * 10)
+            vpin_label = "LOW" if vpin < 0.40 else ("MED" if vpin <= 0.55 else "HIGH")
+            lines.append(f"  VPIN:      {vpin:.2f} [{vpin_bar:<10s}] {vpin_label}")
+
     # Circuit breaker warning
     if tracker.circuit_breaker_tripped:
         lines.append(f"  *** {tracker.circuit_breaker_reason} ***")

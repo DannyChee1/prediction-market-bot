@@ -105,9 +105,9 @@ async def signal_ticker(
                 if trade_state is not None:
                     tracker.ctx["_trade_bars"] = trade_state["bars"]
                     tracker.ctx["_trade_total_bars"] = trade_state.get("total_bars", 0)
-                tracker.evaluate(snap, up_token, down_token)
+                await asyncio.to_thread(tracker.evaluate, snap, up_token, down_token)
 
-            tracker.check_api_balance()
+            await asyncio.to_thread(tracker.check_api_balance)
         except Exception as exc:
             err_msg = f"{type(exc).__name__}: {exc}"
             tracker.ctx["_signal_error"] = err_msg
@@ -160,7 +160,7 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
             print(f"  WARNING: calibration rebuild failed: {exc}")
 
     print(f"  Searching for active {config.display_name} market...")
-    event, market = find_market(config)
+    event, market = await asyncio.to_thread(find_market, config)
 
     if not event or not market:
         print(f"  No active {config.display_name} market found. Retrying in 30s...")
@@ -295,9 +295,10 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
         tracker.flat_reason_counts = {}
 
     if tracker.open_orders:
-        tracker._cancel_open_orders()
+        await asyncio.to_thread(tracker._cancel_open_orders)
 
-    tracker.resolve_window(
+    await asyncio.to_thread(
+        tracker.resolve_window,
         slug,
         price_state.get("price"),
         price_state.get("window_start_price"),

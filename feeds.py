@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 # ── WS endpoints ─────────────────────────────────────────────────────────────
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RTDS_WS = "wss://ws-live-data.polymarket.com"
+BINANCE_WS = "wss://stream.binance.com:9443/ws"
 
 
 # ── Live snapshot builder ────────────────────────────────────────────────────
@@ -39,10 +40,6 @@ def snapshot_from_live(
 
     ba_up = book_up.best_ask
     ba_down = book_down.best_ask
-
-    if ba_up is None or ba_down is None:
-        return None
-
     bb_up = book_up.best_bid
     bb_down = book_down.best_bid
 
@@ -171,6 +168,7 @@ async def clob_ws(
 
                 finally:
                     hb.cancel()
+                    await asyncio.gather(hb, return_exceptions=True)
 
         except Exception as exc:
             if cancel.is_set():
@@ -271,10 +269,80 @@ async def rtds_ws(price_state: dict, cancel: asyncio.Event,
                 finally:
                     hb.cancel()
                     wd.cancel()
+                    await asyncio.gather(hb, wd, return_exceptions=True)
 
         except Exception as exc:
             if cancel.is_set():
                 return
             print(f"\n  [RTDS] reconnecting: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(min(backoff, 30))
+            backoff = min(backoff * 2, 60)
+
+
+# ── Binance bookTicker WebSocket ────────────────────────────────────────────
+
+async def binance_ws(binance_state: dict, cancel: asyncio.Event,
+                     config: MarketConfig, debug: bool = False):
+    """Stream Binance best bid/ask for oracle lag detection.
+
+    Stores mid price in binance_state["mid_price"]. On disconnect the last
+    value is retained (conservative — slight stale discrepancy is better
+    than dropping protection entirely).
+    """
+    symbol = config.binance_symbol
+    if not symbol:
+        return  # no Binance symbol configured for this market
+
+    url = f"{BINANCE_WS}/{symbol}@bookTicker"
+    backoff = 2
+
+    while not cancel.is_set():
+        try:
+            async with websockets.connect(
+                url, ssl=SSL_CTX, ping_interval=20, ping_timeout=10
+            ) as ws:
+                backoff = 2
+                print(f"  [BINANCE] connected ({symbol}@bookTicker)")
+
+                async def heartbeat():
+                    try:
+                        while not cancel.is_set():
+                            await asyncio.sleep(10)
+                            await ws.ping()
+                    except Exception:
+                        pass
+
+                hb = asyncio.create_task(heartbeat())
+                try:
+                    async for raw in ws:
+                        if cancel.is_set():
+                            break
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+
+                        best_bid = msg.get("b")
+                        best_ask = msg.get("a")
+                        if best_bid is not None and best_ask is not None:
+                            try:
+                                mid = (float(best_bid) + float(best_ask)) / 2.0
+                                binance_state["mid_price"] = mid
+                                binance_state["last_update_ts"] = _time.time()
+                            except (ValueError, TypeError):
+                                pass
+
+                        if debug:
+                            t = datetime.now().strftime("%H:%M:%S")
+                            print(f"\n  [BINANCE {t}] {raw[:200]}")
+                finally:
+                    hb.cancel()
+                    await asyncio.gather(hb, return_exceptions=True)
+
+        except Exception as exc:
+            if cancel.is_set():
+                return
+            if debug:
+                print(f"\n  [BINANCE] reconnecting: {type(exc).__name__}: {exc}")
             await asyncio.sleep(min(backoff, 30))
             backoff = min(backoff * 2, 60)

@@ -463,8 +463,8 @@ class DiffusionSignal(Signal):
         bankroll: float,
         vol_lookback_s: int = 90,
         min_sigma: float = 1e-6,
-        edge_threshold: float = 0.10,
-        early_edge_mult: float = 4.0,
+        edge_threshold: float = 0.04,
+        early_edge_mult: float = 0.4,
         window_duration: float = 900.0,
         max_bet_fraction: float = 0.0125,
         min_order_shares: float = 5.0,
@@ -490,7 +490,7 @@ class DiffusionSignal(Signal):
         sigma_ema_alpha: float = 0.30,
         max_sigma: float | None = None,
         vamp_mode: str = "none",
-        vamp_filter_threshold: float = 0.03,
+        vamp_filter_threshold: float = 0.07,
         max_entry_price: float = 1.0,
         # NO/DOWN bias: reduce edge threshold for DOWN by this fraction
         # of base threshold (optimism tax — YES/UP tends to be overpriced)
@@ -504,10 +504,13 @@ class DiffusionSignal(Signal):
         regime_z_scale: bool = False,
         sigma_calibration: float | None = None,
         # VPIN flow toxicity filter
-        vpin_threshold: float = 0.50,
+        vpin_threshold: float = 0.95,
         vpin_edge_mult: float = 1.5,
         vpin_window: int = 20,
         vpin_bar_s: float = 60.0,
+        # Oracle lag detection (Binance vs Chainlink discrepancy)
+        oracle_lag_threshold: float = 0.002,
+        oracle_lag_mult: float = 2.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -551,6 +554,8 @@ class DiffusionSignal(Signal):
         self.vpin_edge_mult = vpin_edge_mult
         self.vpin_window = vpin_window
         self.vpin_bar_s = vpin_bar_s
+        self.oracle_lag_threshold = oracle_lag_threshold
+        self.oracle_lag_mult = oracle_lag_mult
 
     def _compute_vol(
         self,
@@ -604,8 +609,7 @@ class DiffusionSignal(Signal):
         ctx["_sigma_ema"] = ema
         if self.max_sigma is not None:
             ema = min(ema, self.max_sigma)
-        if self.min_sigma > 1e-6:
-            ema = max(ema, self.min_sigma)  # only enforce if explicitly set above default
+        ema = max(ema, self.min_sigma)
         return ema
 
     @staticmethod
@@ -669,6 +673,17 @@ class DiffusionSignal(Signal):
             # Empty bars (no trades) contribute 0
         return imbalance_sum / window
 
+    @staticmethod
+    def _compute_oracle_lag(chainlink_price: float, binance_mid) -> float:
+        """Price discrepancy between Binance mid and Chainlink oracle.
+
+        Returns abs(binance_mid - chainlink) / chainlink.
+        Returns 0.0 if binance_mid is None (graceful degradation).
+        """
+        if binance_mid is None or chainlink_price <= 0:
+            return 0.0
+        return abs(binance_mid - chainlink_price) / chainlink_price
+
     def _p_model(self, z_capped: float, tau: float) -> float:
         """Model probability of UP via Bayesian fusion of GBM + calibration.
 
@@ -687,15 +702,20 @@ class DiffusionSignal(Signal):
         return p_gbm
 
     def decide(self, snapshot: Snapshot, ctx: dict) -> Decision:
+        effective_price = ctx.get("_binance_mid") or snapshot.chainlink_price
+
         # Build price + timestamp history
         hist = ctx.setdefault("price_history", [])
         ts_hist = ctx.setdefault("ts_history", [])
-        hist.append(snapshot.chainlink_price)
-        ts_hist.append(snapshot.ts_ms)
+        if ctx.pop("_live_history_appended", False):
+            pass  # signal_ticker already appended this tick
+        else:
+            hist.append(effective_price)
+            ts_hist.append(snapshot.ts_ms)
 
-        if len(hist) < max(2, self.vol_lookback_s):
+        if len(hist) < 2:
             return Decision("FLAT", 0.0, 0.0,
-                            f"need {self.vol_lookback_s}s history ({len(hist)})")
+                            f"need history ({len(hist)}s collected)")
 
         ask_up = snapshot.best_ask_up
         ask_down = snapshot.best_ask_down
@@ -745,6 +765,14 @@ class DiffusionSignal(Signal):
             vpin_excess = (vpin - self.vpin_threshold) / (1.0 - self.vpin_threshold)
             dyn_threshold *= 1.0 + self.vpin_edge_mult * vpin_excess
 
+        # Oracle lag penalty: widen threshold when Binance mid diverges from Chainlink
+        binance_mid = ctx.get("_binance_mid")
+        oracle_lag = self._compute_oracle_lag(snapshot.chainlink_price, binance_mid)
+        ctx["_oracle_lag"] = oracle_lag
+        if oracle_lag > self.oracle_lag_threshold:
+            lag_excess = min((oracle_lag - self.oracle_lag_threshold) / self.oracle_lag_threshold, 1.0)
+            dyn_threshold *= 1.0 + self.oracle_lag_mult * lag_excess
+
         # Realized vol (short window for model)
         raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
         if raw_sigma == 0.0:
@@ -768,7 +796,7 @@ class DiffusionSignal(Signal):
                 f"> {self.vol_kill_sigma:.2e})")
 
         # Model probability (z capped to prevent overconfidence)
-        delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
+        delta = (effective_price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
 
         # Regime-scaled z (same as decide_both_sides)
@@ -929,7 +957,6 @@ class DiffusionSignal(Signal):
         # Store expected range
         price = snapshot.chainlink_price
         move_1sig = sigma_per_s * math.sqrt(tau) * price
-        # (caller should capture _expected_range from ctx if needed)
 
         reason = (
             f"p={p_model:.4f} sig={sigma_per_s:.2e} z={z:.2f}"
@@ -950,29 +977,49 @@ class DiffusionSignal(Signal):
         """
         flat = Decision("FLAT", 0.0, 0.0, "")
 
+        effective_price = ctx.get("_binance_mid") or snapshot.chainlink_price
+
         # Build price + timestamp history (always, even during warmup, so vol is ready)
+        # In live mode, signal_ticker already appended and sets a flag.
         hist = ctx.setdefault("price_history", [])
         ts_hist = ctx.setdefault("ts_history", [])
-        hist.append(snapshot.chainlink_price)
-        ts_hist.append(snapshot.ts_ms)
+        if ctx.pop("_live_history_appended", False):
+            pass  # signal_ticker already appended this tick
+        else:
+            hist.append(effective_price)
+            ts_hist.append(snapshot.ts_ms)
 
-        # Maker warmup: no trading in first N seconds of window
-        if self.maker_mode:
-            tau = snapshot.time_remaining_s
-            elapsed = self.window_duration - tau
-            if elapsed < self.maker_warmup_s:
-                reason = f"maker warmup ({elapsed:.0f}s < {self.maker_warmup_s:.0f}s)"
-                return (Decision("FLAT", 0.0, 0.0, reason),
-                        Decision("FLAT", 0.0, 0.0, reason))
+        # Early p_model for display: compute whenever possible so the
+        # dashboard shows live probabilities even during warmup / gates.
+        # Uses raw (unsmoothed) sigma and pure GBM norm_cdf (not
+        # calibration table) so the display updates continuously —
+        # calibration bins are wide and would cause the value to appear
+        # stuck.  The full computation later overwrites _p_model_raw
+        # with the refined calibrated value for trading decisions.
+        # Require enough history for a reliable vol estimate — too few
+        # samples give a tiny sigma that sends z to the ±max_z cap,
+        # making every market show the same p_up/p_down.
+        _min_hist_display = max(10, self.vol_lookback_s // 3)
+        if len(hist) >= _min_hist_display and snapshot.time_remaining_s > 0 and snapshot.window_start_price:
+            _raw = self._compute_vol(
+                hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
+            )
+            if _raw > 0:
+                _tau = snapshot.time_remaining_s
+                _delta = (effective_price - snapshot.window_start_price) / snapshot.window_start_price
+                _z = _delta / (_raw * math.sqrt(_tau))
+                _z = max(-self.max_z, min(self.max_z, _z))
+                ctx["_p_display"] = norm_cdf(_z)
+                ctx["_p_model_raw"] = self._p_model(_z, _tau)
+                ctx["_sigma_per_s"] = _raw
 
-            # End-of-window withdrawal: stop new orders when tau < threshold
-            if tau < self.maker_withdraw_s:
-                reason = f"end-of-window ({tau:.0f}s < {self.maker_withdraw_s:.0f}s)"
-                return (Decision("FLAT", 0.0, 0.0, reason),
-                        Decision("FLAT", 0.0, 0.0, reason))
+        # NOTE: maker warmup and end-of-window withdrawal are handled by
+        # _evaluate_maker() in tracker.py.  We must NOT early-return here
+        # because that blocks the full model computation (vol, z, p_model,
+        # edges) which the dashboard and fill logs need every tick.
 
-        if len(hist) < max(2, self.vol_lookback_s):
-            reason = f"need {self.vol_lookback_s}s history ({len(hist)})"
+        if len(hist) < 2:
+            reason = f"need history ({len(hist)}s collected)"
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
@@ -1084,8 +1131,16 @@ class DiffusionSignal(Signal):
             vpin_excess = (vpin - self.vpin_threshold) / (1.0 - self.vpin_threshold)
             dyn_threshold *= 1.0 + self.vpin_edge_mult * vpin_excess
 
+        # Oracle lag penalty: widen threshold when Binance mid diverges from Chainlink
+        binance_mid = ctx.get("_binance_mid")
+        oracle_lag = self._compute_oracle_lag(snapshot.chainlink_price, binance_mid)
+        ctx["_oracle_lag"] = oracle_lag
+        if oracle_lag > self.oracle_lag_threshold:
+            lag_excess = min((oracle_lag - self.oracle_lag_threshold) / self.oracle_lag_threshold, 1.0)
+            dyn_threshold *= 1.0 + self.oracle_lag_mult * lag_excess
+
         # z normalization: fractional delta / (sigma * sqrt(tau))
-        price = snapshot.chainlink_price
+        price = effective_price
         delta = (price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
 
@@ -1105,6 +1160,12 @@ class DiffusionSignal(Signal):
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = self._p_model(z, tau)
 
+        # Expose model state so OrderMixin can snapshot it at fill time
+        ctx["_p_model_raw"] = p_model
+        ctx["_p_display"] = norm_cdf(z)  # smooth GBM for dashboard (no binning)
+        ctx["_sigma_per_s"] = sigma_per_s
+        ctx["_dyn_threshold_up"] = dyn_threshold
+
         if self.reversion_discount > 0:
             p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
 
@@ -1116,9 +1177,15 @@ class DiffusionSignal(Signal):
             cost_up = bid_up
             cost_down = bid_down
 
+        # Expose cost basis so OrderMixin can include it in model snapshot
+        ctx["_cost_up"] = cost_up
+        ctx["_cost_down"] = cost_down
+
         # Edges — bid pricing already accounts for spread naturally
         edge_up = p_model - cost_up - self.spread_edge_penalty * spread_up
         edge_down = (1.0 - p_model) - cost_down - self.spread_edge_penalty * spread_down
+        ctx["_edge_up"] = edge_up
+        ctx["_edge_down"] = edge_down
 
         # Inventory skew: penalize adding to an existing side
         if self.inventory_skew > 0:
@@ -1378,6 +1445,7 @@ class BacktestEngine:
         pending: Optional[tuple[int, Decision]] = None
         results: list[TradeResult] = []
         last_fill_ts: int = 0
+        filled_sides: set = set()  # anti-hedge: track filled sides per window
         cooldown_ms = 30_000  # minimum 30s between bets
         maker_mode = getattr(self.signal, "maker_mode", False)
         if maker_mode:
@@ -1416,13 +1484,27 @@ class BacktestEngine:
 
             # Maker mode: evaluate both sides independently
             if maker_mode and hasattr(self.signal, "decide_both_sides"):
+                # Enforce maker warmup (matches live bot's _evaluate_maker)
+                elapsed = self.signal.window_duration - snap.time_remaining_s
+                if elapsed < self.signal.maker_warmup_s:
+                    continue
+                # Enforce maker withdraw
+                if snap.time_remaining_s < getattr(self.signal, "maker_withdraw_s", 60.0):
+                    continue
+
                 up_dec, down_dec = self.signal.decide_both_sides(snap, ctx)
                 for decision in [up_dec, down_dec]:
                     if decision.action != "FLAT" and decision.size_usd > 0:
                         if self.max_trades_per_window is not None and len(results) >= self.max_trades_per_window:
                             break
+                        # Anti-hedge: don't bet both sides in the same window
+                        side_label = "UP" if "UP" in decision.action else "DOWN"
+                        opposite = "DOWN" if side_label == "UP" else "UP"
+                        if opposite in filled_sides:
+                            continue
                         fill = self._execute_fill(snap, decision, ctx)
                         if fill is not None:
+                            filled_sides.add(side_label)
                             results.append(self._resolve_fill(fill, outcome_up, final_btc))
                             self.bankroll += results[-1].pnl
                             if hasattr(self.signal, "bankroll"):
@@ -1762,13 +1844,13 @@ def main():
         maker_overrides = dict(
             maker_mode=True,
             max_bet_fraction=0.02,
-            edge_threshold=0.06,
+            edge_threshold=0.08,
             momentum_majority=0.0,
             spread_edge_penalty=0.0,  # bid pricing handles spread naturally
             window_duration=config.window_duration_s,
         )
         if "max_trades_per_window" not in eth_engine_kw:
-            eth_engine_kw["max_trades_per_window"] = 3
+            eth_engine_kw["max_trades_per_window"] = 1
 
     if args.max_trades_per_window is not None:
         eth_engine_kw["max_trades_per_window"] = args.max_trades_per_window
@@ -1784,9 +1866,9 @@ def main():
         print(f"  Calibration table: {n_cells} cells, {n_obs} observations")
         # Calibrated edges are smaller/honest — still require meaningful edge
         if args.maker:
-            calibrated_overrides = dict(edge_threshold=0.10, early_edge_mult=2.0)
+            calibrated_overrides = dict(edge_threshold=0.04, early_edge_mult=0.4)
         else:
-            calibrated_overrides = dict(edge_threshold=0.10, early_edge_mult=2.0)
+            calibrated_overrides = dict(edge_threshold=0.04, early_edge_mult=0.4)
 
     # VAMP mode: BTC uses cost-based, ETH uses filter-based
     vamp_kw = {}
@@ -1794,7 +1876,7 @@ def main():
     if base_market == "btc":
         vamp_kw = dict(vamp_mode="cost")
     elif base_market == "eth":
-        vamp_kw = dict(vamp_mode="filter", vamp_filter_threshold=0.03)
+        vamp_kw = dict(vamp_mode="filter", vamp_filter_threshold=0.07)
 
     # 5m market overrides: scale timing for 300s windows
     is_5m = "_5m" in args.market
@@ -1803,13 +1885,13 @@ def main():
     five_m_kw = {}
     if is_5m:
         if base_market == "btc":
-            maker_warmup = 70.0
+            maker_warmup = 30.0
             maker_withdraw = 30.0
         elif base_market == "eth":
             maker_warmup = 30.0
             maker_withdraw = 20.0
-            five_m_kw["edge_threshold"] = 0.12
-            five_m_kw["early_edge_mult"] = 2.5   # grid search: 2.5 >> 2.0 for Sharpe
+            five_m_kw["edge_threshold"] = 0.04
+            five_m_kw["early_edge_mult"] = 0.4
             five_m_kw["reversion_discount"] = 0.10
             eth_engine_kw["max_trades_per_window"] = 2  # fewer trades = higher Sharpe
         print(f"  5m overrides: warmup={maker_warmup:.0f}s, withdraw={maker_withdraw:.0f}s")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import math
 import threading
@@ -97,6 +98,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.last_price_update_ts: float = 0.0
         self.window_trade_count: int = 0
         self.min_order_shares: float = 5.0
+        # Recent events shown on display (thread-safe deque)
+        self.event_log: collections.deque = collections.deque(maxlen=6)
 
         # Session stats
         self.windows_seen: int = 0
@@ -207,6 +210,15 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         down_token: str,
     ) -> Decision:
         """Called every 1s: run signal, place real orders if triggered."""
+        # ALWAYS run signal first — this accumulates price history for vol
+        # warmup regardless of stale price, circuit breakers, or maker warmup.
+        self.ctx["window_trade_count"] = self.window_trade_count
+        self.ctx["inventory_up"] = sum(1 for f in self.pending_fills if f["side"] == "UP")
+        self.ctx["inventory_down"] = sum(1 for f in self.pending_fills if f["side"] == "DOWN")
+        up_dec, down_dec = self.signal.decide_both_sides(snapshot, self.ctx)
+        self.last_up_decision = up_dec
+        self.last_down_decision = down_dec
+
         cb_reason = self._check_circuit_breakers()
         if cb_reason:
             self.last_decision = Decision("FLAT", 0.0, 0.0, cb_reason)
@@ -219,13 +231,15 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             )
             return self.last_decision
 
-        return self._evaluate_maker(snapshot, up_token, down_token)
+        return self._evaluate_maker(snapshot, up_token, down_token, up_dec, down_dec)
 
     def _evaluate_maker(
         self,
         snapshot: Snapshot,
         up_token: str,
         down_token: str,
+        up_dec: Decision,
+        down_dec: Decision,
     ) -> Decision:
         """Maker mode: continuous quote management with cancel/replace."""
         tau = snapshot.time_remaining_s
@@ -249,13 +263,6 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
         if self.exit_enabled:
             self._evaluate_exits(snapshot, up_token, down_token)
-
-        self.ctx["window_trade_count"] = self.window_trade_count
-        self.ctx["inventory_up"] = sum(1 for f in self.pending_fills if f["side"] == "UP")
-        self.ctx["inventory_down"] = sum(1 for f in self.pending_fills if f["side"] == "DOWN")
-        up_dec, down_dec = self.signal.decide_both_sides(snapshot, self.ctx)
-        self.last_up_decision = up_dec
-        self.last_down_decision = down_dec
         self.signal_eval_count += 1
 
         if up_dec.action != "FLAT" or down_dec.action != "FLAT":
@@ -270,11 +277,20 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "DOWN": snapshot.best_bid_down,
         }
 
+        # Block opposite-side trading once a fill exists on one side —
+        # betting both UP and DOWN in the same window is a guaranteed
+        # loss due to spread.
+        filled_sides = {f["side"] for f in self.pending_fills}
+
         for dec, token, side_label in [
             (up_dec, up_token, "UP"),
             (down_dec, down_token, "DOWN"),
         ]:
             if side_label in self.exited_sides:
+                continue
+
+            opposite = "DOWN" if side_label == "UP" else "UP"
+            if opposite in filled_sides:
                 continue
 
             if self.window_trade_count >= self.max_trades_per_window:
@@ -482,21 +498,32 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
     ):
         """At window close: poll for resolution, compute PnL, verify balance."""
         if not self.pending_fills:
+            print("  [RESOLVE] No pending fills — skipping resolution")
             return
 
-        print("\n  Polling Gamma API for market resolution...")
+        fill_summary = ", ".join(
+            f"{f['side']} {f['shares']:.1f}sh ${f['cost_usd']:.2f}"
+            for f in self.pending_fills
+        )
+        print(f"\n  Polling Gamma API for market resolution...")
+        print(f"  [RESOLVE] {len(self.pending_fills)} fills: {fill_summary}")
+        print(f"  [RESOLVE] conditionId: {self.condition_id[:16]}..." if self.condition_id else "  [RESOLVE] conditionId: MISSING")
+
         outcome_up = poll_market_resolution(slug, debug=self.debug)
 
-        if outcome_up is None:
+        if outcome_up is not None:
+            print(f"  [RESOLVE] API result: {'UP' if outcome_up else 'DOWN'}")
+        else:
+            print(f"  [RESOLVE] API returned None — using price fallback")
             if final_price is not None and window_start_price is not None:
                 outcome_up = 1 if final_price >= window_start_price else 0
                 print(
                     f"  WARNING: API resolution unavailable, using local "
                     f"prices (start=${window_start_price:,.2f} "
-                    f"final=${final_price:,.2f})"
+                    f"final=${final_price:,.2f}) -> {'UP' if outcome_up else 'DOWN'}"
                 )
             else:
-                print("  ERROR: Cannot resolve window")
+                print(f"  ERROR: Cannot resolve window (final_price={final_price}, start={window_start_price})")
                 for fill in self.pending_fills:
                     self.bankroll += fill["cost_usd"]
                 self.pending_fills = []
@@ -564,16 +591,40 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             (f["side"] == "DOWN" and outcome_up == 0)
             for f in self.pending_fills
         )
+        print(f"  [RESOLVE] has_winning={has_winning}, condition_id={'yes' if self.condition_id else 'MISSING'}")
         if has_winning and self.condition_id:
             cond_id = self.condition_id
-            t = threading.Thread(
-                target=self.redeem_positions, args=(cond_id,),
-                daemon=True,
-            )
+            self._log({
+                "type": "redemption_started",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "condition_id": cond_id,
+                "market_slug": slug,
+            })
+
+            def _safe_redeem():
+                try:
+                    self.redeem_positions(cond_id)
+                except Exception as exc:
+                    print(f"  [REDEEM] Thread crashed: {type(exc).__name__}: {exc}")
+                    self._log({
+                        "type": "redemption",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "condition_id": cond_id,
+                        "status": "thread_crash",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+
+            t = threading.Thread(target=_safe_redeem, daemon=True)
             t.start()
             print(f"  [REDEEM] Started background redemption thread "
                   f"(conditionId: {cond_id[:10]}...)")
         elif has_winning and not self.condition_id:
+            self._log({
+                "type": "redemption_skipped",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "reason": "no_condition_id",
+                "market_slug": slug,
+            })
             print("  WARNING: Won but no conditionId — cannot auto-redeem. "
                   "Claim manually on Polymarket.")
 
@@ -607,8 +658,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             self.api_balance = api_bal
             drift = abs(api_bal - self.bankroll)
             if drift > 1.0 and len(self.pending_fills) == 0:
-                print(
-                    f"\n  [BALANCE DRIFT] API=${api_bal:,.2f} vs "
+                self._event(
+                    f"[BALANCE DRIFT] API=${api_bal:,.2f} vs "
                     f"tracked=${self.bankroll:,.2f} (drift=${drift:.2f})"
                 )
 
@@ -670,6 +721,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "edge_gap": round(max(edge_up, edge_down) - dyn_threshold, 4),
             "toxicity": round(self.ctx.get("_toxicity", 0.0), 4),
             "vpin": round(self.ctx.get("_vpin", 0.0), 4),
+            "oracle_lag": round(self.ctx.get("_oracle_lag", 0.0), 6),
             "regime_z_factor": round(self.ctx.get("_regime_z_factor", 1.0), 4),
             "down_bonus_active": self.ctx.get("_down_bonus_active", False),
             "down_share": round(self.ctx.get("_down_share", 0.5), 4),

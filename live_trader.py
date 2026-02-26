@@ -21,6 +21,10 @@ import argparse
 import asyncio
 import collections
 import os
+import sys
+import threading
+import time as _time
+import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -36,8 +40,8 @@ from market_config import MARKET_CONFIGS, DEFAULT_MARKET, get_config
 from market_api import (
     build_clob_client, query_usdc_balance, find_market, _ensure_list,
 )
-from feeds import snapshot_from_live, clob_ws, rtds_ws
-from display import render_display, display_ticker
+from feeds import snapshot_from_live, clob_ws, rtds_ws, binance_ws
+from display import render_display
 from tracker import LiveTradeTracker
 from recorder import OrderBook
 from redemption import POLYGON_RPC
@@ -55,31 +59,94 @@ async def signal_ticker(
     cancel: asyncio.Event,
     skip_trading: bool = False,
     trade_state: dict | None = None,
+    binance_state: dict | None = None,
 ):
     while not cancel.is_set():
         await asyncio.sleep(1)
         if cancel.is_set():
             break
 
-        snap = snapshot_from_live(
-            book_up, book_down,
-            price_state.get("price"),
-            price_state.get("window_start_price"),
-            window_end, market_slug,
-        )
-        if snap is not None and not skip_trading:
-            if trade_state is not None:
-                tracker.ctx["_trade_bars"] = trade_state["bars"]
-                tracker.ctx["_trade_total_bars"] = trade_state.get("total_bars", 0)
-            tracker.evaluate(snap, up_token, down_token)
+        try:
+            # Clear previous error on successful tick start
+            tracker.ctx.pop("_signal_error", None)
 
-        tracker.check_api_balance()
+            # Inject Binance mid into ctx only if fresh (< 10s old).
+            # Stale Binance data (WS dropped) would poison vol/z/oracle-lag.
+            if binance_state is not None:
+                _bn_ts = binance_state.get("last_update_ts", 0)
+                if _bn_ts and (_time.time() - _bn_ts) < 10.0:
+                    tracker.ctx["_binance_mid"] = binance_state.get("mid_price")
+                else:
+                    tracker.ctx.pop("_binance_mid", None)
+
+            # Accumulate price history on EVERY tick — this must never be
+            # gated by snapshot, skip_trading, stale price, or any guard.
+            eff_px = tracker.ctx.get("_binance_mid") or price_state.get("price")
+            if eff_px is not None:
+                hist = tracker.ctx.setdefault("price_history", [])
+                ts_hist = tracker.ctx.setdefault("ts_history", [])
+                hist.append(eff_px)
+                ts_hist.append(int(_time.time() * 1000))
+                tracker.ctx["_live_history_appended"] = True
+                # Cap history to prevent unbounded growth if a window
+                # runs longer than expected or new_window() isn't called.
+                _MAX_HIST = 2000
+                if len(hist) > _MAX_HIST:
+                    del hist[:-_MAX_HIST]
+                    del ts_hist[:-_MAX_HIST]
+
+            snap = snapshot_from_live(
+                book_up, book_down,
+                price_state.get("price"),
+                price_state.get("window_start_price"),
+                window_end, market_slug,
+            )
+            if snap is not None and not skip_trading:
+                if trade_state is not None:
+                    tracker.ctx["_trade_bars"] = trade_state["bars"]
+                    tracker.ctx["_trade_total_bars"] = trade_state.get("total_bars", 0)
+                tracker.evaluate(snap, up_token, down_token)
+
+            tracker.check_api_balance()
+        except Exception as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"
+            tracker.ctx["_signal_error"] = err_msg
+            print(f"\n  [SIGNAL_TICKER ERROR] {err_msg}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+
+# ── Display Thread ───────────────────────────────────────────────────────────
+
+def _display_thread_fn(
+    tracker, price_state, flat_state, market_title,
+    window_start, window_end, stop_event: threading.Event, config,
+):
+    """Runs in a daemon thread — completely independent of the asyncio event loop.
+
+    Even if the event loop is blocked by synchronous API calls, the display
+    keeps refreshing every second.
+    """
+    while not stop_event.is_set():
+        try:
+            render_display(
+                tracker, price_state, flat_state,
+                market_title, window_start, window_end, config,
+            )
+        except Exception as exc:
+            # Show the error on screen so we can diagnose display crashes
+            try:
+                sys.stdout.write(f"\033[2J\033[H\n  [DISPLAY ERROR] {type(exc).__name__}: {exc}\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
+        stop_event.wait(1.0)
 
 
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
 
 async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
-                     trade_state: dict | None = None):
+                     trade_state: dict | None = None,
+                     binance_state: dict | None = None):
     """Run a single trading window."""
     # Rebuild calibration table from latest data
     if tracker.cal_data_dir is not None:
@@ -102,8 +169,18 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
 
     outcomes = _ensure_list(market["outcomes"])
     tokens = _ensure_list(market["clobTokenIds"])
-    up_token = tokens[outcomes.index("Up")]
-    down_token = tokens[outcomes.index("Down")]
+    # Case-insensitive outcome lookup (API may return "Up"/"Down" or "UP"/"DOWN")
+    outcomes_lower = [o.lower() for o in outcomes]
+    try:
+        up_idx = outcomes_lower.index("up")
+    except ValueError:
+        up_idx = outcomes_lower.index("yes") if "yes" in outcomes_lower else 0
+    try:
+        down_idx = outcomes_lower.index("down")
+    except ValueError:
+        down_idx = outcomes_lower.index("no") if "no" in outcomes_lower else 1
+    up_token = tokens[up_idx]
+    down_token = tokens[down_idx]
 
     end = datetime.fromisoformat(market["endDate"].replace("Z", "+00:00"))
     start = datetime.fromisoformat(
@@ -177,6 +254,17 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
     print(f"  Bankroll: ${tracker.bankroll:,.2f}  |  Min order: {tracker.min_order_shares:.0f} shares")
 
     cancel = asyncio.Event()
+
+    # Display runs in its own thread — never blocked by API calls
+    display_stop = threading.Event()
+    display_thread = threading.Thread(
+        target=_display_thread_fn,
+        args=(tracker, price_state, flat_state,
+              title, start, end, display_stop, config),
+        daemon=True,
+    )
+    display_thread.start()
+
     tasks = [
         asyncio.create_task(
             clob_ws(up_token, down_token, book_up, book_down,
@@ -187,11 +275,8 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
             signal_ticker(tracker, book_up, book_down, price_state,
                           end, slug, up_token, down_token, cancel,
                           skip_trading=skip_trading,
-                          trade_state=trade_state)
-        ),
-        asyncio.create_task(
-            display_ticker(tracker, price_state, flat_state,
-                           title, start, end, cancel, config)
+                          trade_state=trade_state,
+                          binance_state=binance_state)
         ),
     ]
 
@@ -199,6 +284,8 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
     await asyncio.sleep(max(0, (end - now).total_seconds()) + 5)
 
     cancel.set()
+    display_stop.set()
+    display_thread.join(timeout=2)
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -234,18 +321,35 @@ async def run(tracker: LiveTradeTracker, config):
         "total_bars": 0,
     }
 
+    # Binance state persists across windows (like price_state)
+    binance_state: dict = {}
+
     rtds_cancel = asyncio.Event()
     rtds_task = asyncio.create_task(
         rtds_ws(price_state, rtds_cancel, config, tracker,
                 debug=tracker.debug)
     )
 
+    # Launch Binance bookTicker as a long-lived task (only if symbol configured)
+    binance_cancel = asyncio.Event()
+    binance_task = None
+    if config.binance_symbol:
+        binance_task = asyncio.create_task(
+            binance_ws(binance_state, binance_cancel, config,
+                       debug=tracker.debug)
+        )
+
     try:
         while True:
-            await run_window(tracker, config, price_state, trade_state)
+            await run_window(tracker, config, price_state, trade_state,
+                             binance_state)
     finally:
         rtds_cancel.set()
         rtds_task.cancel()
+        binance_cancel.set()
+        if binance_task is not None:
+            binance_task.cancel()
+            await asyncio.gather(binance_task, return_exceptions=True)
         await asyncio.gather(rtds_task, return_exceptions=True)
 
 
@@ -317,7 +421,7 @@ def main():
                         help="Max simultaneous filled positions (default: 4)")
     parser.add_argument("--inventory-skew", type=float, default=0.02,
                         help="Edge penalty per same-side position (default 0.02)")
-    parser.add_argument("--maker-withdraw", type=float, default=120.0,
+    parser.add_argument("--maker-withdraw", type=float, default=30.0,
                         help="Stop new orders when tau < N seconds (default 120)")
     parser.add_argument("--toxicity-threshold", type=float, default=0.75,
                         help="Toxicity score above which edge threshold widens (default: 0.75)")
@@ -325,18 +429,22 @@ def main():
                         help="Max edge threshold multiplier at toxicity=1.0 (default: 1.5)")
     parser.add_argument("--vol-kill-sigma", type=float, default=None,
                         help="Absolute sigma ceiling — pause quoting above this (default: None)")
-    parser.add_argument("--down-edge-bonus", type=float, default=0.15,
-                        help="Fraction to reduce DOWN edge threshold (optimism tax, default: 0.15)")
+    parser.add_argument("--down-edge-bonus", type=float, default=0.05,
+                        help="Fraction to reduce DOWN edge threshold (optimism tax, default: 0.05)")
     parser.add_argument("--regime-z-scale", action="store_true",
                         help="Scale z-scores by sigma_ema / sigma_calibration (requires --calibrated)")
-    parser.add_argument("--vpin-threshold", type=float, default=0.50,
-                        help="VPIN above which edge threshold widens (default: 0.50)")
+    parser.add_argument("--vpin-threshold", type=float, default=0.95,
+                        help="VPIN above which edge threshold widens (default: 0.75)")
     parser.add_argument("--vpin-edge-mult", type=float, default=1.5,
                         help="Max edge threshold multiplier at VPIN=1.0 (default: 1.5)")
     parser.add_argument("--vpin-window", type=int, default=20,
                         help="Number of completed trade bars for VPIN (default: 20)")
     parser.add_argument("--vpin-bar-s", type=float, default=60.0,
                         help="Trade bar duration in seconds (default: 60)")
+    parser.add_argument("--oracle-lag-threshold", type=float, default=0.002,
+                        help="Binance-Chainlink discrepancy above which edge widens (default: 0.002)")
+    parser.add_argument("--oracle-lag-mult", type=float, default=2.0,
+                        help="Max edge threshold multiplier at full oracle lag (default: 2.0)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -344,8 +452,8 @@ def main():
     trades_log = Path(f"live_trades_{config.data_subdir}.jsonl")
     state_file = Path(f"live_state_{config.data_subdir}.json")
 
-    # Default max trades
-    max_trades = args.max_trades_per_window if args.max_trades_per_window is not None else 2
+    # Default max trades — 1 per window to avoid self-hedging
+    max_trades = args.max_trades_per_window if args.max_trades_per_window is not None else 1
 
     # Build authenticated client
     print(f"\n  {'='*62}")
@@ -387,7 +495,7 @@ def main():
     base_market = args.market.replace("_5m", "")
     if base_market == "eth":
         signal_kw = dict(
-            edge_threshold=0.15,
+            edge_threshold=0.08,
             reversion_discount=0.10,
             momentum_lookback_s=15,
             momentum_majority=0.7,
@@ -398,7 +506,7 @@ def main():
     signal_kw["window_duration"] = config.window_duration_s
     signal_kw["maker_mode"] = True
     signal_kw["max_bet_fraction"] = 0.02
-    signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", 0.10)
+    signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", 0.08)
     signal_kw["momentum_majority"] = 0.0
     signal_kw["spread_edge_penalty"] = signal_kw.get("spread_edge_penalty", 0.0)
     cooldown_ms = 30_000
@@ -415,8 +523,8 @@ def main():
         n_obs = sum(cal_table.counts.values())
         print(f"  Calibration table: {n_cells} cells, {n_obs} observations")
         signal_kw["calibration_table"] = cal_table
-        signal_kw["edge_threshold"] = 0.10
-        signal_kw["early_edge_mult"] = 2.0
+        signal_kw["edge_threshold"] = 0.08
+        signal_kw["early_edge_mult"] = 0.4
 
     signal_kw["inventory_skew"] = args.inventory_skew
     signal_kw["maker_warmup_s"] = args.maker_warmup
@@ -433,6 +541,8 @@ def main():
     signal_kw["vpin_edge_mult"] = args.vpin_edge_mult
     signal_kw["vpin_window"] = args.vpin_window
     signal_kw["vpin_bar_s"] = args.vpin_bar_s
+    signal_kw["oracle_lag_threshold"] = args.oracle_lag_threshold
+    signal_kw["oracle_lag_mult"] = args.oracle_lag_mult
 
     # Compute sigma_calibration from recorded data when regime-z-scale is on
     if args.regime_z_scale and args.calibrated:
@@ -468,10 +578,10 @@ def main():
 
     # VAMP: BTC uses cost-based, ETH uses filter-based
     if base_market == "btc":
-        signal_kw["vamp_mode"] = "cost"
+        signal_kw["vamp_mode"] = "filter"
     elif base_market == "eth":
         signal_kw["vamp_mode"] = "filter"
-        signal_kw["vamp_filter_threshold"] = 0.03
+        signal_kw["vamp_filter_threshold"] = 0.07
 
     # 5m market overrides
     is_5m = "_5m" in args.market
@@ -483,16 +593,17 @@ def main():
     exit_min_remaining = args.exit_min_remaining
 
     if is_5m:
+        signal_kw["vol_lookback_s"] = 30  # 90s is too long for 300s windows
+        signal_kw["edge_threshold"] = 0.10  # higher bar for shorter windows
         if base_market == "btc":
-            maker_warmup = 70.0
-            maker_withdraw = 30.0
+            maker_warmup = 30.0
+            maker_withdraw = 20.0
         elif base_market == "eth":
             maker_warmup = 30.0
             maker_withdraw = 20.0
-            signal_kw["edge_threshold"] = 0.12
-            signal_kw["early_edge_mult"] = 2.5
+            signal_kw["edge_threshold"] = 0.10
+            signal_kw["early_edge_mult"] = 0.4
             signal_kw["reversion_discount"] = 0.10
-            max_trades = 2
         signal_kw["maker_warmup_s"] = maker_warmup
         signal_kw["maker_withdraw_s"] = maker_withdraw
         cooldown_ms = 10_000
@@ -579,6 +690,8 @@ def main():
     print(f"  Stale timeout:   {stale_timeout:.0f}s")
     print(f"  VPIN:            thresh={args.vpin_threshold} mult={args.vpin_edge_mult} "
           f"window={args.vpin_window} bar={args.vpin_bar_s:.0f}s")
+    print(f"  Oracle lag:      thresh={args.oracle_lag_threshold} mult={args.oracle_lag_mult} "
+          f"binance={config.binance_symbol or 'disabled'}")
     print(f"  Trades log:      {trades_log}")
     print(f"  State file:      {state_file}")
     print()

@@ -26,6 +26,32 @@ def render_display(
     window_end: datetime,
     config: MarketConfig,
 ):
+    # ── Thread-safe snapshots of mutable shared state ──
+    # The main asyncio thread mutates these concurrently; iterating them
+    # without a copy can raise RuntimeError ("changed size during iteration")
+    # and crash the display thread.
+    try:
+        open_orders = list(tracker.open_orders)
+    except (RuntimeError, ValueError):
+        open_orders = []
+    try:
+        pending_fills = list(tracker.pending_fills)
+    except (RuntimeError, ValueError):
+        pending_fills = []
+    try:
+        all_results = list(tracker.all_results)
+    except (RuntimeError, ValueError):
+        all_results = []
+    try:
+        flat_reason_counts = dict(tracker.flat_reason_counts)
+    except RuntimeError:
+        flat_reason_counts = {}
+    try:
+        event_log = list(tracker.event_log)
+    except RuntimeError:
+        event_log = []
+    exited_sides = set(tracker.exited_sides)
+
     lines = ["\033[2J\033[H"]
     mode_str = "DRY RUN" if tracker.dry_run else "LIVE"
     exit_tag = "+EXIT" if tracker.exit_enabled else ""
@@ -108,14 +134,27 @@ def render_display(
     dn_d = tracker.last_down_decision
     up_tag = up_d.action if up_d.action != "FLAT" else "FLAT"
     dn_tag = dn_d.action if dn_d.action != "FLAT" else "FLAT"
-    lines.append(
-        f"  Up: {up_tag} (edge={up_d.edge:.4f})"
-        f"  |  Down: {dn_tag} (edge={dn_d.edge:.4f})"
-    )
+    p_model = tracker.ctx.get("_p_display") or tracker.ctx.get("_p_model_raw")
+    if p_model is not None:
+        lines.append(
+            f"  Model: p_up={p_model:.4f}  p_down={1.0 - p_model:.4f}"
+        )
+    # Live edges from ctx (updated every tick by decide_both_sides)
+    edge_up = tracker.ctx.get("_edge_up")
+    edge_dn = tracker.ctx.get("_edge_down")
+    if edge_up is not None and edge_dn is not None:
+        lines.append(
+            f"  Up: {up_tag} (edge={edge_up:.4f})"
+            f"  |  Down: {dn_tag} (edge={edge_dn:.4f})"
+        )
+    else:
+        lines.append(
+            f"  Up: {up_tag}  |  Down: {dn_tag}"
+        )
 
     # Show top FLAT reason distribution this window
-    if tracker.flat_reason_counts and tracker.signal_eval_count > 0:
-        top = sorted(tracker.flat_reason_counts.items(), key=lambda x: -x[1])
+    if flat_reason_counts and tracker.signal_eval_count > 0:
+        top = sorted(flat_reason_counts.items(), key=lambda x: -x[1])
         top_str = "  |  ".join(f"{k}:{v}" for k, v in top[:3])
         lines.append(f"  FLAT dist: {top_str}")
 
@@ -126,30 +165,20 @@ def render_display(
         tox_label = "LOW" if toxicity < 0.3 else ("MED" if toxicity < 0.6 else "HIGH")
         lines.append(f"  Toxicity:  {toxicity:.2f} [{tox_bar:<10s}] {tox_label}")
 
-    # VPIN flow toxicity indicator
-    vpin = tracker.ctx.get("_vpin", 0.0)
-    trade_bars = tracker.ctx.get("_trade_bars")
-    vpin_window = getattr(tracker.signal, "vpin_window", 20)
-    n_bars = len(trade_bars) if trade_bars is not None else 0
-    # Total bars collected (persists across windows via trade_state)
-    total_bars = tracker.ctx.get("_trade_total_bars", 0)
-    target_bars = 1440  # 24h at 60s/bar
-    if n_bars > 0 or total_bars > 0:
-        if n_bars < vpin_window:
-            lines.append(f"  VPIN:      warming up ({n_bars}/{vpin_window} bars)"
-                         f"  |  collected: {total_bars}/{target_bars} (24h)")
-        else:
-            vpin_bar = "#" * int(vpin * 10)
-            vpin_label = "LOW" if vpin < 0.40 else ("MED" if vpin <= 0.55 else "HIGH")
-            lines.append(f"  VPIN:      {vpin:.2f} [{vpin_bar:<10s}] {vpin_label}"
-                         f"  |  collected: {total_bars}/{target_bars} (24h)")
+    # Signal error (from signal_ticker crash)
+    sig_err = tracker.ctx.get("_signal_error")
+    if sig_err:
+        lines.append(f"  !! SIGNAL ERROR: {sig_err[:80]} !!")
 
     # Circuit breaker warning
     if tracker.circuit_breaker_tripped:
         lines.append(f"  *** {tracker.circuit_breaker_reason} ***")
 
-    # Price history info
-    hist = tracker.ctx.get("price_history", [])
+    # Price history info — snapshot to avoid concurrent append issues
+    try:
+        hist = list(tracker.ctx.get("price_history", []))
+    except (RuntimeError, ValueError):
+        hist = []
     hist_len = len(hist)
     vol_str = ""
     if hist_len >= 20:
@@ -165,19 +194,26 @@ def render_display(
     lines.append("")
 
     # Open limit orders
-    if tracker.open_orders:
+    if open_orders:
         lines.append("  -- Open Limit Orders " + "-" * 36)
-        for o in tracker.open_orders:
+        for o in open_orders:
             age_s = int(_time.time() - o.get("placed_ts_unix", _time.time()))
             lines.append(
                 f"    {o['side']:>4s}  {o['shares']:.1f}sh @ {o['price']:.4f}"
                 f"  (${o['cost_est']:.2f})  age={age_s}s"
                 f"  id={o['order_id'][:12]}..."
             )
+            ms = o.get("model_snapshot")
+            if ms:
+                lines.append(
+                    f"          p_{o['side'].lower()}={ms['p_side']:.4f} "
+                    f"cost={ms['cost_basis']:.4f} edge={ms['edge']:.4f}"
+                    f"  |  Range: ${ms['expected_low']:,.0f}-${ms['expected_high']:,.0f}"
+                )
         lines.append("")
 
     # Positions display (early exit mode)
-    if tracker.exit_enabled and tracker.pending_fills:
+    if tracker.exit_enabled and pending_fills:
         lines.append(
             f"  -- Positions ({tracker.position_count}/{tracker.max_positions}) "
             + "-" * 36
@@ -186,7 +222,7 @@ def render_display(
             "UP": flat_state.get("up_best_bid"),
             "DOWN": flat_state.get("down_best_bid"),
         }
-        for fill in tracker.pending_fills:
+        for fill in pending_fills:
             entry_px = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
             bid_val = bid_map.get(fill["side"])
             bid_f = float(bid_val) if bid_val else 0.0
@@ -197,11 +233,18 @@ def render_display(
                 f"@ {entry_px:.4f}  bid={bid_f:.2f}  "
                 f"uPnL=${upnl:+.2f}  hold={hold_s}s"
             )
-        if tracker.exited_sides:
-            lines.append(f"    Exited: {', '.join(sorted(tracker.exited_sides))}")
+            ms = fill.get("model_snapshot")
+            if ms:
+                lines.append(
+                    f"          p_{fill['side'].lower()}={ms['p_side']:.4f} "
+                    f"cost={ms['cost_basis']:.4f} edge={ms['edge']:.4f}"
+                    f"  |  Range: ${ms['expected_low']:,.0f}-${ms['expected_high']:,.0f}"
+                )
+        if exited_sides:
+            lines.append(f"    Exited: {', '.join(sorted(exited_sides))}")
         lines.append("")
-    elif tracker.pending_fills:
-        for fill in tracker.pending_fills:
+    elif pending_fills:
+        for fill in pending_fills:
             entry_px = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
             rem_m = int(fill["time_remaining_s"]) // 60
             rem_s = int(fill["time_remaining_s"]) % 60
@@ -210,12 +253,19 @@ def render_display(
                 f"x {fill['shares']:.1f}sh ${fill['cost_usd']:.2f} "
                 f"[{rem_m}:{rem_s:02d} left]"
             )
+            ms = fill.get("model_snapshot")
+            if ms:
+                lines.append(
+                    f"                p_{fill['side'].lower()}={ms['p_side']:.4f} "
+                    f"cost={ms['cost_basis']:.4f} edge={ms['edge']:.4f}"
+                    f"  |  Range: ${ms['expected_low']:,.0f}-${ms['expected_high']:,.0f}"
+                )
     else:
         lines.append("  This Window:  no trades")
 
     # Last result
-    if tracker.all_results:
-        r = tracker.all_results[-1]
+    if all_results:
+        r = all_results[-1]
         tag = "WON" if r.pnl > 0 else "LOST"
         lines.append(
             f"  Last Result:  {r.fill.side} "
@@ -224,12 +274,12 @@ def render_display(
     lines.append("")
 
     # Session stats
-    wins = [r for r in tracker.all_results if r.pnl > 0]
-    total = len(tracker.all_results)
-    total_pnl = sum(r.pnl for r in tracker.all_results)
+    wins = [r for r in all_results if r.pnl > 0]
+    total = len(all_results)
+    total_pnl = sum(r.pnl for r in all_results)
     win_count = len(wins)
     win_str = f"{win_count}/{total} ({win_count / total:.0%})" if total > 0 else "---"
-    open_str = f"  |  Open: {len(tracker.open_orders)}"
+    open_str = f"  |  Open: {len(open_orders)}"
     lines.append(
         f"  Session:  {tracker.windows_traded}/{tracker.windows_seen}"
         f" windows traded  |  Win: {win_str}{open_str}"
@@ -239,7 +289,13 @@ def render_display(
         f"  |  Fees: ~${tracker.total_fees:.2f}"
         f"  |  DD: ${tracker.max_drawdown:.0f} ({tracker.max_dd_pct:.1%})"
     )
-    lines.append("")
+    # Recent order events
+    if event_log:
+        lines.append("  -- Recent Events " + "-" * 40)
+        for evt in event_log:
+            lines.append(f"  {evt}")
+        lines.append("")
+
     lines.append("  Ctrl+C to exit (cancels open orders)")
 
     sys.stdout.write("\n".join(lines) + "\n")

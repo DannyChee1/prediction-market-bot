@@ -15,6 +15,7 @@ class MarketConfig:
     window_align_m: int = 15           # minute alignment for find_market
     max_sigma: float = 8e-05           # per-second sigma ceiling
     min_sigma: float = 1e-6            # per-second sigma floor
+    binance_symbol: str = ""           # e.g. "btcusdt" for Binance bookTicker
 
 
 MARKET_CONFIGS: dict[str, MarketConfig] = {
@@ -25,6 +26,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         display_name="BTC 15m",
         window_duration_s=900.0,
         window_align_m=15,
+        binance_symbol="btcusdt",
     ),
     "eth": MarketConfig(
         slug_prefix="eth-updown-15m",
@@ -34,6 +36,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_duration_s=900.0,
         window_align_m=15,
         max_sigma=5e-05,
+        binance_symbol="ethusdt",
     ),
     "btc_5m": MarketConfig(
         slug_prefix="btc-updown-5m",
@@ -42,6 +45,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         display_name="BTC 5m",
         window_duration_s=300.0,
         window_align_m=5,
+        binance_symbol="btcusdt",
     ),
     "eth_5m": MarketConfig(
         slug_prefix="eth-updown-5m",
@@ -51,6 +55,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_duration_s=300.0,
         window_align_m=5,
         max_sigma=5e-05,
+        binance_symbol="ethusdt",
     ),
 }
 

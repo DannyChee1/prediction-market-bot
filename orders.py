@@ -21,12 +21,49 @@ class OrderMixin:
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
+    def _event(self: "LiveTradeTracker", msg: str):
+        """Log an order event to the display buffer."""
+        clean = msg.lstrip("\n").rstrip()
+        self.event_log.append(clean)
+
     def _get_open_order(self: "LiveTradeTracker", side: str) -> dict | None:
         """Return the open order dict for a given side ("UP"/"DOWN"), or None."""
         for o in self.open_orders:
             if o.get("side") == side:
                 return o
         return None
+
+    @staticmethod
+    def _model_log_fields(order: dict) -> dict:
+        """Extract model_snapshot fields from an order dict for JSONL logging."""
+        ms = order.get("model_snapshot")
+        if not ms:
+            return {}
+        return {
+            "p_model": ms["p_model"],
+            "p_side": ms["p_side"],
+            "cost_basis": ms["cost_basis"],
+            "edge": ms["edge"],
+            "sigma_per_s": ms["sigma_per_s"],
+            "tau": ms["tau"],
+            "expected_low": ms["expected_low"],
+            "expected_high": ms["expected_high"],
+            "dyn_threshold": ms["dyn_threshold"],
+        }
+
+    @staticmethod
+    def _model_fill_line(order: dict) -> str:
+        """Return a second-line string for model state at fill time, or ''."""
+        ms = order.get("model_snapshot")
+        if not ms:
+            return ""
+        side = order.get("side", "up").lower()
+        return (
+            f"\n    Model: p_{side}={ms['p_side']:.4f} "
+            f"cost={ms['cost_basis']:.4f} edge={ms['edge']:.4f}"
+            f" | Range: ${ms['expected_low']:,.0f}-${ms['expected_high']:,.0f}"
+            f" | tau={ms['tau']:.0f}s"
+        )
 
     # ── Cancel ─────────────────────────────────────────────────────────────
 
@@ -43,13 +80,13 @@ class OrderMixin:
                 self.client.cancel(order_id)
             except Exception as exc:
                 if self.debug:
-                    print(f"\n  [CANCEL] error cancelling {order_id[:12]}...: {exc}")
+                    self._event(f"[CANCEL] error cancelling {order_id[:12]}...: {exc}")
                 return False
 
             # Verify cancel — order may have filled in the race window
             try:
                 resp = self.client.get_order(order_id)
-                status = resp.get("status", "unknown")
+                status = str(resp.get("status", "unknown")).upper()
                 size_matched = float(resp.get("size_matched", 0) or 0)
                 original_size = float(
                     resp.get("original_size", order["shares"]) or order["shares"]
@@ -81,6 +118,7 @@ class OrderMixin:
                         "time_remaining_s": order["time_remaining_s"],
                         "chainlink_price": order["chainlink_price"],
                         "window_start_price": order["window_start_price"],
+                        "model_snapshot": order.get("model_snapshot"),
                     })
                     self.window_trade_count += 1
                     self.position_count += 1
@@ -88,10 +126,11 @@ class OrderMixin:
                     entry_px = (
                         actual_cost / size_matched if size_matched > 0 else 0
                     )
-                    print(
-                        f"\n  [CANCEL->FILL] {order['side']} "
+                    self._event(
+                        f"[CANCEL->FILL] {order['side']} "
                         f"{size_matched:.1f}sh @ {entry_px:.4f} "
                         f"(${actual_cost:.2f}) — filled before cancel"
+                        + self._model_fill_line(order)
                     )
                     self._log({
                         "type": "limit_fill",
@@ -102,6 +141,7 @@ class OrderMixin:
                         "price": order["price"],
                         "cost_usd": round(actual_cost, 2),
                         "note": f"filled_before_cancel: {reason}",
+                        **self._model_log_fields(order),
                     })
                     return False
 
@@ -129,6 +169,7 @@ class OrderMixin:
                         "time_remaining_s": order["time_remaining_s"],
                         "chainlink_price": order["chainlink_price"],
                         "window_start_price": order["window_start_price"],
+                        "model_snapshot": order.get("model_snapshot"),
                     })
                     self.window_trade_count += 1
                     self.position_count += 1
@@ -136,11 +177,12 @@ class OrderMixin:
                     entry_px = (
                         filled_cost / size_matched if size_matched > 0 else 0
                     )
-                    print(
-                        f"\n  [CANCEL->PARTIAL] {order['side']} "
+                    self._event(
+                        f"[CANCEL->PARTIAL] {order['side']} "
                         f"{size_matched:.1f}/{original_size:.1f}sh "
                         f"@ {entry_px:.4f} (${filled_cost:.2f}) — "
                         f"refunding ${unfilled_cost_est:.2f}"
+                        + self._model_fill_line(order)
                     )
                     self._log({
                         "type": "partial_fill",
@@ -152,11 +194,12 @@ class OrderMixin:
                         "cost_usd": round(filled_cost, 2),
                         "refund": round(unfilled_cost_est, 2),
                         "note": f"partial_before_cancel: {reason}",
+                        **self._model_log_fields(order),
                     })
                     return False
             except Exception as verify_exc:
-                print(
-                    f"\n  [CANCEL WARNING] Could not verify "
+                self._event(
+                    f"[CANCEL WARNING] Could not verify "
                     f"{order_id[:12]}...: {verify_exc}"
                 )
                 self._log({
@@ -184,8 +227,8 @@ class OrderMixin:
             "reason": reason,
             "refund": round(order["cost_est"], 2),
         })
-        print(
-            f"\n  [CANCEL] {order['side']} {order['shares']:.1f}sh "
+        self._event(
+            f"[CANCEL] {order['side']} {order['shares']:.1f}sh "
             f"@ {order['price']:.4f} — {reason}"
         )
         return True
@@ -226,6 +269,27 @@ class OrderMixin:
 
         now_iso = datetime.now(timezone.utc).isoformat()
         now_unix = _time.time()
+
+        # Capture model state at order time for fill logging
+        p_model = self.ctx.get("_p_model_raw", 0.0)
+        expected_range = self.ctx.get("_expected_range", {})
+        p_side = p_model if side_label == "UP" else 1.0 - p_model
+        cost_basis = self.ctx.get(
+            "_cost_down" if side_label == "DOWN" else "_cost_up", limit_price
+        )
+        model_snapshot = {
+            "p_model": round(p_model, 4),
+            "p_side": round(p_side, 4),
+            "sigma_per_s": self.ctx.get("_sigma_per_s", 0.0),
+            "tau": round(snapshot.time_remaining_s, 0),
+            "dyn_threshold": round(self.ctx.get("_dyn_threshold_down" if side_label == "DOWN" else "_dyn_threshold_up", 0.0), 4),
+            "expected_low": round(expected_range.get("expected_low", 0.0), 2),
+            "expected_high": round(expected_range.get("expected_high", 0.0), 2),
+            "cost_basis": round(cost_basis, 4),
+            "fill_price": limit_price,
+            "edge": round(decision.edge, 4),
+        }
+
         trade_record = {
             "type": "limit_order",
             "ts": now_iso,
@@ -238,14 +302,15 @@ class OrderMixin:
             "signal_reason": decision.reason,
             "bankroll_before": round(self.bankroll, 2),
             "chainlink_price": round(snapshot.chainlink_price, 2),
+            **model_snapshot,
         }
 
         if self.dry_run:
             trade_record["dry_run"] = True
             trade_record["status"] = "dry_run"
             self._log(trade_record)
-            print(
-                f"\n  [DRY RUN] Would place limit: BUY {side_label} "
+            self._event(
+                f"[DRY RUN] Would place limit: BUY {side_label} "
                 f"{shares:.1f}sh @ {limit_price:.4f} (${cost_est:.2f})"
                 f" | BTC: ${snapshot.chainlink_price:,.2f}"
             )
@@ -264,6 +329,7 @@ class OrderMixin:
                 "time_remaining_s": snapshot.time_remaining_s,
                 "chainlink_price": snapshot.chainlink_price,
                 "window_start_price": snapshot.window_start_price,
+                "model_snapshot": model_snapshot,
             })
             return
 
@@ -281,12 +347,12 @@ class OrderMixin:
             trade_record["status"] = "error"
             trade_record["error"] = str(exc)
             self._log(trade_record)
-            print(f"\n  [LIMIT ORDER ERROR] {exc}")
+            self._event(f"[LIMIT ORDER ERROR] {exc}")
             return
 
         success = resp.get("success", False)
         order_id = resp.get("orderID") or resp.get("id", "")
-        status = resp.get("status", "unknown")
+        status = str(resp.get("status", "unknown")).upper()
 
         trade_record["order_id"] = order_id
         trade_record["status"] = status
@@ -297,8 +363,8 @@ class OrderMixin:
             trade_record["filled"] = False
             self._log(trade_record)
             err_msg = resp.get("errorMsg", "")
-            print(
-                f"\n  [LIMIT] {side_label} {shares:.1f}sh @ {limit_price:.4f} "
+            self._event(
+                f"[LIMIT] {side_label} {shares:.1f}sh @ {limit_price:.4f} "
                 f"-> REJECTED (status={status}, err={err_msg})"
             )
             return
@@ -308,7 +374,7 @@ class OrderMixin:
         # Check if the order was immediately filled
         taking = resp.get("takingAmount", "")
         making = resp.get("makingAmount", "")
-        if status == "matched" and taking:
+        if status == "MATCHED" and taking:
             filled_shares = float(taking)
             actual_cost = float(making) if making else filled_shares * limit_price
             self.bankroll -= actual_cost
@@ -325,16 +391,21 @@ class OrderMixin:
                 "time_remaining_s": snapshot.time_remaining_s,
                 "chainlink_price": snapshot.chainlink_price,
                 "window_start_price": snapshot.window_start_price,
+                "model_snapshot": model_snapshot,
             })
             self.last_fill_ts_ms = snapshot.ts_ms
             self.window_trade_count += 1
             self.position_count += 1
 
             entry_px = actual_cost / filled_shares if filled_shares > 0 else 0
-            print(
-                f"\n  [LIMIT FILLED] BUY {side_label} {filled_shares:.1f}sh "
+            ms = model_snapshot
+            self._event(
+                f"[LIMIT FILLED] BUY {side_label} {filled_shares:.1f}sh "
                 f"@ {entry_px:.4f} (${actual_cost:.2f})"
-                f" | BTC: ${snapshot.chainlink_price:,.2f}"
+                f"\n    Model: p_{side_label.lower()}={ms['p_side']:.4f} "
+                f"cost={ms['cost_basis']:.4f} edge={ms['edge']:.4f}"
+                f" | Range: ${ms['expected_low']:,.0f}-${ms['expected_high']:,.0f}"
+                f" | tau={ms['tau']:.0f}s"
             )
             return
 
@@ -354,10 +425,11 @@ class OrderMixin:
             "time_remaining_s": snapshot.time_remaining_s,
             "chainlink_price": snapshot.chainlink_price,
             "window_start_price": snapshot.window_start_price,
+            "model_snapshot": model_snapshot,
         })
 
-        print(
-            f"\n  [LIMIT] BUY {side_label} {shares:.1f}sh @ {limit_price:.4f} "
+        self._event(
+            f"[LIMIT] BUY {side_label} {shares:.1f}sh @ {limit_price:.4f} "
             f"(${cost_est:.2f}) -> resting (id={order_id[:12]}...)"
         )
 
@@ -391,15 +463,28 @@ class OrderMixin:
                         "time_remaining_s": order["time_remaining_s"],
                         "chainlink_price": order["chainlink_price"],
                         "window_start_price": order["window_start_price"],
+                        "model_snapshot": order.get("model_snapshot"),
                     })
                     self.last_fill_ts_ms = snapshot.ts_ms
                     self.window_trade_count += 1
                     self.position_count += 1
                     entry_px = actual_cost / order["shares"] if order["shares"] > 0 else 0
-                    print(
-                        f"\n  [DRY FILL] {order['side']} {order['shares']:.1f}sh "
+                    self._event(
+                        f"[DRY FILL] {order['side']} {order['shares']:.1f}sh "
                         f"@ {entry_px:.4f} (${actual_cost:.2f})"
+                        + self._model_fill_line(order)
                     )
+                    self._log({
+                        "type": "limit_fill",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "order_id": order_id,
+                        "side": order["side"],
+                        "shares": round(order["shares"], 2),
+                        "price": order["price"],
+                        "cost_usd": round(actual_cost, 2),
+                        "note": "dry_run_fill",
+                        **self._model_log_fields(order),
+                    })
                 else:
                     still_open.append(order)
                 continue
@@ -408,11 +493,11 @@ class OrderMixin:
                 resp = self.client.get_order(order_id)
             except Exception as exc:
                 if self.debug:
-                    print(f"\n  [POLL] error checking {order_id[:12]}...: {exc}")
+                    self._event(f"[POLL] error checking {order_id[:12]}...: {exc}")
                 still_open.append(order)
                 continue
 
-            status = resp.get("status", "unknown")
+            status = str(resp.get("status", "unknown")).upper()
             size_matched = float(resp.get("size_matched", 0) or 0)
             original_size = float(resp.get("original_size", order["shares"]) or order["shares"])
             fill_pct = size_matched / original_size if original_size > 0 else 0
@@ -434,15 +519,17 @@ class OrderMixin:
                     "time_remaining_s": order["time_remaining_s"],
                     "chainlink_price": order["chainlink_price"],
                     "window_start_price": order["window_start_price"],
+                    "model_snapshot": order.get("model_snapshot"),
                 })
                 self.last_fill_ts_ms = snapshot.ts_ms
                 self.window_trade_count += 1
                 self.position_count += 1
 
                 entry_px = actual_cost / size_matched if size_matched > 0 else 0
-                print(
-                    f"\n  [LIMIT FILLED] {order['side']} {size_matched:.1f}sh "
+                self._event(
+                    f"[LIMIT FILLED] {order['side']} {size_matched:.1f}sh "
                     f"@ {entry_px:.4f} (${actual_cost:.2f})"
+                    + self._model_fill_line(order)
                 )
                 self._log({
                     "type": "limit_fill",
@@ -452,13 +539,14 @@ class OrderMixin:
                     "shares": round(size_matched, 2),
                     "price": order["price"],
                     "cost_usd": round(actual_cost, 2),
+                    **self._model_log_fields(order),
                 })
 
             elif status in ("CANCELLED", "EXPIRED"):
                 self.bankroll += order["cost_est"]
                 self.signal.bankroll = self.bankroll
-                print(
-                    f"\n  [LIMIT {status}] {order['side']} "
+                self._event(
+                    f"[LIMIT {status}] {order['side']} "
                     f"{order['shares']:.1f}sh @ {order['price']:.4f} "
                     f"— refunded ${order['cost_est']:.2f}"
                 )
@@ -490,15 +578,17 @@ class OrderMixin:
                     "time_remaining_s": order["time_remaining_s"],
                     "chainlink_price": order["chainlink_price"],
                     "window_start_price": order["window_start_price"],
+                    "model_snapshot": order.get("model_snapshot"),
                 })
                 self.last_fill_ts_ms = snapshot.ts_ms
                 self.window_trade_count += 1
                 self.position_count += 1
 
-                print(
-                    f"\n  [PARTIAL FILL] {order['side']} {new_fill_shares:.1f}sh "
+                self._event(
+                    f"[PARTIAL FILL] {order['side']} {new_fill_shares:.1f}sh "
                     f"@ {order['price']:.4f} (${new_fill_cost:.2f}) — "
                     f"{order['shares']:.1f}sh still open"
+                    + self._model_fill_line(order)
                 )
                 self._log({
                     "type": "partial_fill",
@@ -509,6 +599,7 @@ class OrderMixin:
                     "remaining_shares": round(order["shares"], 2),
                     "price": order["price"],
                     "cost_usd": round(new_fill_cost, 2),
+                    **self._model_log_fields(order),
                 })
                 still_open.append(order)
             else:
@@ -532,9 +623,9 @@ class OrderMixin:
             return
         try:
             resp = self.client.cancel_all()
-            print(f"  Cancelled all open orders: {resp}")
+            self._event(f"Cancelled all open orders: {resp}")
         except Exception as exc:
-            print(f"  Warning: cancel_all failed: {exc}")
+            self._event(f"Warning: cancel_all failed: {exc}")
 
     # ── Early exit: FOK sell ───────────────────────────────────────────────
 
@@ -569,8 +660,8 @@ class OrderMixin:
                 "reason": reason,
                 "dry_run": True,
             })
-            print(
-                f"\n  [DRY EXIT] {fill['side']} {shares:.1f}sh "
+            self._event(
+                f"[DRY EXIT] {fill['side']} {shares:.1f}sh "
                 f"@ {sell_price:.4f} (entry {entry_price:.4f}) "
                 f"PnL=${exit_pnl:+.2f} | EV: hold={ev_hold:.3f} sell={ev_sell:.3f} "
                 f"({reason})"
@@ -588,7 +679,7 @@ class OrderMixin:
             signed_order = self.client.create_market_order(order_args)
             resp = self.client.post_order(signed_order, OrderType.FOK)
         except Exception as exc:
-            print(f"\n  [EXIT ERROR] {fill['side']}: {exc}")
+            self._event(f"[EXIT ERROR] {fill['side']}: {exc}")
             self._log({
                 "type": "early_exit",
                 "ts": now_iso,
@@ -599,11 +690,11 @@ class OrderMixin:
             return False
 
         success = resp.get("success", False)
-        status = resp.get("status", "unknown")
+        status = str(resp.get("status", "unknown")).upper()
 
-        if not success or status not in ("matched", "live"):
+        if not success or status not in ("MATCHED", "LIVE"):
             if self.debug:
-                print(f"\n  [EXIT] {fill['side']} FOK not filled (status={status})")
+                self._event(f"[EXIT] {fill['side']} FOK not filled (status={status})")
             return False
 
         taking = resp.get("takingAmount", "")
@@ -628,8 +719,8 @@ class OrderMixin:
             "reason": reason,
             "bankroll_after": round(self.bankroll, 2),
         })
-        print(
-            f"\n  [EXIT] {fill['side']} {shares:.1f}sh "
+        self._event(
+            f"[EXIT] {fill['side']} {shares:.1f}sh "
             f"@ {sell_price:.4f} (entry {entry_price:.4f}) "
             f"PnL=${exit_pnl:+.2f} | EV: hold={ev_hold:.3f} sell={ev_sell:.3f}"
         )

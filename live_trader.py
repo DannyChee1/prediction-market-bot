@@ -31,29 +31,30 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+load_dotenv()
+
 from web3 import Web3
+
+from polybot_core import OrderClient, BookFeed, PriceFeed, BinanceFeed
 
 from backtest import (
     Decision, DiffusionSignal, build_calibration_table,
 )
 from market_config import MARKET_CONFIGS, DEFAULT_MARKET, get_config
 from market_api import (
-    build_clob_client, query_usdc_balance, find_market, _ensure_list,
+    find_market, _ensure_list,
 )
-from feeds import snapshot_from_live, clob_ws, rtds_ws, binance_ws
+from feeds import snapshot_from_book_feed
 from display import render_display
 from tracker import LiveTradeTracker
-from recorder import OrderBook
 from redemption import POLYGON_RPC
-
-load_dotenv()
 
 
 # ── Signal Ticker ────────────────────────────────────────────────────────────
 
 async def signal_ticker(
     tracker: LiveTradeTracker,
-    book_up: OrderBook, book_down: OrderBook,
+    book_feed: BookFeed,
     price_state: dict, window_end: datetime,
     market_slug: str, up_token: str, down_token: str,
     cancel: asyncio.Event,
@@ -95,8 +96,8 @@ async def signal_ticker(
                     del hist[:-_MAX_HIST]
                     del ts_hist[:-_MAX_HIST]
 
-            snap = snapshot_from_live(
-                book_up, book_down,
+            snap = snapshot_from_book_feed(
+                book_feed, up_token, down_token,
                 price_state.get("price"),
                 price_state.get("window_start_price"),
                 window_end, market_slug,
@@ -140,6 +141,100 @@ def _display_thread_fn(
             except Exception:
                 pass
         stop_event.wait(1.0)
+
+
+# ── Rust Feed Polling ────────────────────────────────────────────────────────
+
+async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
+                           tracker: LiveTradeTracker, cancel: asyncio.Event,
+                           debug: bool = False):
+    """Bridge Rust PriceFeed → Python price_state dict."""
+    last_ts = 0.0
+    _stale_warned = False
+    while not cancel.is_set():
+        await asyncio.sleep(0.1)
+        if cancel.is_set():
+            break
+        try:
+            px = price_feed.price()
+            ts = price_feed.last_update_ts()
+            if px is not None and ts > last_ts:
+                last_ts = ts
+                _stale_warned = False
+                price_state["price"] = px
+                tracker.last_price_update_ts = ts
+                ts_ms = int(ts * 1000)
+                price_state["price_history"].append((ts_ms, px))
+                if price_state["window_start_price"] is None:
+                    price_state["window_start_price"] = px
+            elif debug and last_ts > 0 and not _stale_warned:
+                import time as _t
+                age = _t.time() - last_ts
+                if age > 15:
+                    print(f"  [PriceFeed] WARNING: no update for {age:.0f}s "
+                          f"(last_ts={last_ts:.0f}, px={px}, raw_ts={ts})")
+                    _stale_warned = True
+        except Exception:
+            pass
+
+
+async def _poll_binance_feed(binance_feed: BinanceFeed, binance_state: dict,
+                             cancel: asyncio.Event):
+    """Bridge Rust BinanceFeed → Python binance_state dict."""
+    while not cancel.is_set():
+        await asyncio.sleep(0.1)
+        if cancel.is_set():
+            break
+        try:
+            mid = binance_feed.mid()
+            if mid is not None:
+                binance_state["mid_price"] = mid
+                binance_state["last_update_ts"] = binance_feed.last_update_ts()
+        except Exception:
+            pass
+
+
+async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
+                          flat_state: dict, trade_state: dict | None,
+                          cancel: asyncio.Event):
+    """Bridge Rust BookFeed → Python flat_state + trade_state for VPIN."""
+    while not cancel.is_set():
+        await asyncio.sleep(0.2)
+        if cancel.is_set():
+            break
+        try:
+            # Update flat_state BBO for display thread
+            for side, token in [("up", up_token), ("down", down_token)]:
+                snap = book_feed.snapshot(token)
+                bb = snap.best_bid
+                ba = snap.best_ask
+                flat_state[f"{side}_best_bid"] = str(bb) if bb is not None else None
+                flat_state[f"{side}_best_ask"] = str(ba) if ba is not None else None
+
+            # Drain trade events for VPIN bar accumulation
+            if trade_state is not None:
+                for size, trade_side in book_feed.drain_trades():
+                    bar = trade_state["current_bar"]
+                    now_ts = _time.time()
+                    if bar["start_ts"] == 0:
+                        bar["start_ts"] = now_ts
+                    if trade_side == "BUY":
+                        bar["buy_vol"] += size
+                    else:
+                        bar["sell_vol"] += size
+                    bar_dur = trade_state.get("bar_duration_s", 60.0)
+                    if now_ts - bar["start_ts"] >= bar_dur:
+                        trade_state["bars"].append(
+                            (bar["buy_vol"], bar["sell_vol"])
+                        )
+                        trade_state["total_bars"] = (
+                            trade_state.get("total_bars", 0) + 1
+                        )
+                        bar["buy_vol"] = 0.0
+                        bar["sell_vol"] = 0.0
+                        bar["start_ts"] = now_ts
+        except Exception:
+            pass
 
 
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
@@ -193,8 +288,7 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
     if not tracker.condition_id:
         print("  WARNING: conditionId missing from market data — auto-redeem disabled for this window")
 
-    book_up = OrderBook()
-    book_down = OrderBook()
+    book_feed = BookFeed([up_token, down_token])
 
     # Wait until eventStartTime + 5s so the RTDS buffer has the start price
     now = datetime.now(timezone.utc)
@@ -267,12 +361,11 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
 
     tasks = [
         asyncio.create_task(
-            clob_ws(up_token, down_token, book_up, book_down,
-                    flat_state, cancel, debug=tracker.debug,
-                    trade_state=trade_state)
+            _poll_book_feed(book_feed, up_token, down_token,
+                            flat_state, trade_state, cancel)
         ),
         asyncio.create_task(
-            signal_ticker(tracker, book_up, book_down, price_state,
+            signal_ticker(tracker, book_feed, price_state,
                           end, slug, up_token, down_token, cancel,
                           skip_trading=skip_trading,
                           trade_state=trade_state,
@@ -325,19 +418,24 @@ async def run(tracker: LiveTradeTracker, config):
     # Binance state persists across windows (like price_state)
     binance_state: dict = {}
 
-    rtds_cancel = asyncio.Event()
-    rtds_task = asyncio.create_task(
-        rtds_ws(price_state, rtds_cancel, config, tracker,
-                debug=tracker.debug)
-    )
+    # Rust feeds — background tokio tasks start immediately
+    price_feed = PriceFeed(config.chainlink_symbol)
+    print(f"  [PriceFeed] started (filtering for {config.chainlink_symbol})")
 
-    # Launch Binance bookTicker as a long-lived task (only if symbol configured)
-    binance_cancel = asyncio.Event()
-    binance_task = None
+    binance_feed = None
     if config.binance_symbol:
-        binance_task = asyncio.create_task(
-            binance_ws(binance_state, binance_cancel, config,
-                       debug=tracker.debug)
+        binance_feed = BinanceFeed(config.binance_symbol)
+        print(f"  [BinanceFeed] started ({config.binance_symbol}@bookTicker)")
+
+    # Polling loops bridge Rust feeds → Python state dicts
+    feed_cancel = asyncio.Event()
+    price_poll = asyncio.create_task(
+        _poll_price_feed(price_feed, price_state, tracker, feed_cancel, debug=tracker.debug)
+    )
+    binance_poll = None
+    if binance_feed is not None:
+        binance_poll = asyncio.create_task(
+            _poll_binance_feed(binance_feed, binance_state, feed_cancel)
         )
 
     try:
@@ -345,13 +443,12 @@ async def run(tracker: LiveTradeTracker, config):
             await run_window(tracker, config, price_state, trade_state,
                              binance_state)
     finally:
-        rtds_cancel.set()
-        rtds_task.cancel()
-        binance_cancel.set()
-        if binance_task is not None:
-            binance_task.cancel()
-            await asyncio.gather(binance_task, return_exceptions=True)
-        await asyncio.gather(rtds_task, return_exceptions=True)
+        feed_cancel.set()
+        price_poll.cancel()
+        if binance_poll is not None:
+            binance_poll.cancel()
+            await asyncio.gather(binance_poll, return_exceptions=True)
+        await asyncio.gather(price_poll, return_exceptions=True)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -467,10 +564,24 @@ def main():
     print(f"  {mode} [{order_mode}] -- {config.display_name} Up/Down")
     print(f"  {'='*62}")
 
-    client = build_clob_client()
+    client = OrderClient(
+        host="https://clob.polymarket.com",
+        private_key=os.getenv("PRIVATE_KEY"),
+        chain_id=137,
+        api_key=os.getenv("POLY_API_KEY", ""),
+        api_secret=os.getenv("POLY_API_SECRET", ""),
+        api_passphrase=os.getenv("POLY_PASSPHRASE", ""),
+        sig_type=int(os.getenv("SIGNATURE_TYPE", "1")),
+        funder=os.getenv("POLY_FUNDER") or None,
+    )
 
     # Determine bankroll
-    api_balance = query_usdc_balance(client, debug=args.debug)
+    try:
+        api_balance = client.get_balance()
+    except Exception as exc:
+        api_balance = None
+        if args.debug:
+            print(f"  [BALANCE] error: {exc}")
     if api_balance is not None:
         print(f"  API USDC balance: ${api_balance:,.2f}")
 
@@ -525,7 +636,7 @@ def main():
         print(f"  Calibration table: {n_cells} cells, {n_obs} observations")
         signal_kw["calibration_table"] = cal_table
         signal_kw["edge_threshold"] = 0.08
-        signal_kw["early_edge_mult"] = 0.4
+        signal_kw["early_edge_mult"] = 1.2
 
     signal_kw["inventory_skew"] = args.inventory_skew
     signal_kw["maker_warmup_s"] = args.maker_warmup
@@ -603,7 +714,7 @@ def main():
             maker_warmup = 30.0
             maker_withdraw = 20.0
             signal_kw["edge_threshold"] = 0.10
-            signal_kw["early_edge_mult"] = 0.4
+            signal_kw["early_edge_mult"] = 1.2
             signal_kw["reversion_discount"] = 0.10
         signal_kw["maker_warmup_s"] = maker_warmup
         signal_kw["maker_withdraw_s"] = maker_withdraw

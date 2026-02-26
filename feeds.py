@@ -64,6 +64,42 @@ def snapshot_from_live(
     )
 
 
+def snapshot_from_book_feed(
+    book_feed, up_token: str, down_token: str,
+    price: float | None, window_start_price: float | None,
+    window_end: datetime, market_slug: str,
+) -> Snapshot | None:
+    """Build a Snapshot from Rust BookFeed snapshots (BookSnapshot pyclasses)."""
+    if price is None or window_start_price is None:
+        return None
+
+    snap_up = book_feed.snapshot(up_token)
+    snap_down = book_feed.snapshot(down_token)
+
+    now = datetime.now(timezone.utc)
+    time_remaining_s = max(0.0, (window_end - now).total_seconds())
+
+    return Snapshot(
+        ts_ms=int(_time.time() * 1000),
+        market_slug=market_slug,
+        time_remaining_s=time_remaining_s,
+        chainlink_price=price,
+        window_start_price=window_start_price,
+        best_bid_up=snap_up.best_bid,
+        best_ask_up=snap_up.best_ask,
+        best_bid_down=snap_down.best_bid,
+        best_ask_down=snap_down.best_ask,
+        size_bid_up=snap_up.bids[0][1] if snap_up.bids else None,
+        size_ask_up=snap_up.asks[0][1] if snap_up.asks else None,
+        size_bid_down=snap_down.bids[0][1] if snap_down.bids else None,
+        size_ask_down=snap_down.asks[0][1] if snap_down.asks else None,
+        ask_levels_up=tuple(snap_up.asks[:5]),
+        ask_levels_down=tuple(snap_down.asks[:5]),
+        bid_levels_up=tuple(snap_up.bids[:5]),
+        bid_levels_down=tuple(snap_down.bids[:5]),
+    )
+
+
 # ── CLOB order book WebSocket ────────────────────────────────────────────────
 
 async def clob_ws(

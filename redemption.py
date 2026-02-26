@@ -257,10 +257,18 @@ class RedemptionMixin:
             )
             resp.raise_for_status()
             result = resp.json()
-            tx_id = result.get("transactionId", "")
+            if self.debug:
+                print(f"  [REDEEM] Relayer response: {result}")
+            tx_id = result.get("transactionID") or result.get("transactionId", "")
             tx_hash = result.get("transactionHash", "")
 
             print(f"  [REDEEM] Relayer accepted: id={tx_id}, hash={tx_hash}")
+
+            if not tx_id:
+                print(f"  [REDEEM] WARNING: Relayer returned no transaction ID. "
+                      f"Raw response: {result}")
+                return tx_hash if tx_hash else None
+
             print(f"  [REDEEM] Waiting for confirmation...")
 
             # 7. Poll /transaction until confirmed

@@ -10,13 +10,11 @@ import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from py_clob_client.client import ClobClient
-
 from backtest import (
     Snapshot, Decision, Fill, TradeResult,
     DiffusionSignal, poly_fee,
 )
-from market_api import query_usdc_balance, poll_market_resolution
+from market_api import poll_market_resolution
 from orders import OrderMixin
 from redemption import RedemptionMixin
 
@@ -26,7 +24,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
     def __init__(
         self,
-        client: ClobClient,
+        client,  # polybot_core.OrderClient or py_clob_client.ClobClient
         signal: DiffusionSignal,
         initial_bankroll: float,
         latency_ms: int = 0,
@@ -653,7 +651,13 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             return
         self.last_balance_check_ts = now
 
-        api_bal = query_usdc_balance(self.client, debug=self.debug)
+        try:
+            api_bal = self.client.get_balance()
+        except Exception as exc:
+            if self.debug:
+                self._event(f"[BALANCE] error: {exc}")
+            api_bal = None
+
         if api_bal is not None:
             self.api_balance = api_bal
             drift = abs(api_bal - self.bankroll)

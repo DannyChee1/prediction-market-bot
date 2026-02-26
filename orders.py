@@ -7,9 +7,6 @@ import time as _time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
-
 from backtest import Snapshot, Decision, Fill, TradeResult, poly_fee
 
 if TYPE_CHECKING:
@@ -333,16 +330,9 @@ class OrderMixin:
             })
             return
 
-        # Place GTC limit order
+        # Place GTC limit order via Rust OrderClient (single call: sign + HTTP/2 POST)
         try:
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=limit_price,
-                size=shares,
-                side=BUY,
-            )
-            signed_order = self.client.create_order(order_args)
-            resp = self.client.post_order(signed_order, OrderType.GTC, post_only=True)
+            resp = self.client.place_order(token_id, limit_price, shares, "BUY", "GTC", 1000)
         except Exception as exc:
             trade_record["status"] = "error"
             trade_record["error"] = str(exc)
@@ -669,15 +659,9 @@ class OrderMixin:
             self._record_exit_result(fill, proceeds, exit_pnl)
             return True
 
-        # Live: place FOK market sell
+        # Live: place FOK market sell via Rust OrderClient
         try:
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=shares,
-                side=SELL,
-            )
-            signed_order = self.client.create_market_order(order_args)
-            resp = self.client.post_order(signed_order, OrderType.FOK)
+            resp = self.client.place_market_order(token_id, shares, "SELL", 1000)
         except Exception as exc:
             self._event(f"[EXIT ERROR] {fill['side']}: {exc}")
             self._log({

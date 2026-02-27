@@ -364,8 +364,8 @@ class OrderMixin:
         # Check if the order was immediately filled
         taking = resp.get("takingAmount", "")
         making = resp.get("makingAmount", "")
-        if status == "MATCHED" and taking:
-            filled_shares = float(taking)
+        filled_shares = float(taking) if taking else 0.0
+        if status == "MATCHED" and filled_shares > 0:
             actual_cost = float(making) if making else filled_shares * limit_price
             self.bankroll -= actual_cost
             self.signal.bankroll = self.bankroll
@@ -609,6 +609,8 @@ class OrderMixin:
         """Cancel all open orders — called on shutdown."""
         if self.open_orders:
             self._cancel_open_orders()
+        if self.open_sell_orders:
+            self._cancel_open_sell_orders()
         if self.dry_run:
             return
         try:
@@ -616,6 +618,306 @@ class OrderMixin:
             self._event(f"Cancelled all open orders: {resp}")
         except Exception as exc:
             self._event(f"Warning: cancel_all failed: {exc}")
+
+    # ── Maker sell order lifecycle ────────────────────────────────────────
+
+    def _get_open_sell_order(self: "LiveTradeTracker", side: str) -> dict | None:
+        """Return the open sell order dict for a given side, or None."""
+        for o in self.open_sell_orders:
+            if o.get("side") == side:
+                return o
+        return None
+
+    def _place_limit_sell(
+        self: "LiveTradeTracker",
+        fill: dict,
+        snapshot: "Snapshot",
+        token_id: str,
+        side: str,
+        sell_price: float,
+    ):
+        """Place a GTC limit SELL order for an existing position."""
+        shares = fill["shares"]
+        entry_price = fill["cost_usd"] / shares if shares > 0 else 0
+        now_iso = datetime.now(timezone.utc).isoformat()
+        now_unix = _time.time()
+
+        if self.dry_run:
+            order_id = f"drysell_{side}_{int(now_unix)}"
+            sell_order = {
+                "order_id": order_id,
+                "side": side,
+                "price": sell_price,
+                "shares": shares,
+                "market_slug": fill["market_slug"],
+                "placed_ts": now_iso,
+                "placed_ts_unix": now_unix,
+                "source_fill": fill,
+                "entry_price": entry_price,
+            }
+            self.open_sell_orders.append(sell_order)
+            self._event(
+                f"[SELL] {side} {shares:.1f}sh @ {sell_price:.4f} "
+                f"(entry {entry_price:.4f}) -> resting [DRY]"
+            )
+            self._log({
+                "type": "maker_sell_placed",
+                "ts": now_iso,
+                "side": side,
+                "price": sell_price,
+                "shares": round(shares, 2),
+                "entry_price": round(entry_price, 4),
+                "order_id": order_id,
+                "dry_run": True,
+            })
+            return
+
+        try:
+            resp = self.client.place_order(
+                token_id, sell_price, shares, "SELL", "GTC", 1000
+            )
+        except Exception as exc:
+            self._event(f"[SELL ERROR] {side}: {exc}")
+            self._log({
+                "type": "maker_sell_placed",
+                "ts": now_iso,
+                "side": side,
+                "price": sell_price,
+                "shares": round(shares, 2),
+                "status": "error",
+                "error": str(exc),
+            })
+            return
+
+        success = resp.get("success", False)
+        order_id = resp.get("orderID") or resp.get("id", "")
+        status = str(resp.get("status", "unknown")).upper()
+
+        if not success:
+            err_msg = resp.get("errorMsg", "")
+            self._event(
+                f"[SELL] {side} {shares:.1f}sh @ {sell_price:.4f} "
+                f"-> REJECTED ({err_msg})"
+            )
+            self._log({
+                "type": "maker_sell_placed",
+                "ts": now_iso,
+                "side": side,
+                "price": sell_price,
+                "shares": round(shares, 2),
+                "status": "rejected",
+                "error": err_msg,
+            })
+            return
+
+        # Check if immediately filled
+        taking = resp.get("takingAmount", "")
+        proceeds = float(taking) if taking else 0.0
+        if status == "MATCHED" and proceeds > 0:
+            self._process_sell_fill(fill, proceeds, sell_price)
+            self._log({
+                "type": "maker_sell_placed",
+                "ts": now_iso,
+                "side": side,
+                "price": sell_price,
+                "shares": round(shares, 2),
+                "order_id": order_id,
+                "status": "immediate_fill",
+                "proceeds": round(proceeds, 2),
+            })
+            return
+
+        sell_order = {
+            "order_id": order_id,
+            "side": side,
+            "price": sell_price,
+            "shares": shares,
+            "market_slug": fill["market_slug"],
+            "placed_ts": now_iso,
+            "placed_ts_unix": now_unix,
+            "source_fill": fill,
+            "entry_price": entry_price,
+        }
+        self.open_sell_orders.append(sell_order)
+        self._event(
+            f"[SELL] {side} {shares:.1f}sh @ {sell_price:.4f} "
+            f"(entry {entry_price:.4f}) -> resting (id={order_id[:12]}...)"
+        )
+        self._log({
+            "type": "maker_sell_placed",
+            "ts": now_iso,
+            "side": side,
+            "price": sell_price,
+            "shares": round(shares, 2),
+            "entry_price": round(entry_price, 4),
+            "order_id": order_id,
+            "status": "resting",
+        })
+
+    def _process_sell_fill(
+        self: "LiveTradeTracker",
+        fill: dict,
+        proceeds: float,
+        sell_price: float,
+    ):
+        """Process a filled sell order: update bankroll, remove position, log."""
+        entry_price = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
+        exit_pnl = proceeds - fill["cost_usd"]
+
+        self.bankroll += proceeds
+        self.signal.bankroll = self.bankroll
+
+        self.pending_fills = [f for f in self.pending_fills if f is not fill]
+        self.exited_sides.add(fill["side"])
+        self.position_count = max(0, self.position_count - 1)
+
+        self._event(
+            f"[SELL FILLED] {fill['side']} {fill['shares']:.1f}sh "
+            f"@ {sell_price:.4f} (entry {entry_price:.4f}) "
+            f"PnL=${exit_pnl:+.2f} (MAKER, 0% fee)"
+        )
+        self._log({
+            "type": "maker_exit",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "market_slug": fill["market_slug"],
+            "side": fill["side"],
+            "shares": round(fill["shares"], 2),
+            "entry_price": round(entry_price, 4),
+            "sell_price": round(sell_price, 4),
+            "proceeds": round(proceeds, 2),
+            "pnl": round(exit_pnl, 2),
+            "bankroll_after": round(self.bankroll, 2),
+        })
+        self._record_exit_result(fill, proceeds, exit_pnl)
+
+    def _poll_open_sell_orders(self: "LiveTradeTracker", snapshot: "Snapshot"):
+        """Check open sell orders for fills or cancellations."""
+        if not self.open_sell_orders:
+            return
+
+        still_open = []
+        for order in self.open_sell_orders:
+            order_id = order["order_id"]
+
+            # Dry-run: simulate sell fill after 10s resting
+            if self.dry_run and order_id.startswith("drysell_"):
+                age = _time.time() - order.get("placed_ts_unix", _time.time())
+                if age >= 10.0:
+                    proceeds = order["shares"] * order["price"]
+                    self._process_sell_fill(order["source_fill"], proceeds, order["price"])
+                    self._log({
+                        "type": "maker_exit",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "order_id": order_id,
+                        "side": order["side"],
+                        "note": "dry_run_sell_fill",
+                    })
+                else:
+                    still_open.append(order)
+                continue
+
+            try:
+                resp = self.client.get_order(order_id)
+            except Exception as exc:
+                if self.debug:
+                    self._event(f"[SELL POLL] error checking {order_id[:12]}...: {exc}")
+                still_open.append(order)
+                continue
+
+            status = str(resp.get("status", "unknown")).upper()
+            size_matched = float(resp.get("size_matched", 0) or 0)
+            original_size = float(
+                resp.get("original_size", order["shares"]) or order["shares"]
+            )
+            fill_pct = size_matched / original_size if original_size > 0 else 0
+
+            if status == "MATCHED" or fill_pct >= 0.99:
+                proceeds = size_matched * order["price"]
+                self._process_sell_fill(order["source_fill"], proceeds, order["price"])
+
+            elif status in ("CANCELLED", "EXPIRED"):
+                self._event(
+                    f"[SELL {status}] {order['side']} "
+                    f"{order['shares']:.1f}sh @ {order['price']:.4f}"
+                )
+                # No bankroll refund needed — sell orders don't reserve bankroll
+
+            else:
+                still_open.append(order)
+
+        self.open_sell_orders = still_open
+
+    def _cancel_single_sell_order(
+        self: "LiveTradeTracker", order: dict, reason: str
+    ) -> bool:
+        """Cancel one sell order. Returns True if cancelled."""
+        order_id = order["order_id"]
+
+        if not self.dry_run:
+            try:
+                self.client.cancel(order_id)
+            except Exception as exc:
+                if self.debug:
+                    self._event(f"[SELL CANCEL] error {order_id[:12]}...: {exc}")
+                return False
+
+            # Check for race-condition fill
+            try:
+                resp = self.client.get_order(order_id)
+                status = str(resp.get("status", "unknown")).upper()
+                size_matched = float(resp.get("size_matched", 0) or 0)
+                original_size = float(
+                    resp.get("original_size", order["shares"]) or order["shares"]
+                )
+                fill_pct = (
+                    size_matched / original_size if original_size > 0 else 0
+                )
+
+                if status == "MATCHED" or fill_pct >= 0.99:
+                    proceeds = size_matched * order["price"]
+                    self.open_sell_orders = [
+                        o for o in self.open_sell_orders
+                        if o["order_id"] != order_id
+                    ]
+                    self._process_sell_fill(
+                        order["source_fill"], proceeds, order["price"]
+                    )
+                    self._event(
+                        f"[SELL CANCEL->FILL] {order['side']} "
+                        f"{size_matched:.1f}sh @ {order['price']:.4f} "
+                        f"— filled before cancel"
+                    )
+                    return False
+            except Exception as verify_exc:
+                if self.debug:
+                    self._event(
+                        f"[SELL CANCEL] verify failed "
+                        f"{order_id[:12]}...: {verify_exc}"
+                    )
+
+        self.open_sell_orders = [
+            o for o in self.open_sell_orders if o["order_id"] != order_id
+        ]
+        self._event(
+            f"[SELL CANCEL] {order['side']} {order['shares']:.1f}sh "
+            f"@ {order['price']:.4f} — {reason}"
+        )
+        self._log({
+            "type": "maker_sell_cancel",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "order_id": order_id,
+            "side": order["side"],
+            "reason": reason,
+        })
+        return True
+
+    def _cancel_open_sell_orders(self: "LiveTradeTracker"):
+        """Cancel all open sell orders (end of window / new window)."""
+        if not self.open_sell_orders:
+            return
+        for order in list(self.open_sell_orders):
+            self._cancel_single_sell_order(order, "end_of_window")
+        self.open_sell_orders = []
 
     # ── Early exit: FOK sell ───────────────────────────────────────────────
 

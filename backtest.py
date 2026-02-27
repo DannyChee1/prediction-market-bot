@@ -50,19 +50,124 @@ def norm_cdf(x: float) -> float:
 
 # ── Calibration table ──────────────────────────────────────────────────────
 
+def _build_ohlc_bars(
+    prices: list[float],
+    timestamps: list[int] | None = None,
+    bar_s: float = 5.0,
+) -> list[tuple[float, float, float, float]]:
+    """Build OHLC micro-bars from tick data, skipping duplicate prices.
+
+    Returns list of (open, high, low, close) tuples.
+    Timestamps are in ms; if None, assumes 1 tick = 1 second.
+    """
+    # Collect actual price changes with timestamps
+    changes: list[tuple[float, int]] = []  # (price, ts_ms)
+    for i, p in enumerate(prices):
+        ts = timestamps[i] if timestamps is not None else i * 1000
+        if p > 0 and (not changes or p != changes[-1][0]):
+            changes.append((p, ts))
+    if len(changes) < 2:
+        return []
+
+    bar_ms = bar_s * 1000.0
+    bars: list[tuple[float, float, float, float]] = []
+    bar_start = changes[0][1]
+    o = h = l = c = changes[0][0]
+
+    for px, ts in changes[1:]:
+        if ts - bar_start >= bar_ms:
+            bars.append((o, h, l, c))
+            o = h = l = c = px
+            bar_start = ts
+        else:
+            h = max(h, px)
+            l = min(l, px)
+            c = px
+
+    # Final partial bar only if it has meaningful content
+    if c != o or h != l:
+        bars.append((o, h, l, c))
+
+    return bars
+
+
+def _yang_zhang_vol(bars: list[tuple[float, float, float, float]], bar_s: float = 5.0) -> float:
+    """Yang-Zhang volatility estimator from OHLC bars.
+
+    Returns per-second volatility (sigma_per_s).
+    Requires at least 3 bars (2 consecutive pairs for overnight returns).
+    """
+    n = len(bars)
+    if n < 3:
+        return 0.0
+
+    # Components across consecutive bars
+    log_oc = []  # open-to-prev-close ("overnight")
+    log_co = []  # close-to-open (intrabar)
+    rs_vals = []  # Rogers-Satchell per bar
+
+    for i in range(1, n):
+        o, h, l, c = bars[i]
+        prev_c = bars[i - 1][3]
+        if prev_c <= 0 or o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            continue
+        if h < l:
+            continue
+
+        log_oc.append(math.log(o / prev_c))
+        log_co.append(math.log(c / o))
+
+        log_ho = math.log(h / o)
+        log_lo = math.log(l / o)
+        log_hc = math.log(h / c)
+        log_lc = math.log(l / c)
+        rs_vals.append(log_ho * log_hc + log_lo * log_lc)
+
+    m = len(log_oc)
+    if m < 2:
+        return 0.0
+
+    # Variances (sample variance with ddof=1 for overnight and close-open)
+    mean_oc = sum(log_oc) / m
+    var_oc = sum((x - mean_oc) ** 2 for x in log_oc) / (m - 1)
+
+    mean_co = sum(log_co) / m
+    var_co = sum((x - mean_co) ** 2 for x in log_co) / (m - 1)
+
+    # Rogers-Satchell: mean (not variance)
+    var_rs = sum(rs_vals) / m
+
+    # Yang-Zhang weighting
+    k = 0.34 / (1.34 + (m + 1) / (m - 1))
+    var_yz = var_oc + k * var_co + (1 - k) * var_rs
+
+    if var_yz <= 0:
+        return 0.0
+
+    # Convert from per-bar to per-second
+    return math.sqrt(var_yz / bar_s)
+
+
 def _compute_vol_deduped(
     prices: list[float],
     timestamps: list[int] | None = None,
 ) -> float:
-    """Realized vol from price series, ignoring stale (duplicate) ticks.
+    """Yang-Zhang realized vol from price series via 5s OHLC micro-bars.
 
     Standalone version of DiffusionSignal._compute_vol for use outside
     the signal class (e.g. build_calibration_table).
 
-    When *timestamps* (ms) are provided, uses real time deltas instead
-    of assuming 1 second per row index.
+    Falls back to simple stdev of time-normalized log returns when fewer
+    than 3 OHLC bars are available.
     """
-    changes: list[tuple[int, float, int]] = []   # (index, price, ts_ms)
+    bars = _build_ohlc_bars(prices, timestamps, bar_s=5.0)
+    if len(bars) >= 3:
+        result = _yang_zhang_vol(bars, bar_s=5.0)
+        if result > 0:
+            return result
+
+    # Fallback: simple stdev (original method)
+    changes: list[tuple[int, float, int]] = []
     for i, p in enumerate(prices):
         ts = timestamps[i] if timestamps is not None else i * 1000
         if p > 0 and (not changes or p != changes[-1][1]):
@@ -72,9 +177,9 @@ def _compute_vol_deduped(
     log_rets = []
     for j in range(1, len(changes)):
         if timestamps is not None:
-            dt = (changes[j][2] - changes[j - 1][2]) / 1000.0   # ms → seconds
+            dt = (changes[j][2] - changes[j - 1][2]) / 1000.0
         else:
-            dt = changes[j][0] - changes[j - 1][0]              # index ≈ seconds
+            dt = changes[j][0] - changes[j - 1][0]
         if dt > 0:
             lr = math.log(changes[j][1] / changes[j - 1][1])
             log_rets.append(lr / math.sqrt(dt))
@@ -511,6 +616,8 @@ class DiffusionSignal(Signal):
         # Oracle lag detection (Binance vs Chainlink discrepancy)
         oracle_lag_threshold: float = 0.002,
         oracle_lag_mult: float = 2.0,
+        # Order book imbalance alpha: shift p_model by obi_weight * OBI
+        obi_weight: float = 0.03,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -556,46 +663,23 @@ class DiffusionSignal(Signal):
         self.vpin_bar_s = vpin_bar_s
         self.oracle_lag_threshold = oracle_lag_threshold
         self.oracle_lag_mult = oracle_lag_mult
+        self.obi_weight = obi_weight
 
     def _compute_vol(
         self,
         prices: list[float],
         timestamps: list[int] | None = None,
     ) -> float:
-        """Realized vol from price series, ignoring stale (duplicate) ticks.
+        """Yang-Zhang realized vol from 5s OHLC micro-bars.
 
-        Chainlink oracle updates irregularly. Between updates the same
-        price is recorded every tick, producing zero-returns that
-        artificially deflate sigma.  We skip consecutive duplicates and
-        normalize each return by sqrt(dt) to get per-second volatility.
+        Constructs OHLC bars from tick data (skipping duplicate prices),
+        then applies the Yang-Zhang estimator which is up to 14x more
+        statistically efficient than simple stdev of returns.
 
-        When *timestamps* (ms) are provided, uses real time deltas
-        instead of assuming 1 second per row index.
+        Falls back to simple stdev when fewer than 3 OHLC bars are
+        available (e.g. during early warmup).
         """
-        # Collect (index, price, ts_ms) for each actual price change
-        changes: list[tuple[int, float, int]] = []
-        for i, p in enumerate(prices):
-            ts = timestamps[i] if timestamps is not None else i * 1000
-            if p > 0 and (not changes or p != changes[-1][1]):
-                changes.append((i, p, ts))
-
-        if len(changes) < 3:
-            return 0.0
-
-        # Time-normalized log returns
-        log_rets = []
-        for j in range(1, len(changes)):
-            if timestamps is not None:
-                dt = (changes[j][2] - changes[j - 1][2]) / 1000.0   # ms → seconds
-            else:
-                dt = changes[j][0] - changes[j - 1][0]              # index ≈ seconds
-            if dt > 0:
-                lr = math.log(changes[j][1] / changes[j - 1][1])
-                log_rets.append(lr / math.sqrt(dt))
-
-        if len(log_rets) < 2:
-            return 0.0
-        return float(np.std(log_rets, ddof=1))
+        return _compute_vol_deduped(prices, timestamps)
 
     def _smoothed_sigma(self, raw_sigma: float, ctx: dict) -> float:
         """Apply EMA smoothing and asset-specific cap to raw sigma."""
@@ -1169,6 +1253,25 @@ class DiffusionSignal(Signal):
         if self.reversion_discount > 0:
             p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
 
+        # Order book imbalance → continuous p_model shift
+        # OBI > 0 means more bid depth (buying pressure) → nudge p_up higher
+        bid_depth_up = sum(sz for _, sz in snapshot.bid_levels_up)
+        ask_depth_up = sum(sz for _, sz in snapshot.ask_levels_up)
+        bid_depth_down = sum(sz for _, sz in snapshot.bid_levels_down)
+        ask_depth_down = sum(sz for _, sz in snapshot.ask_levels_down)
+        total_depth_up = bid_depth_up + ask_depth_up
+        total_depth_down = bid_depth_down + ask_depth_down
+        obi_up = (bid_depth_up - ask_depth_up) / total_depth_up if total_depth_up > 0 else 0.0
+        obi_down = (bid_depth_down - ask_depth_down) / total_depth_down if total_depth_down > 0 else 0.0
+        ctx["_obi_up"] = obi_up
+        ctx["_obi_down"] = obi_down
+
+        if self.obi_weight > 0:
+            # Positive OBI on UP side → buy pressure → p_up higher
+            # Positive OBI on DOWN side → buy pressure → p_down higher (p_up lower)
+            p_model += self.obi_weight * (obi_up - obi_down)
+            p_model = max(0.01, min(0.99, p_model))
+
         # Cost basis: VAMP (volume-weighted mid) or best bid
         if self.vamp_mode == "cost":
             cost_up = vamp_up if vamp_up is not None else bid_up
@@ -1187,14 +1290,18 @@ class DiffusionSignal(Signal):
         ctx["_edge_up"] = edge_up
         ctx["_edge_down"] = edge_down
 
-        # Inventory skew: penalize adding to an existing side
+        # Avellaneda-Stoikov dynamic inventory skew: penalize adding to an
+        # existing side, scaled by tau/window_duration.  Full penalty at window
+        # start, near-zero at expiry (safe to load up when outcome is clearer).
         if self.inventory_skew > 0:
             n_up = ctx.get("inventory_up", 0)
             n_down = ctx.get("inventory_down", 0)
-            edge_up -= self.inventory_skew * n_up
-            edge_up += self.inventory_skew * n_down
-            edge_down -= self.inventory_skew * n_down
-            edge_down += self.inventory_skew * n_up
+            skew = self.inventory_skew * (tau / self.window_duration)
+            ctx["_inventory_skew"] = skew
+            edge_up -= skew * n_up
+            edge_up += skew * n_down
+            edge_down -= skew * n_down
+            edge_down += skew * n_up
 
         # Store expected range in ctx
         move_1sig = sigma_per_s * math.sqrt(tau) * price
@@ -1214,12 +1321,9 @@ class DiffusionSignal(Signal):
         down_bonus_active = False
         down_share = 0.5
         if self.down_edge_bonus > 0:
-            bid_depth_up = sum(sz for _, sz in snapshot.bid_levels_up)
-            ask_depth_up = sum(sz for _, sz in snapshot.ask_levels_up)
-            bid_depth_down = sum(sz for _, sz in snapshot.bid_levels_down)
-            ask_depth_down = sum(sz for _, sz in snapshot.ask_levels_down)
-            total_d = bid_depth_up + ask_depth_up + bid_depth_down + ask_depth_down
-            down_d = bid_depth_down + ask_depth_down
+            # Reuse depths computed for OBI above
+            total_d = total_depth_up + total_depth_down
+            down_d = total_depth_down
             down_share = down_d / total_d if total_d > 0 else 0.5
             # Only apply bonus when book is reasonably balanced (30-70% range)
             if 0.3 <= down_share <= 0.7:

@@ -491,11 +491,26 @@ async fn price_feed_task(
             write
         });
 
-        while let Some(msg) = read.next().await {
+        // Read with timeout — if no message for 30s, assume dead subscription
+        // and reconnect. The server may silently drop the subscription after
+        // ~1 hour without closing the TCP connection.
+        let read_timeout = std::time::Duration::from_secs(30);
+        loop {
+            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break,         // stream ended
+                Err(_) => {
+                    eprintln!("[PriceFeed] no data for 30s, reconnecting");
+                    break;                 // timeout → reconnect
+                }
+            };
             let text = match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
                 Ok(_) => continue,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("[PriceFeed] read error: {e}");
+                    break;
+                }
             };
 
             if text == "PONG" || text.is_empty() {
@@ -539,8 +554,8 @@ async fn price_feed_task(
         }
 
         let _ = hb.await;
-        tokio::time::sleep(std::time::Duration::from_secs(backoff.min(30))).await;
-        backoff = (backoff * 2).min(60);
+        backoff = 2;  // reset backoff on every reconnect attempt
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
@@ -632,11 +647,23 @@ async fn binance_feed_task(
 
         let (_write, mut read) = ws.split();
 
-        while let Some(msg) = read.next().await {
+        let read_timeout = std::time::Duration::from_secs(30);
+        loop {
+            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break,
+                Err(_) => {
+                    eprintln!("[BinanceFeed] no data for 30s, reconnecting");
+                    break;
+                }
+            };
             let text = match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
                 Ok(_) => continue,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("[BinanceFeed] read error: {e}");
+                    break;
+                }
             };
 
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -661,7 +688,7 @@ async fn binance_feed_task(
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(backoff.min(30))).await;
-        backoff = (backoff * 2).min(60);
+        backoff = 2;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }

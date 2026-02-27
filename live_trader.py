@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Live Trading Bot for Polymarket 15-Min Up/Down Markets
+Live Trading Bot for Polymarket Up/Down Markets (multi-timeframe)
 
-Places GTC limit orders via the Polymarket CLOB API using the
-DiffusionSignal from backtest.py. Tracks balance via API and enforces
-circuit breakers.
+Runs both 15m and 5m windows concurrently in a single process, sharing
+one PriceFeed, one BinanceFeed, and one display thread.
 
 Usage:
-    py -3 live_trader.py                          # BTC, $10k bankroll
-    py -3 live_trader.py --market eth              # ETH market
+    py -3 live_trader.py                          # BTC 15m + 5m
+    py -3 live_trader.py --market eth              # ETH 15m + 5m
+    py -3 live_trader.py --market sol              # SOL 15m + 5m
+    py -3 live_trader.py --market xrp              # XRP 15m + 5m
+    py -3 live_trader.py --market btc_5m           # BTC 5m only
     py -3 live_trader.py --bankroll 500            # smaller bankroll
-    py -3 live_trader.py --max-loss-pct 5          # stop at 5% loss
     py -3 live_trader.py --dry-run                 # signal + log, no real orders
     py -3 live_trader.py --debug
 """
@@ -40,12 +41,15 @@ from polybot_core import OrderClient, BookFeed, PriceFeed, BinanceFeed
 from backtest import (
     Decision, DiffusionSignal, build_calibration_table,
 )
-from market_config import MARKET_CONFIGS, DEFAULT_MARKET, get_config
+from market_config import (
+    MARKET_CONFIGS, DEFAULT_MARKET, get_config, get_paired_configs,
+)
 from market_api import (
     find_market, _ensure_list,
 )
 from feeds import snapshot_from_book_feed
 from display import render_display
+from recording import record_sampler
 from tracker import LiveTradeTracker
 from redemption import POLYGON_RPC
 
@@ -61,6 +65,7 @@ async def signal_ticker(
     skip_trading: bool = False,
     trade_state: dict | None = None,
     binance_state: dict | None = None,
+    window_start_price: float | None = None,
 ):
     while not cancel.is_set():
         await asyncio.sleep(1)
@@ -99,7 +104,7 @@ async def signal_ticker(
             snap = snapshot_from_book_feed(
                 book_feed, up_token, down_token,
                 price_state.get("price"),
-                price_state.get("window_start_price"),
+                window_start_price,
                 window_end, market_slug,
             )
             if snap is not None and not skip_trading:
@@ -108,7 +113,6 @@ async def signal_ticker(
                     tracker.ctx["_trade_total_bars"] = trade_state.get("total_bars", 0)
                 await asyncio.to_thread(tracker.evaluate, snap, up_token, down_token)
 
-            await asyncio.to_thread(tracker.check_api_balance)
         except Exception as exc:
             err_msg = f"{type(exc).__name__}: {exc}"
             tracker.ctx["_signal_error"] = err_msg
@@ -119,24 +123,32 @@ async def signal_ticker(
 # ── Display Thread ───────────────────────────────────────────────────────────
 
 def _display_thread_fn(
-    tracker, price_state, flat_state, market_title,
-    window_start, window_end, stop_event: threading.Event, config,
+    price_state: dict,
+    display_sections: list[dict],
+    base_config,
+    dry_run: bool,
+    exit_enabled: bool,
+    stop_event: threading.Event,
 ):
-    """Runs in a daemon thread — completely independent of the asyncio event loop.
+    """Persistent display thread — lives across windows, never killed mid-session.
 
-    Even if the event loop is blocked by synchronous API calls, the display
-    keeps refreshing every second.
+    Reads from display_sections which are updated by each _window_loop.
     """
     while not stop_event.is_set():
         try:
             render_display(
-                tracker, price_state, flat_state,
-                market_title, window_start, window_end, config,
+                price_state,
+                display_sections,
+                base_config,
+                dry_run=dry_run,
+                exit_enabled=exit_enabled,
             )
         except Exception as exc:
-            # Show the error on screen so we can diagnose display crashes
             try:
-                sys.stdout.write(f"\033[2J\033[H\n  [DISPLAY ERROR] {type(exc).__name__}: {exc}\n")
+                sys.stdout.write(
+                    f"\033[2J\033[H\n  [DISPLAY ERROR] "
+                    f"{type(exc).__name__}: {exc}\n"
+                )
                 sys.stdout.flush()
             except Exception:
                 pass
@@ -146,13 +158,19 @@ def _display_thread_fn(
 # ── Rust Feed Polling ────────────────────────────────────────────────────────
 
 async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
-                           tracker: LiveTradeTracker, cancel: asyncio.Event,
-                           debug: bool = False):
-    """Bridge Rust PriceFeed → Python price_state dict."""
+                           trackers: list[LiveTradeTracker],
+                           cancel: asyncio.Event, debug: bool = False,
+                           symbol: str = ""):
+    """Bridge Rust PriceFeed → Python price_state dict (shared across trackers).
+
+    Auto-restarts the Rust WS feed if the price stays stale for >60s
+    (beyond the Rust-side 30s reconnect timeout).
+    """
     last_ts = 0.0
     _stale_warned = False
+    _STALE_RESTART_S = 60.0
     while not cancel.is_set():
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.1)  # fast poll — captures every Chainlink round for accurate start price
         if cancel.is_set():
             break
         try:
@@ -162,15 +180,18 @@ async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
                 last_ts = ts
                 _stale_warned = False
                 price_state["price"] = px
-                tracker.last_price_update_ts = ts
+                for t in trackers:
+                    t.last_price_update_ts = ts
                 ts_ms = int(ts * 1000)
                 price_state["price_history"].append((ts_ms, px))
-                if price_state["window_start_price"] is None:
-                    price_state["window_start_price"] = px
-            elif debug and last_ts > 0 and not _stale_warned:
-                import time as _t
-                age = _t.time() - last_ts
-                if age > 15:
+            elif last_ts > 0:
+                age = _time.time() - last_ts
+                if age > _STALE_RESTART_S and symbol:
+                    print(f"  [PriceFeed] stale for {age:.0f}s — restarting WS")
+                    price_feed = PriceFeed(symbol)
+                    last_ts = 0.0
+                    _stale_warned = False
+                elif debug and age > 15 and not _stale_warned:
                     print(f"  [PriceFeed] WARNING: no update for {age:.0f}s "
                           f"(last_ts={last_ts:.0f}, px={px}, raw_ts={ts})")
                     _stale_warned = True
@@ -179,17 +200,30 @@ async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
 
 
 async def _poll_binance_feed(binance_feed: BinanceFeed, binance_state: dict,
-                             cancel: asyncio.Event):
-    """Bridge Rust BinanceFeed → Python binance_state dict."""
+                             cancel: asyncio.Event, symbol: str = ""):
+    """Bridge Rust BinanceFeed → Python binance_state dict.
+
+    Auto-restarts if no update for >60s.
+    """
+    _last_ts = 0.0
+    _STALE_RESTART_S = 60.0
     while not cancel.is_set():
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
         if cancel.is_set():
             break
         try:
             mid = binance_feed.mid()
-            if mid is not None:
+            ts = binance_feed.last_update_ts()
+            if mid is not None and ts > _last_ts:
+                _last_ts = ts
                 binance_state["mid_price"] = mid
-                binance_state["last_update_ts"] = binance_feed.last_update_ts()
+                binance_state["last_update_ts"] = ts
+            elif _last_ts > 0:
+                age = _time.time() - _last_ts
+                if age > _STALE_RESTART_S and symbol:
+                    print(f"  [BinanceFeed] stale for {age:.0f}s — restarting WS")
+                    binance_feed = BinanceFeed(symbol)
+                    _last_ts = 0.0
         except Exception:
             pass
 
@@ -237,34 +271,59 @@ async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
             pass
 
 
+# ── Bankroll sync ────────────────────────────────────────────────────────────
+
+def _sync_bankroll(all_trackers: list[LiveTradeTracker]):
+    """After a resolution, propagate the current bankroll to all trackers.
+
+    Uses the minimum bankroll across trackers (conservative — accounts for
+    capital committed by other timeframes). Also syncs the signal's bankroll.
+    """
+    if len(all_trackers) <= 1:
+        return
+    # Use the minimum bankroll (most conservative — reflects committed capital)
+    min_bankroll = min(t.bankroll for t in all_trackers)
+    for t in all_trackers:
+        t.bankroll = min_bankroll
+        t.signal.bankroll = min_bankroll
+
+
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
 
-async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
-                     trade_state: dict | None = None,
-                     binance_state: dict | None = None):
-    """Run a single trading window."""
+async def run_window(
+    tracker: LiveTradeTracker, config, price_state: dict,
+    trade_state: dict | None,
+    binance_state: dict | None,
+    section: dict,
+    pending_resolve: asyncio.Task | None = None,
+    record: bool = True,
+) -> tuple[str, float | None, float | None, str] | None:
+    """Run a single trading window. Returns (slug, final_price, start_price,
+    condition_id) for resolution, or None if no market was found."""
+
     # Rebuild calibration table from latest data
     if tracker.cal_data_dir is not None:
         try:
             cal_table = build_calibration_table(tracker.cal_data_dir)
             tracker.signal.calibration_table = cal_table
             n_obs = sum(cal_table.counts.values())
-            print(f"  Calibration table rebuilt: {len(cal_table.table)} cells, "
-                  f"{n_obs} obs")
+            print(f"  [{config.display_name}] Calibration rebuilt: "
+                  f"{len(cal_table.table)} cells, {n_obs} obs")
         except Exception as exc:
-            print(f"  WARNING: calibration rebuild failed: {exc}")
+            print(f"  [{config.display_name}] WARNING: calibration rebuild failed: {exc}")
 
-    print(f"  Searching for active {config.display_name} market...")
+    section["status"] = "searching"
+    section["market_title"] = f"Searching for {config.display_name}..."
+    print(f"  [{config.display_name}] Searching for active market...")
     event, market = await asyncio.to_thread(find_market, config)
 
     if not event or not market:
-        print(f"  No active {config.display_name} market found. Retrying in 30s...")
+        print(f"  [{config.display_name}] No active market found. Retrying in 30s...")
         await asyncio.sleep(30)
-        return
+        return None
 
     outcomes = _ensure_list(market["outcomes"])
     tokens = _ensure_list(market["clobTokenIds"])
-    # Case-insensitive outcome lookup (API may return "Up"/"Down" or "UP"/"DOWN")
     outcomes_lower = [o.lower() for o in outcomes]
     try:
         up_idx = outcomes_lower.index("up")
@@ -286,7 +345,7 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
 
     tracker.condition_id = market.get("conditionId", "")
     if not tracker.condition_id:
-        print("  WARNING: conditionId missing from market data — auto-redeem disabled for this window")
+        print(f"  [{config.display_name}] WARNING: conditionId missing")
 
     book_feed = BookFeed([up_token, down_token])
 
@@ -295,38 +354,48 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
     target = start + timedelta(seconds=5)
     wait_s = (target - now).total_seconds()
     if 0 < wait_s <= 120:
-        print(f"  Waiting {wait_s:.0f}s for start price (until {target.strftime('%H:%M:%S')} UTC)...")
+        section["status"] = "waiting"
+        section["market_title"] = f"Waiting {wait_s:.0f}s for start..."
+        print(f"  [{config.display_name}] Waiting {wait_s:.0f}s for start price...")
         await asyncio.sleep(wait_s)
 
-    # Look up exact Chainlink price at eventStartTime from RTDS buffer
+    # Look up exact Chainlink price at eventStartTime from RTDS buffer.
+    # We want the LAST update at-or-before eventStartTime — that's the
+    # price Polymarket's contract considers active at the start boundary.
     start_ts_ms = int(start.timestamp() * 1000)
     start_price_exact = None
     history = price_state.get("price_history", [])
     best_entry = None
     if history:
-        best_diff = float("inf")
         for ts_ms, px in history:
-            diff = abs(ts_ms - start_ts_ms)
-            if diff < best_diff:
-                best_diff = diff
+            if ts_ms <= start_ts_ms:
                 best_entry = (ts_ms, px)
-        if best_entry and best_diff <= 2000:
+            # history is chronological, so last match is the freshest <= start
+        if best_entry and (start_ts_ms - best_entry[0]) <= 2000:
             start_price_exact = best_entry[1]
 
+    # Per-window start price (NOT shared — each timeframe has its own)
     if start_price_exact is not None:
-        price_state["window_start_price"] = start_price_exact
+        window_start_price = start_price_exact
         offset_ms = best_entry[0] - start_ts_ms
-        print(f"  Start price: ${start_price_exact:,.2f} (Chainlink @ eventStart{offset_ms:+d}ms)")
+        print(f"  [{config.display_name}] Start: ${start_price_exact:,.2f} "
+              f"(Chainlink @ eventStart{offset_ms:+d}ms)")
     else:
-        current_price = price_state.get("price")
-        price_state["window_start_price"] = current_price
-        print(f"  Start price: ${current_price:,.2f} (RTDS fallback — no exact match in buffer)"
-              if current_price else "  Start price: waiting for RTDS...")
+        window_start_price = price_state.get("price")
+        if window_start_price:
+            print(f"  [{config.display_name}] Start: ${window_start_price:,.2f} (RTDS fallback)")
+        else:
+            print(f"  [{config.display_name}] Start: waiting for RTDS...")
 
     flat_state = {
         "up_best_bid": None, "up_best_ask": None,
         "down_best_bid": None, "down_best_ask": None,
     }
+
+    # Wait for any pending resolution from previous window before trading
+    # (bankroll must be settled before we size new orders)
+    if pending_resolve is not None:
+        await pending_resolve
 
     tracker.new_window(end)
 
@@ -337,27 +406,26 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
     if skip_trading:
         tracker.last_decision = Decision(
             "FLAT", 0.0, 0.0,
-            f"WARM-UP: joined {elapsed_since_start:.0f}s into window, feeds warming up"
+            f"WARM-UP: joined {elapsed_since_start:.0f}s into window"
         )
-        print(f"  [WARM-UP] Joined {elapsed_since_start:.0f}s after window start — "
-              f"skipping trading, warming up feeds for next window")
+        print(f"  [{config.display_name}] WARM-UP: joined {elapsed_since_start:.0f}s in — "
+              f"skipping trading")
 
     mode = "DRY RUN" if tracker.dry_run else "LIVE"
-    print(f"  [{mode}] Market: {title}")
-    print(f"  Window:   {start.strftime('%H:%M:%S')} -> {end.strftime('%H:%M:%S')} UTC")
-    print(f"  Bankroll: ${tracker.bankroll:,.2f}  |  Min order: {tracker.min_order_shares:.0f} shares")
+    print(f"  [{config.display_name}] [{mode}] {title}")
+    print(f"  [{config.display_name}] {start.strftime('%H:%M:%S')} -> "
+          f"{end.strftime('%H:%M:%S')} UTC | "
+          f"Bankroll: ${tracker.bankroll:,.2f}")
+
+    # Update display section
+    section["status"] = "trading"
+    section["market_title"] = title
+    section["flat_state"] = flat_state
+    section["window_start"] = start
+    section["window_end"] = end
+    section["window_start_price"] = window_start_price
 
     cancel = asyncio.Event()
-
-    # Display runs in its own thread — never blocked by API calls
-    display_stop = threading.Event()
-    display_thread = threading.Thread(
-        target=_display_thread_fn,
-        args=(tracker, price_state, flat_state,
-              title, start, end, display_stop, config),
-        daemon=True,
-    )
-    display_thread.start()
 
     tasks = [
         asyncio.create_task(
@@ -369,16 +437,32 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
                           end, slug, up_token, down_token, cancel,
                           skip_trading=skip_trading,
                           trade_state=trade_state,
-                          binance_state=binance_state)
+                          binance_state=binance_state,
+                          window_start_price=window_start_price)
         ),
     ]
+
+    if record:
+        rec_meta = {
+            "market_slug": slug,
+            "condition_id": tracker.condition_id,
+            "token_id_up": up_token,
+            "token_id_down": down_token,
+            "window_start_ms": int(start.timestamp() * 1000),
+            "window_end_ms": int(end.timestamp() * 1000),
+        }
+        tasks.append(asyncio.create_task(
+            record_sampler(
+                book_feed, up_token, down_token, rec_meta,
+                price_state, window_start_price,
+                slug, config.data_subdir, cancel,
+            )
+        ))
 
     now = datetime.now(timezone.utc)
     await asyncio.sleep(max(0, (end - now).total_seconds()) + 5)
 
     cancel.set()
-    display_stop.set()
-    display_thread.join(timeout=2)
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -387,25 +471,37 @@ async def run_window(tracker: LiveTradeTracker, config, price_state: dict,
         tracker._log_flat_summary()
         tracker.flat_reason_counts = {}
 
-    if tracker.open_orders:
-        await asyncio.to_thread(tracker._cancel_open_orders)
+    return (slug, price_state.get("price"), window_start_price, tracker.condition_id)
 
+
+async def _resolve_background(
+    tracker: LiveTradeTracker,
+    slug: str,
+    final_price: float | None,
+    start_price: float | None,
+    condition_id: str,
+    all_trackers: list[LiveTradeTracker],
+):
+    """Background resolution: resolve window + process redemption queue + sync bankroll."""
     await asyncio.to_thread(
-        tracker.resolve_window,
-        slug,
-        price_state.get("price"),
-        price_state.get("window_start_price"),
+        tracker.resolve_window, slug, final_price, start_price, condition_id,
     )
+    # Process one queued redemption (includes newly enqueued + retries)
+    await asyncio.to_thread(tracker.process_redemption_queue)
+    _sync_bankroll(all_trackers)
     tracker.save_state()
 
 
-async def run(tracker: LiveTradeTracker, config):
-    price_state: dict = {
-        "price": None,
-        "window_start_price": None,
-        "price_history": collections.deque(maxlen=600),
-    }
-
+async def _window_loop(
+    tracker: LiveTradeTracker,
+    config,
+    price_state: dict,
+    binance_state: dict,
+    section: dict,
+    all_trackers: list[LiveTradeTracker],
+    record: bool = True,
+):
+    """Main loop for one timeframe — runs forever, handles search/trade/resolve."""
     # Trade state persists across windows — VPIN needs 20+ min history
     vpin_bar_s = tracker.signal.vpin_bar_s
     trade_state: dict = {
@@ -415,40 +511,341 @@ async def run(tracker: LiveTradeTracker, config):
         "total_bars": 0,
     }
 
-    # Binance state persists across windows (like price_state)
+    pending_resolve: asyncio.Task | None = None
+
+    while True:
+        result = await run_window(
+            tracker, config, price_state, trade_state,
+            binance_state, section,
+            pending_resolve=pending_resolve,
+            record=record,
+        )
+
+        if result is None:
+            continue  # no market found, run_window already waited 30s
+
+        slug, final_price, start_price, condition_id = result
+
+        # ── Post-window: cancel orders, then resolve in background ──
+        section["status"] = "resolving"
+        section["market_title"] = f"Resolving {config.display_name}..."
+
+        if tracker.open_orders:
+            await asyncio.to_thread(tracker._cancel_open_orders)
+        if tracker.open_sell_orders:
+            await asyncio.to_thread(tracker._cancel_open_sell_orders)
+
+        # Start resolution in background — next run_window will search for
+        # the next market concurrently and await this before trading begins.
+        # condition_id is captured NOW (before next run_window overwrites it).
+        pending_resolve = asyncio.create_task(
+            _resolve_background(
+                tracker, slug, final_price, start_price,
+                condition_id, all_trackers,
+            )
+        )
+
+
+async def run(
+    trackers_and_configs: list[tuple[LiveTradeTracker, str, object]],
+    base_config,
+    dry_run: bool,
+    exit_enabled: bool,
+    debug: bool,
+    record: bool = True,
+):
+    """Run all timeframes concurrently with shared feeds and display.
+
+    trackers_and_configs: [(tracker, config_key, config), ...]
+    """
+    all_trackers = [t for t, _, _ in trackers_and_configs]
+
+    price_state: dict = {
+        "price": None,
+        "price_history": collections.deque(maxlen=600),
+    }
     binance_state: dict = {}
 
-    # Rust feeds — background tokio tasks start immediately
-    price_feed = PriceFeed(config.chainlink_symbol)
-    print(f"  [PriceFeed] started (filtering for {config.chainlink_symbol})")
+    # Shared Rust feeds — one PriceFeed + one BinanceFeed for the asset
+    price_feed = PriceFeed(base_config.chainlink_symbol)
+    print(f"  [PriceFeed] started (filtering for {base_config.chainlink_symbol})")
 
     binance_feed = None
-    if config.binance_symbol:
-        binance_feed = BinanceFeed(config.binance_symbol)
-        print(f"  [BinanceFeed] started ({config.binance_symbol}@bookTicker)")
+    if base_config.binance_symbol:
+        binance_feed = BinanceFeed(base_config.binance_symbol)
+        print(f"  [BinanceFeed] started ({base_config.binance_symbol}@bookTicker)")
 
-    # Polling loops bridge Rust feeds → Python state dicts
+    # Shared polling loops
     feed_cancel = asyncio.Event()
     price_poll = asyncio.create_task(
-        _poll_price_feed(price_feed, price_state, tracker, feed_cancel, debug=tracker.debug)
+        _poll_price_feed(price_feed, price_state, all_trackers, feed_cancel,
+                         debug=debug, symbol=base_config.chainlink_symbol)
     )
     binance_poll = None
     if binance_feed is not None:
         binance_poll = asyncio.create_task(
-            _poll_binance_feed(binance_feed, binance_state, feed_cancel)
+            _poll_binance_feed(binance_feed, binance_state, feed_cancel,
+                               symbol=base_config.binance_symbol)
         )
 
+    # Display sections — one per timeframe, updated by each _window_loop
+    display_sections: list[dict] = []
+    for tracker, config_key, config in trackers_and_configs:
+        section = {
+            "tracker": tracker,
+            "config": config,
+            "flat_state": {
+                "up_best_bid": None, "up_best_ask": None,
+                "down_best_bid": None, "down_best_ask": None,
+            },
+            "window_start": None,
+            "window_end": None,
+            "market_title": "Starting...",
+            "status": "searching",
+        }
+        display_sections.append(section)
+
+    # Persistent display thread — never killed between windows
+    display_stop = threading.Event()
+    display_thread = threading.Thread(
+        target=_display_thread_fn,
+        args=(price_state, display_sections, base_config,
+              dry_run, exit_enabled, display_stop),
+        daemon=True,
+    )
+    display_thread.start()
+
     try:
-        while True:
-            await run_window(tracker, config, price_state, trade_state,
-                             binance_state)
+        # Process any redemption queue items left from a previous session
+        for tracker, _, _ in trackers_and_configs:
+            if len(tracker.redemption_queue) > 0:
+                print(f"  [STARTUP] Processing {len(tracker.redemption_queue)} "
+                      f"queued redemption(s)...")
+                await asyncio.to_thread(tracker.process_redemption_queue)
+
+        # Run all timeframe loops concurrently
+        window_loops = []
+        for i, (tracker, config_key, config) in enumerate(trackers_and_configs):
+            window_loops.append(
+                _window_loop(
+                    tracker, config, price_state, binance_state,
+                    display_sections[i], all_trackers,
+                    record=record,
+                )
+            )
+        await asyncio.gather(*window_loops)
     finally:
+        display_stop.set()
+        display_thread.join(timeout=2)
         feed_cancel.set()
         price_poll.cancel()
         if binance_poll is not None:
             binance_poll.cancel()
             await asyncio.gather(binance_poll, return_exceptions=True)
         await asyncio.gather(price_poll, return_exceptions=True)
+
+
+# ── Tracker Builder ──────────────────────────────────────────────────────────
+
+def _build_tracker(
+    args, config, config_key: str, client, bankroll: float,
+    saved: dict | None,
+) -> LiveTradeTracker:
+    """Build a LiveTradeTracker for one timeframe config."""
+    base_market = config_key.replace("_5m", "")
+    is_5m = "_5m" in config_key
+
+    # Per-market signal overrides
+    signal_kw: dict = {}
+    if base_market == "eth":
+        signal_kw = dict(
+            edge_threshold=0.08,
+            reversion_discount=0.10,
+            momentum_lookback_s=15,
+            momentum_majority=0.7,
+            spread_edge_penalty=0.2,
+        )
+    elif base_market == "sol":
+        signal_kw = dict(
+            edge_threshold=0.08,
+            reversion_discount=0.10,
+            momentum_lookback_s=15,
+            momentum_majority=0.7,
+            spread_edge_penalty=0.2,
+        )
+    elif base_market == "xrp":
+        signal_kw = dict(
+            edge_threshold=0.08,
+            reversion_discount=0.10,
+            momentum_lookback_s=15,
+            momentum_majority=0.7,
+            spread_edge_penalty=0.2,
+        )
+
+    # Maker signal overrides
+    signal_kw["window_duration"] = config.window_duration_s
+    signal_kw["maker_mode"] = True
+    signal_kw["max_bet_fraction"] = 0.02
+    signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", 0.08)
+    signal_kw["momentum_majority"] = 0.0
+    signal_kw["spread_edge_penalty"] = signal_kw.get("spread_edge_penalty", 0.0)
+    cooldown_ms = 30_000
+    stale_timeout = 60.0
+
+    # Calibration
+    if args.calibrated:
+        from backtest import DATA_DIR
+        cal_data_dir = DATA_DIR / config.data_subdir
+        print(f"  [{config.display_name}] Building calibration table...")
+        try:
+            cal_table = build_calibration_table(cal_data_dir, vol_lookback_s=90)
+            n_cells = len(cal_table.table)
+            n_obs = sum(cal_table.counts.values())
+            print(f"  [{config.display_name}] Calibration: {n_cells} cells, {n_obs} obs")
+            signal_kw["calibration_table"] = cal_table
+        except Exception as exc:
+            print(f"  [{config.display_name}] WARNING: calibration failed: {exc}")
+        signal_kw["edge_threshold"] = 0.08
+        signal_kw["early_edge_mult"] = 1.2
+
+    signal_kw["inventory_skew"] = args.inventory_skew
+    signal_kw["maker_warmup_s"] = args.maker_warmup
+    signal_kw["maker_withdraw_s"] = args.maker_withdraw
+    signal_kw["max_sigma"] = config.max_sigma
+    signal_kw["min_sigma"] = config.min_sigma
+    signal_kw["toxicity_threshold"] = args.toxicity_threshold
+    signal_kw["toxicity_edge_mult"] = args.toxicity_edge_mult
+    if args.vol_kill_sigma is not None:
+        signal_kw["vol_kill_sigma"] = args.vol_kill_sigma
+    signal_kw["down_edge_bonus"] = args.down_edge_bonus
+    signal_kw["regime_z_scale"] = args.regime_z_scale
+    signal_kw["vpin_threshold"] = args.vpin_threshold
+    signal_kw["vpin_edge_mult"] = args.vpin_edge_mult
+    signal_kw["vpin_window"] = args.vpin_window
+    signal_kw["vpin_bar_s"] = args.vpin_bar_s
+    signal_kw["oracle_lag_threshold"] = args.oracle_lag_threshold
+    signal_kw["oracle_lag_mult"] = args.oracle_lag_mult
+    signal_kw["obi_weight"] = args.obi_weight
+
+    # Compute sigma_calibration from recorded data when regime-z-scale is on
+    if args.regime_z_scale and args.calibrated:
+        from backtest import DATA_DIR, _compute_vol_deduped
+        cal_data_dir_for_sigma = DATA_DIR / config.data_subdir
+        MAX_CAL_FILES = 200
+        MIN_SIGMA_CAL = 1e-7
+        try:
+            sigmas = []
+            files = sorted(cal_data_dir_for_sigma.glob("*.parquet"))
+            files = files[-MAX_CAL_FILES:]
+            for f in files:
+                df = pd.read_parquet(f)
+                if df.empty:
+                    continue
+                pcol = "chainlink_price" if "chainlink_price" in df.columns else "chainlink_btc"
+                if pcol not in df.columns:
+                    continue
+                prices = df[pcol].tolist()
+                ts_list = df["ts_ms"].tolist() if "ts_ms" in df.columns else None
+                s = _compute_vol_deduped(prices, ts_list)
+                if s > 0:
+                    sigmas.append(s)
+            if sigmas:
+                sigma_cal = max(float(np.median(sigmas)), MIN_SIGMA_CAL)
+                signal_kw["sigma_calibration"] = sigma_cal
+                print(f"  [{config.display_name}] sigma_calibration={sigma_cal:.2e} "
+                      f"(median of {len(sigmas)} windows)")
+            else:
+                print(f"  [{config.display_name}] WARNING: no valid sigma data for regime-z-scale")
+        except Exception as exc:
+            print(f"  [{config.display_name}] WARNING: sigma_calibration failed: {exc}")
+
+    # VAMP
+    if base_market == "btc":
+        signal_kw["vamp_mode"] = "filter"
+    elif base_market == "eth":
+        signal_kw["vamp_mode"] = "filter"
+        signal_kw["vamp_filter_threshold"] = 0.07
+    elif base_market in ("sol", "xrp"):
+        signal_kw["vamp_mode"] = "filter"
+        signal_kw["vamp_filter_threshold"] = 0.07
+
+    # 5m overrides
+    maker_warmup = args.maker_warmup
+    maker_withdraw = args.maker_withdraw
+    max_order_age = args.max_order_age
+    requote_cooldown = args.requote_cooldown
+    exit_min_hold = args.exit_min_hold
+    exit_min_remaining = args.exit_min_remaining
+
+    if is_5m:
+        signal_kw["vol_lookback_s"] = 30
+        signal_kw["edge_threshold"] = 0.10
+        maker_warmup = 30.0
+        maker_withdraw = 20.0
+        if base_market == "eth":
+            signal_kw["edge_threshold"] = 0.10
+            signal_kw["early_edge_mult"] = 1.2
+            signal_kw["reversion_discount"] = 0.10
+        elif base_market in ("sol", "xrp"):
+            signal_kw["edge_threshold"] = 0.10
+            signal_kw["early_edge_mult"] = 1.2
+            signal_kw["reversion_discount"] = 0.10
+        signal_kw["maker_warmup_s"] = maker_warmup
+        signal_kw["maker_withdraw_s"] = maker_withdraw
+        cooldown_ms = 10_000
+        max_order_age = 40.0
+        requote_cooldown = 2.0
+        exit_min_hold = 10.0
+        exit_min_remaining = 20.0
+
+    max_trades = args.max_trades_per_window if args.max_trades_per_window is not None else 6
+
+    # Shared trades log and state file (named after base asset, not timeframe)
+    trades_log = Path(f"live_trades_{base_market}.jsonl")
+    state_file = Path(f"live_state_{base_market}.json")
+
+    signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
+    tracker = LiveTradeTracker(
+        client=client,
+        signal=signal,
+        initial_bankroll=bankroll,
+        latency_ms=args.latency,
+        slippage=args.slippage,
+        cooldown_ms=cooldown_ms,
+        max_loss_pct=args.max_loss_pct,
+        max_trades_per_window=max_trades,
+        stale_price_timeout_s=stale_timeout,
+        window_duration_s=config.window_duration_s,
+        edge_cancel_threshold=args.edge_cancel_threshold,
+        max_order_age_s=max_order_age,
+        requote_cooldown_s=requote_cooldown,
+        max_exposure_pct=args.max_exposure_pct,
+        maker_warmup_s=maker_warmup,
+        maker_withdraw_s=maker_withdraw,
+        exit_enabled=args.early_exit,
+        exit_threshold=args.exit_threshold,
+        exit_min_hold_s=exit_min_hold,
+        exit_min_remaining_s=exit_min_remaining,
+        max_positions=args.max_positions,
+        exit_sell_buffer=args.exit_sell_buffer,
+        debug=args.debug,
+        dry_run=args.dry_run,
+        trades_log=trades_log,
+        state_file=state_file,
+    )
+    if args.calibrated:
+        from backtest import DATA_DIR
+        tracker.cal_data_dir = DATA_DIR / config.data_subdir
+
+    if saved:
+        tracker.windows_seen = saved.get("windows_seen", 0)
+        tracker.windows_traded = saved.get("windows_traded", 0)
+        tracker.total_fees = saved.get("total_fees", 0.0)
+        tracker.peak_bankroll = saved.get("peak_bankroll", bankroll)
+        tracker.max_drawdown = saved.get("max_drawdown", 0.0)
+        tracker.max_dd_pct = saved.get("max_dd_pct", 0.0)
+
+    return tracker
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -458,8 +855,9 @@ def main():
         description="Live trading bot for Polymarket Up/Down markets"
     )
     parser.add_argument(
-        "--market", default=DEFAULT_MARKET, choices=list(MARKET_CONFIGS),
-        help="Market to trade (default: btc)",
+        "--market", default=DEFAULT_MARKET,
+        choices=list(MARKET_CONFIGS),
+        help="Market to trade — 'btc' runs both 15m+5m (default: btc)",
     )
     parser.add_argument(
         "--bankroll", type=float, default=None,
@@ -479,7 +877,7 @@ def main():
     )
     parser.add_argument(
         "--max-trades-per-window", type=int, default=None,
-        help="Max trades per window (default: 2)",
+        help="Max trades per window (default: 6)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -515,12 +913,14 @@ def main():
                         help="Min seconds after fill before evaluating exit (default: 30)")
     parser.add_argument("--exit-min-remaining", type=float, default=60.0,
                         help="Don't exit when < this many seconds remain (default: 60)")
-    parser.add_argument("--max-positions", type=int, default=4,
-                        help="Max simultaneous filled positions (default: 4)")
+    parser.add_argument("--exit-sell-buffer", type=float, default=0.08,
+                        help="Buffer above model value for sell price floor (default: 0.08)")
+    parser.add_argument("--max-positions", type=int, default=1,
+                        help="Max simultaneous filled positions (default: 1)")
     parser.add_argument("--inventory-skew", type=float, default=0.02,
                         help="Edge penalty per same-side position (default 0.02)")
     parser.add_argument("--maker-withdraw", type=float, default=30.0,
-                        help="Stop new orders when tau < N seconds (default 120)")
+                        help="Stop new orders when tau < N seconds (default 30)")
     parser.add_argument("--toxicity-threshold", type=float, default=0.75,
                         help="Toxicity score above which edge threshold widens (default: 0.75)")
     parser.add_argument("--toxicity-edge-mult", type=float, default=1.5,
@@ -532,7 +932,7 @@ def main():
     parser.add_argument("--regime-z-scale", action="store_true",
                         help="Scale z-scores by sigma_ema / sigma_calibration (requires --calibrated)")
     parser.add_argument("--vpin-threshold", type=float, default=0.95,
-                        help="VPIN above which edge threshold widens (default: 0.75)")
+                        help="VPIN above which edge threshold widens (default: 0.95)")
     parser.add_argument("--vpin-edge-mult", type=float, default=1.5,
                         help="Max edge threshold multiplier at VPIN=1.0 (default: 1.5)")
     parser.add_argument("--vpin-window", type=int, default=20,
@@ -543,17 +943,19 @@ def main():
                         help="Binance-Chainlink discrepancy above which edge widens (default: 0.002)")
     parser.add_argument("--oracle-lag-mult", type=float, default=2.0,
                         help="Max edge threshold multiplier at full oracle lag (default: 2.0)")
+    parser.add_argument("--obi-weight", type=float, default=0.03,
+                        help="Order book imbalance alpha weight on p_model (default: 0.03)")
+    parser.add_argument("--no-record", action="store_true",
+                        help="Disable integrated parquet recording")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    config = get_config(args.market)
-    trades_log = Path(f"live_trades_{config.data_subdir}.jsonl")
-    state_file = Path(f"live_state_{config.data_subdir}.json")
+    # Resolve market -> list of (config_key, config) pairs
+    paired = get_paired_configs(args.market)
+    base_config = paired[0][1]  # use first config for shared settings
+    base_market = args.market.replace("_5m", "")
 
-    # Default max trades — 1 per window to avoid self-hedging
-    max_trades = args.max_trades_per_window if args.max_trades_per_window is not None else 1
-
-    # Build authenticated client
+    # Print header
     print(f"\n  {'='*62}")
     mode = "DRY RUN" if args.dry_run else "LIVE TRADING"
     order_mode = "MAKER"
@@ -561,9 +963,11 @@ def main():
         order_mode += "+CAL"
     if args.early_exit:
         order_mode += "+EXIT"
-    print(f"  {mode} [{order_mode}] -- {config.display_name} Up/Down")
+    timeframes = ", ".join(c.display_name for _, c in paired)
+    print(f"  {mode} [{order_mode}] -- {timeframes}")
     print(f"  {'='*62}")
 
+    # Build authenticated client (shared across all trackers)
     client = OrderClient(
         host="https://clob.polymarket.com",
         private_key=os.getenv("PRIVATE_KEY"),
@@ -587,6 +991,7 @@ def main():
 
     bankroll = args.bankroll
     saved = None
+    state_file = Path(f"live_state_{base_market}.json")
     if args.resume:
         saved = LiveTradeTracker.load_state(state_file)
         if saved:
@@ -602,170 +1007,17 @@ def main():
             bankroll = 10_000.0
             print(f"  WARNING: Could not query balance, using default ${bankroll:,.0f}")
 
-    # Per-market signal overrides
-    signal_kw: dict = {}
-    base_market = args.market.replace("_5m", "")
-    if base_market == "eth":
-        signal_kw = dict(
-            edge_threshold=0.08,
-            reversion_discount=0.10,
-            momentum_lookback_s=15,
-            momentum_majority=0.7,
-            spread_edge_penalty=0.2,
-        )
+    # Build one tracker per timeframe
+    trackers_and_configs: list[tuple[LiveTradeTracker, str, object]] = []
+    for config_key, config in paired:
+        tracker = _build_tracker(args, config, config_key, client, bankroll, saved)
+        trackers_and_configs.append((tracker, config_key, config))
+        print(f"  [{config.display_name}] Tracker ready "
+              f"(edge={tracker.signal.edge_threshold:.2f}, "
+              f"warmup={tracker.maker_warmup_s:.0f}s, "
+              f"withdraw={tracker.maker_withdraw_s:.0f}s)")
 
-    # Maker signal overrides
-    signal_kw["window_duration"] = config.window_duration_s
-    signal_kw["maker_mode"] = True
-    signal_kw["max_bet_fraction"] = 0.02
-    signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", 0.08)
-    signal_kw["momentum_majority"] = 0.0
-    signal_kw["spread_edge_penalty"] = signal_kw.get("spread_edge_penalty", 0.0)
-    cooldown_ms = 30_000
-    stale_timeout = 60.0
-
-    # Calibration
-    cal_table = None
-    if args.calibrated:
-        from backtest import DATA_DIR
-        cal_data_dir = DATA_DIR / config.data_subdir
-        print(f"  Building calibration table from {cal_data_dir} ...")
-        cal_table = build_calibration_table(cal_data_dir, vol_lookback_s=90)
-        n_cells = len(cal_table.table)
-        n_obs = sum(cal_table.counts.values())
-        print(f"  Calibration table: {n_cells} cells, {n_obs} observations")
-        signal_kw["calibration_table"] = cal_table
-        signal_kw["edge_threshold"] = 0.08
-        signal_kw["early_edge_mult"] = 1.2
-
-    signal_kw["inventory_skew"] = args.inventory_skew
-    signal_kw["maker_warmup_s"] = args.maker_warmup
-    signal_kw["maker_withdraw_s"] = args.maker_withdraw
-    signal_kw["max_sigma"] = config.max_sigma
-    signal_kw["min_sigma"] = config.min_sigma
-    signal_kw["toxicity_threshold"] = args.toxicity_threshold
-    signal_kw["toxicity_edge_mult"] = args.toxicity_edge_mult
-    if args.vol_kill_sigma is not None:
-        signal_kw["vol_kill_sigma"] = args.vol_kill_sigma
-    signal_kw["down_edge_bonus"] = args.down_edge_bonus
-    signal_kw["regime_z_scale"] = args.regime_z_scale
-    signal_kw["vpin_threshold"] = args.vpin_threshold
-    signal_kw["vpin_edge_mult"] = args.vpin_edge_mult
-    signal_kw["vpin_window"] = args.vpin_window
-    signal_kw["vpin_bar_s"] = args.vpin_bar_s
-    signal_kw["oracle_lag_threshold"] = args.oracle_lag_threshold
-    signal_kw["oracle_lag_mult"] = args.oracle_lag_mult
-
-    # Compute sigma_calibration from recorded data when regime-z-scale is on
-    if args.regime_z_scale and args.calibrated:
-        from backtest import DATA_DIR, _compute_vol_deduped
-        cal_data_dir_for_sigma = DATA_DIR / config.data_subdir
-        MAX_CAL_FILES = 200      # cap to recent windows to keep startup fast
-        MIN_SIGMA_CAL = 1e-7     # floor to prevent z-scaling explosion in quiet regimes
-        try:
-            sigmas = []
-            files = sorted(cal_data_dir_for_sigma.glob("*.parquet"))
-            files = files[-MAX_CAL_FILES:]  # use most recent N windows
-            for f in files:
-                df = pd.read_parquet(f)
-                if df.empty:
-                    continue
-                pcol = "chainlink_price" if "chainlink_price" in df.columns else "chainlink_btc"
-                if pcol not in df.columns:
-                    continue
-                prices = df[pcol].tolist()
-                ts_list = df["ts_ms"].tolist() if "ts_ms" in df.columns else None
-                s = _compute_vol_deduped(prices, ts_list)
-                if s > 0:
-                    sigmas.append(s)
-            if sigmas:
-                sigma_cal = max(float(np.median(sigmas)), MIN_SIGMA_CAL)
-                signal_kw["sigma_calibration"] = sigma_cal
-                print(f"  Regime-z-scale: sigma_calibration={sigma_cal:.2e} "
-                      f"(median of {len(sigmas)} windows, last {len(files)} files)")
-            else:
-                print("  WARNING: regime-z-scale enabled but no valid sigma data found")
-        except Exception as exc:
-            print(f"  WARNING: sigma_calibration computation failed: {exc}")
-
-    # VAMP: BTC uses cost-based, ETH uses filter-based
-    if base_market == "btc":
-        signal_kw["vamp_mode"] = "filter"
-    elif base_market == "eth":
-        signal_kw["vamp_mode"] = "filter"
-        signal_kw["vamp_filter_threshold"] = 0.07
-
-    # 5m market overrides
-    is_5m = "_5m" in args.market
-    maker_warmup = args.maker_warmup
-    maker_withdraw = args.maker_withdraw
-    max_order_age = args.max_order_age
-    requote_cooldown = args.requote_cooldown
-    exit_min_hold = args.exit_min_hold
-    exit_min_remaining = args.exit_min_remaining
-
-    if is_5m:
-        signal_kw["vol_lookback_s"] = 30  # 90s is too long for 300s windows
-        signal_kw["edge_threshold"] = 0.10  # higher bar for shorter windows
-        if base_market == "btc":
-            maker_warmup = 30.0
-            maker_withdraw = 20.0
-        elif base_market == "eth":
-            maker_warmup = 30.0
-            maker_withdraw = 20.0
-            signal_kw["edge_threshold"] = 0.10
-            signal_kw["early_edge_mult"] = 1.2
-            signal_kw["reversion_discount"] = 0.10
-        signal_kw["maker_warmup_s"] = maker_warmup
-        signal_kw["maker_withdraw_s"] = maker_withdraw
-        cooldown_ms = 10_000
-        max_order_age = 40.0
-        requote_cooldown = 2.0
-        exit_min_hold = 10.0
-        exit_min_remaining = 20.0
-
-    signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
-    tracker = LiveTradeTracker(
-        client=client,
-        signal=signal,
-        initial_bankroll=bankroll,
-        latency_ms=args.latency,
-        slippage=args.slippage,
-        cooldown_ms=cooldown_ms,
-        max_loss_pct=args.max_loss_pct,
-        max_trades_per_window=max_trades,
-        stale_price_timeout_s=stale_timeout,
-        window_duration_s=config.window_duration_s,
-        edge_cancel_threshold=args.edge_cancel_threshold,
-        max_order_age_s=max_order_age,
-        requote_cooldown_s=requote_cooldown,
-        max_exposure_pct=args.max_exposure_pct,
-        maker_warmup_s=maker_warmup,
-        maker_withdraw_s=maker_withdraw,
-        exit_enabled=args.early_exit,
-        exit_threshold=args.exit_threshold,
-        exit_min_hold_s=exit_min_hold,
-        exit_min_remaining_s=exit_min_remaining,
-        max_positions=args.max_positions,
-        debug=args.debug,
-        dry_run=args.dry_run,
-        trades_log=trades_log,
-        state_file=state_file,
-    )
-    tracker.api_balance = api_balance
-    if args.calibrated:
-        from backtest import DATA_DIR
-        tracker.cal_data_dir = DATA_DIR / config.data_subdir
-
-    if saved:
-        tracker.windows_seen = saved.get("windows_seen", 0)
-        tracker.windows_traded = saved.get("windows_traded", 0)
-        tracker.total_fees = saved.get("total_fees", 0.0)
-        tracker.peak_bankroll = saved.get("peak_bankroll", bankroll)
-        tracker.max_drawdown = saved.get("max_drawdown", 0.0)
-        tracker.max_dd_pct = saved.get("max_dd_pct", 0.0)
-
-    # Gas balance check for on-chain redemption
+    # Gas balance check (once, shared)
     try:
         w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
         if w3.is_connected():
@@ -776,49 +1028,50 @@ def main():
             print(f"  Signer POL:      {pol_ether:.4f} POL")
             if pol_ether < 0.01:
                 print(f"  WARNING: Low POL balance ({pol_ether:.4f}) — "
-                      f"need gas for CTF redemption txs. Send >= 0.01 POL "
-                      f"to {signer.address}")
+                      f"need gas for CTF redemption txs")
         else:
-            print(f"  WARNING: Cannot connect to Polygon RPC ({POLYGON_RPC}) — "
+            print(f"  WARNING: Cannot connect to Polygon RPC — "
                   f"auto-redemption may fail")
     except Exception as exc:
         print(f"  WARNING: Gas check failed: {exc}")
 
+    # Print shared settings
     print(f"  Bankroll:        ${bankroll:,.2f}")
-    print(f"  Mode:            {order_mode}")
-    print(f"  Window:          {config.window_duration_s:.0f}s ({'5m' if is_5m else '15m'})")
+    print(f"  Timeframes:      {timeframes}")
     print(f"  Max loss:        {args.max_loss_pct}%")
-    print(f"  Max trades/win:  {max_trades}")
     print(f"  Max exposure:    {args.max_exposure_pct}%")
-    print(f"  Maker warmup:    {maker_warmup:.0f}s")
-    print(f"  Maker withdraw:  {maker_withdraw:.0f}s")
-    print(f"  Max order age:   {max_order_age:.0f}s")
     if args.early_exit:
-        print(f"  Early exit:      ON (threshold={args.exit_threshold}, "
-              f"min_hold={exit_min_hold:.0f}s, "
-              f"min_remaining={exit_min_remaining:.0f}s)")
-        print(f"  Max positions:   {args.max_positions}")
-    print(f"  Cooldown:        {cooldown_ms / 1000:.0f}s")
-    print(f"  Stale timeout:   {stale_timeout:.0f}s")
-    print(f"  VPIN:            thresh={args.vpin_threshold} mult={args.vpin_edge_mult} "
-          f"window={args.vpin_window} bar={args.vpin_bar_s:.0f}s")
+        print(f"  Early exit:      ON (threshold={args.exit_threshold})")
+    print(f"  VPIN:            thresh={args.vpin_threshold} mult={args.vpin_edge_mult}")
     print(f"  Oracle lag:      thresh={args.oracle_lag_threshold} mult={args.oracle_lag_mult} "
-          f"binance={config.binance_symbol or 'disabled'}")
-    print(f"  Trades log:      {trades_log}")
+          f"binance={base_config.binance_symbol or 'disabled'}")
+    record = not args.no_record
+    print(f"  Recording:       {'ON' if record else 'OFF'}")
+    print(f"  Trades log:      live_trades_{base_market}.jsonl")
     print(f"  State file:      {state_file}")
     print()
 
+    all_trackers = [t for t, _, _ in trackers_and_configs]
+
     try:
-        asyncio.run(run(tracker, config))
+        asyncio.run(run(
+            trackers_and_configs, base_config,
+            dry_run=args.dry_run,
+            exit_enabled=args.early_exit,
+            debug=args.debug,
+            record=record,
+        ))
     except KeyboardInterrupt:
         print(f"\n  Shutting down...")
-        if tracker.flat_reason_counts:
-            tracker._log_flat_summary()
-        tracker.cancel_all_orders()
-        tracker.save_state()
-        total_pnl = sum(r.pnl for r in tracker.all_results)
+        total_pnl = 0.0
+        for tracker, _, _ in trackers_and_configs:
+            if tracker.flat_reason_counts:
+                tracker._log_flat_summary()
+            tracker.cancel_all_orders()
+            tracker.save_state()
+            total_pnl += sum(r.pnl for r in tracker.all_results)
         print(f"  Session PnL: ${total_pnl:+,.2f}")
-        print(f"  Final bankroll: ${tracker.bankroll:,.2f}")
+        print(f"  Final bankroll: ${all_trackers[0].bankroll:,.2f}")
         print(f"  State saved to {state_file}")
         print("  Exiting.")
 

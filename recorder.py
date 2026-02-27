@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Polymarket Market Recorder
+Polymarket Market Recorder (multi-timeframe)
 
 Captures 1-second snapshots to parquet for backtesting:
   - Full top-5 book depth for Up and Down outcomes
@@ -10,9 +10,10 @@ Captures 1-second snapshots to parquet for backtesting:
 
 Outputs one parquet file per window under ./data/<market>/
 
-Run with native Windows Python (has pyarrow):
-    py -3 recorder.py                  # BTC (default)
-    py -3 recorder.py --market eth     # ETH
+Usage:
+    py -3 recorder.py                  # BTC 15m + 5m
+    py -3 recorder.py --market eth     # ETH 15m + 5m
+    py -3 recorder.py --market btc_5m  # BTC 5m only
     py -3 recorder.py --debug
     py -3 recorder.py --top-n 10       # capture top-10 levels
 """
@@ -34,7 +35,10 @@ import pyarrow.parquet as pq
 import requests
 import websockets
 
-from market_config import MarketConfig, MARKET_CONFIGS, DEFAULT_MARKET, get_config
+from market_config import (
+    MarketConfig, MARKET_CONFIGS, DEFAULT_MARKET,
+    get_config, get_paired_configs,
+)
 
 try:
     import certifi
@@ -97,26 +101,12 @@ class OrderBook:
         return sorted(self.asks.items(), key=lambda x: x[0])[:n]
 
 
-# ── Shared state ─────────────────────────────────────────────────────────────
-book_up = OrderBook()
-book_down = OrderBook()
-chainlink_price: float | None = None
-window_start_price: float | None = None
-price_history: collections.deque = collections.deque(maxlen=600)  # (ts_ms, price)
-
-# Metadata set per window
-meta = {
-    "market_slug": "",
-    "condition_id": "",
-    "token_id_up": "",
-    "token_id_down": "",
-    "window_start_ms": 0,
-    "window_end_ms": 0,
+# ── Shared RTDS price state ─────────────────────────────────────────────────
+# Shared across all timeframes (same asset price feed)
+shared_price: dict = {
+    "chainlink_price": None,
+    "price_history": collections.deque(maxlen=600),
 }
-
-# Trade tick accumulator (flushed into each snapshot row)
-last_trade_up: dict | None = None
-last_trade_down: dict | None = None
 
 
 def _ensure_list(val):
@@ -159,7 +149,12 @@ def find_market(config: MarketConfig):
 
 
 # ── Snapshot builder ─────────────────────────────────────────────────────────
-def build_row() -> dict:
+def build_row(
+    book_up: OrderBook, book_down: OrderBook,
+    meta: dict,
+    last_trade_up: dict | None, last_trade_down: dict | None,
+    window_start_price: float | None,
+) -> dict:
     """Sample current state into a flat dict for one parquet row."""
     now_ms = int(_time.time() * 1000)
     remaining_s = max(0, (meta["window_end_ms"] - now_ms) / 1000)
@@ -173,7 +168,7 @@ def build_row() -> dict:
         "window_start_ms": meta["window_start_ms"],
         "window_end_ms": meta["window_end_ms"],
         "time_remaining_s": round(remaining_s, 3),
-        "chainlink_price": chainlink_price,
+        "chainlink_price": shared_price["chainlink_price"],
         "window_start_price": window_start_price,
     }
 
@@ -226,7 +221,6 @@ def build_row() -> dict:
         )
 
     # Last trade info
-    global last_trade_up, last_trade_down
     for label, lt in [("up", last_trade_up), ("down", last_trade_down)]:
         if lt:
             row[f"last_trade_px_{label}"] = lt.get("price")
@@ -240,9 +234,14 @@ def build_row() -> dict:
     return row
 
 
-# ── CLOB WebSocket ───────────────────────────────────────────────────────────
-async def clob_ws(up_token: str, down_token: str, cancel: asyncio.Event):
-    global last_trade_up, last_trade_down
+# ── CLOB WebSocket (per-window, per-timeframe) ──────────────────────────────
+async def clob_ws(
+    up_token: str, down_token: str,
+    book_up: OrderBook, book_down: OrderBook,
+    trade_state: dict,
+    cancel: asyncio.Event,
+):
+    """CLOB WS for one window — manages its own books and trade ticks."""
     token_map = {up_token: "up", down_token: "down"}
     book_map = {"up": book_up, "down": book_down}
     backoff = 2
@@ -318,10 +317,7 @@ async def clob_ws(up_token: str, down_token: str, cancel: asyncio.Event):
                                     "size": float(msg.get("size", 0)),
                                     "side": msg.get("side"),
                                 }
-                                if side == "up":
-                                    last_trade_up = trade
-                                else:
-                                    last_trade_down = trade
+                                trade_state[f"last_trade_{side}"] = trade
 
                 finally:
                     hb.cancel()
@@ -335,10 +331,9 @@ async def clob_ws(up_token: str, down_token: str, cancel: asyncio.Event):
             backoff = min(backoff * 2, 60)
 
 
-# ── RTDS WebSocket ───────────────────────────────────────────────────────────
+# ── RTDS WebSocket (shared across timeframes) ───────────────────────────────
 async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
-    """Persistent RTDS websocket — runs across windows, buffers (ts_ms, price)."""
-    global chainlink_price
+    """Persistent RTDS websocket — shared across all timeframes."""
     backoff = 2
 
     while not cancel.is_set():
@@ -347,8 +342,6 @@ async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
                 RTDS_WS, ssl=SSL_CTX, ping_interval=None
             ) as ws:
                 backoff = 2
-                # Unfiltered subscription streams continuously;
-                # filtered goes silent after first batch.
                 await ws.send(
                     json.dumps(
                         {
@@ -389,16 +382,16 @@ async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
                         if symbol is None or symbol != config.chainlink_symbol:
                             continue
 
-                        # Initial batch — buffer all entries with timestamps
+                        # Initial batch — buffer all entries
                         data_arr = payload.get("data")
                         if isinstance(data_arr, list) and data_arr:
                             for entry in data_arr:
                                 p = entry.get("value")
                                 ts_ms = entry.get("timestamp")
                                 if p is not None:
-                                    chainlink_price = float(p)
+                                    shared_price["chainlink_price"] = float(p)
                                     if ts_ms is not None:
-                                        price_history.append(
+                                        shared_price["price_history"].append(
                                             (int(ts_ms), float(p))
                                         )
                             continue
@@ -407,9 +400,9 @@ async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
                         price = payload.get("value")
                         ts_ms = payload.get("timestamp")
                         if price is not None:
-                            chainlink_price = float(price)
+                            shared_price["chainlink_price"] = float(price)
                             if ts_ms is not None:
-                                price_history.append(
+                                shared_price["price_history"].append(
                                     (int(ts_ms), float(price))
                                 )
 
@@ -425,16 +418,26 @@ async def rtds_ws(cancel: asyncio.Event, config: MarketConfig):
             backoff = min(backoff * 2, 60)
 
 
-# ── Snapshot sampler ─────────────────────────────────────────────────────────
+# ── Snapshot sampler (per-window) ────────────────────────────────────────────
 async def sampler(
-    rows: list[dict], cancel: asyncio.Event, interval: float = 1.0
+    rows: list[dict],
+    book_up: OrderBook, book_down: OrderBook,
+    meta: dict, trade_state: dict,
+    window_start_price_ref: list,
+    cancel: asyncio.Event,
+    interval: float = 1.0,
 ):
     """Append a snapshot row every `interval` seconds."""
     while not cancel.is_set():
         await asyncio.sleep(interval)
         if cancel.is_set():
             break
-        rows.append(build_row())
+        rows.append(build_row(
+            book_up, book_down, meta,
+            trade_state.get("last_trade_up"),
+            trade_state.get("last_trade_down"),
+            window_start_price_ref[0],
+        ))
 
 
 # ── Parquet flush ────────────────────────────────────────────────────────────
@@ -452,7 +455,7 @@ def flush_parquet(rows: list[dict], slug: str, config: MarketConfig):
             existing = pd.read_parquet(path)
             df = pd.concat([existing, df], ignore_index=True)
         except Exception:
-            pass  # corrupted file, overwrite it
+            pass
 
     # Write to temp then rename for atomic flush
     tmp = path.with_suffix(".parquet.tmp")
@@ -461,23 +464,33 @@ def flush_parquet(rows: list[dict], slug: str, config: MarketConfig):
     return path
 
 
-# ── Window lifecycle ─────────────────────────────────────────────────────────
+# ── Window lifecycle (per-timeframe) ─────────────────────────────────────────
 async def run_window(config: MarketConfig):
-    global chainlink_price, window_start_price
-    global last_trade_up, last_trade_down
+    """Run a single recording window for one timeframe."""
+    label = config.display_name
 
-    print(f"  Searching for active {config.display_name} market...")
+    print(f"  [{label}] Searching for active market...")
     event, market = find_market(config)
 
     if not event or not market:
-        print(f"  No {config.display_name} market found. Retrying in 30s...")
+        print(f"  [{label}] No market found. Retrying in 30s...")
         await asyncio.sleep(30)
         return
 
     outcomes = _ensure_list(market["outcomes"])
     tokens = _ensure_list(market["clobTokenIds"])
-    up_token = tokens[outcomes.index("Up")]
-    down_token = tokens[outcomes.index("Down")]
+    # Case-insensitive outcome lookup
+    outcomes_lower = [o.lower() for o in outcomes]
+    try:
+        up_idx = outcomes_lower.index("up")
+    except ValueError:
+        up_idx = outcomes_lower.index("yes") if "yes" in outcomes_lower else 0
+    try:
+        down_idx = outcomes_lower.index("down")
+    except ValueError:
+        down_idx = outcomes_lower.index("no") if "no" in outcomes_lower else 1
+    up_token = tokens[up_idx]
+    down_token = tokens[down_idx]
 
     end = datetime.fromisoformat(market["endDate"].replace("Z", "+00:00"))
     start = datetime.fromisoformat(
@@ -485,40 +498,36 @@ async def run_window(config: MarketConfig):
     )
     slug = event["slug"]
 
-    # Reset per-window state
-    book_up.__init__()
-    book_down.__init__()
-    window_start_price = None
-    last_trade_up = None
-    last_trade_down = None
+    # Per-window state (not shared)
+    book_up = OrderBook()
+    book_down = OrderBook()
+    trade_state = {"last_trade_up": None, "last_trade_down": None}
 
-    meta.update(
-        {
-            "market_slug": slug,
-            "condition_id": market.get("conditionId", ""),
-            "token_id_up": up_token,
-            "token_id_down": down_token,
-            "window_start_ms": int(start.timestamp() * 1000),
-            "window_end_ms": int(end.timestamp() * 1000),
-        }
-    )
+    meta = {
+        "market_slug": slug,
+        "condition_id": market.get("conditionId", ""),
+        "token_id_up": up_token,
+        "token_id_down": down_token,
+        "window_start_ms": int(start.timestamp() * 1000),
+        "window_end_ms": int(end.timestamp() * 1000),
+    }
 
-    print(f"  Recording: {event['title']}")
-    print(f"  Window:    {start.strftime('%H:%M:%S')} -> {end.strftime('%H:%M:%S')} UTC")
-    print(f"  Slug:      {slug}")
+    print(f"  [{label}] Recording: {event['title']}")
+    print(f"  [{label}] Window: {start.strftime('%H:%M:%S')} -> "
+          f"{end.strftime('%H:%M:%S')} UTC")
 
     # Wait until eventStartTime + 5s so RTDS buffer has the start price
     now = datetime.now(timezone.utc)
     target = start + timedelta(seconds=5)
     wait_s = (target - now).total_seconds()
     if 0 < wait_s <= 120:
-        print(f"  Waiting {wait_s:.0f}s for start price...")
+        print(f"  [{label}] Waiting {wait_s:.0f}s for start price...")
         await asyncio.sleep(wait_s)
 
     # Look up exact Chainlink price at eventStartTime from RTDS buffer
-    # (matches live_trader.py logic — Polymarket's "Price to Beat")
     start_ts_ms = int(start.timestamp() * 1000)
     start_price_exact = None
+    price_history = shared_price["price_history"]
     if price_history:
         best_entry = None
         best_diff = float("inf")
@@ -527,50 +536,58 @@ async def run_window(config: MarketConfig):
             if diff < best_diff:
                 best_diff = diff
                 best_entry = (ts_ms, px)
-        if best_entry and best_diff <= 2000:  # within 2 seconds
+        if best_entry and best_diff <= 2000:
             start_price_exact = best_entry[1]
 
+    # Use a mutable ref so sampler sees updates
+    window_start_price_ref = [None]
     if start_price_exact is not None:
-        window_start_price = start_price_exact
+        window_start_price_ref[0] = start_price_exact
         offset_ms = best_entry[0] - start_ts_ms
-        print(f"  Start price: ${start_price_exact:,.2f} (Chainlink @ eventStart{offset_ms:+d}ms)")
+        print(f"  [{label}] Start: ${start_price_exact:,.2f} "
+              f"(Chainlink @ eventStart{offset_ms:+d}ms)")
     else:
-        window_start_price = chainlink_price
-        if chainlink_price:
-            print(f"  Start price: ${chainlink_price:,.2f} (RTDS fallback)")
+        cp = shared_price["chainlink_price"]
+        window_start_price_ref[0] = cp
+        if cp:
+            print(f"  [{label}] Start: ${cp:,.2f} (RTDS fallback)")
         else:
-            print("  Start price: waiting for RTDS...")
+            print(f"  [{label}] Start: waiting for RTDS...")
 
     rows: list[dict] = []
     cancel = asyncio.Event()
 
-    # RTDS is persistent (started in main), only start CLOB + sampler here
     tasks = [
-        asyncio.create_task(clob_ws(up_token, down_token, cancel)),
-        asyncio.create_task(sampler(rows, cancel)),
+        asyncio.create_task(
+            clob_ws(up_token, down_token, book_up, book_down,
+                    trade_state, cancel)
+        ),
+        asyncio.create_task(
+            sampler(rows, book_up, book_down, meta, trade_state,
+                    window_start_price_ref, cancel)
+        ),
     ]
 
     # Progress printer
     async def progress():
         while not cancel.is_set():
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
             if cancel.is_set():
                 break
-            now = datetime.now(timezone.utc)
-            rem = max(0, (end - now).total_seconds())
+            now_t = datetime.now(timezone.utc)
+            rem = max(0, (end - now_t).total_seconds())
+            cp = shared_price["chainlink_price"]
+            price_str = f"${cp:,.2f}" if cp else "---"
             bb = book_up.best_bid
             ba = book_up.best_ask
-            price_str = f"${chainlink_price:,.2f}" if chainlink_price else "---"
-            book_str = (
-                f"Up {bb:.2f}/{ba:.2f}" if bb and ba else "Up ---/---"
-            )
+            book_str = f"Up {bb:.2f}/{ba:.2f}" if bb and ba else "Up ---/---"
             print(
-                f"  [{now.strftime('%H:%M:%S')}] "
-                f"{len(rows):>5} rows | {rem:>6.1f}s left | "
+                f"  [{label} {now_t.strftime('%H:%M:%S')}] "
+                f"{len(rows):>5} rows | {rem:>5.0f}s left | "
                 f"{price_str} | {book_str}"
             )
 
-    # Periodic flusher — write every 60s so we don't lose data on crash
+    # Periodic flusher
     async def periodic_flush():
         while not cancel.is_set():
             await asyncio.sleep(60)
@@ -592,28 +609,31 @@ async def run_window(config: MarketConfig):
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Final flush
         path = flush_parquet(rows, slug, config)
         if path:
-            print(f"  Saved {len(rows)} rows -> {path}")
+            print(f"  [{label}] Saved {len(rows)} rows -> {path}")
         else:
-            print("  No rows captured.")
+            print(f"  [{label}] No rows captured.")
 
 
-_current_window_task: asyncio.Task | None = None
+async def _window_loop(config: MarketConfig):
+    """Infinite loop recording windows for one timeframe."""
+    while True:
+        await run_window(config)
 
 
-async def main(config: MarketConfig):
-    global _current_window_task
-
-    # Start persistent RTDS websocket (runs across windows)
+async def main(configs: list[MarketConfig]):
+    """Run all timeframe recorders concurrently with shared RTDS."""
+    # Start persistent RTDS websocket (shared across all timeframes)
+    base_config = configs[0]
     rtds_cancel = asyncio.Event()
-    rtds_task = asyncio.create_task(rtds_ws(rtds_cancel, config))
+    rtds_task = asyncio.create_task(rtds_ws(rtds_cancel, base_config))
 
     try:
-        while True:
-            _current_window_task = asyncio.current_task()
-            await run_window(config)
+        # Run all timeframe loops concurrently
+        await asyncio.gather(
+            *[_window_loop(c) for c in configs]
+        )
     finally:
         rtds_cancel.set()
         rtds_task.cancel()
@@ -628,7 +648,7 @@ if __name__ == "__main__":
         "--market",
         default=DEFAULT_MARKET,
         choices=list(MARKET_CONFIGS),
-        help="Market to record (default: btc)",
+        help="Market to record — 'btc' records both 15m+5m (default: btc)",
     )
     parser.add_argument("--debug", action="store_true")
     parser.add_argument(
@@ -641,11 +661,12 @@ if __name__ == "__main__":
     DEBUG = args.debug
     TOP_N = args.top_n
 
-    _config = get_config(args.market)
-    print(f"  Market: {_config.display_name} ({_config.slug_prefix})")
+    paired = get_paired_configs(args.market)
+    configs = [config for _, config in paired]
+    names = ", ".join(c.display_name for c in configs)
+    print(f"  Recording: {names}")
 
     try:
-        asyncio.run(main(_config))
+        asyncio.run(main(configs))
     except KeyboardInterrupt:
-        # run_window's finally block handles the flush
         print("\n  Exiting.")

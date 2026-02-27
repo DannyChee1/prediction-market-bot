@@ -5,8 +5,8 @@ from __future__ import annotations
 import collections
 import json
 import math
-import threading
 import time as _time
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +17,95 @@ from backtest import (
 from market_api import poll_market_resolution
 from orders import OrderMixin
 from redemption import RedemptionMixin
+
+
+# ── Redemption Queue ──────────────────────────────────────────────────────────
+
+@dataclass
+class RedemptionItem:
+    condition_id: str
+    market_slug: str
+    enqueued_at: float      # time.time()
+    attempts: int = 0
+
+
+class RedemptionQueue:
+    """Persistent queue for retrying failed on-chain redemptions."""
+
+    TTL_S = 3600            # discard items older than 1 hour
+    MAX_ATTEMPTS = 5
+    RETRY_INTERVAL_S = 120  # min seconds between retries of the same item
+
+    def __init__(self, queue_file: Path):
+        self._file = queue_file
+        self._items: list[RedemptionItem] = []
+        self._last_process_ts: float = 0.0
+        self._load()
+
+    # ── public API ────────────────────────────────────────────────────
+
+    def enqueue(self, condition_id: str, market_slug: str):
+        """Add a new redemption to the back of the queue."""
+        # Don't double-enqueue the same condition_id
+        if any(it.condition_id == condition_id for it in self._items):
+            return
+        self._items.append(RedemptionItem(
+            condition_id=condition_id,
+            market_slug=market_slug,
+            enqueued_at=_time.time(),
+        ))
+        self._save()
+
+    def pop_next(self) -> RedemptionItem | None:
+        """Return the front item if ready for retry, else None.
+
+        Items are only eligible after RETRY_INTERVAL_S since enqueue/last
+        attempt. Expired or max-attempt items are discarded silently here
+        (caller should use process() which handles logging).
+        """
+        if not self._items:
+            return None
+        return self._items[0]
+
+    def remove_front(self):
+        """Remove the front item (after success or discard)."""
+        if self._items:
+            self._items.pop(0)
+            self._save()
+
+    def requeue_front(self):
+        """Increment attempts on front item and move to back of queue."""
+        if not self._items:
+            return
+        item = self._items.pop(0)
+        item.attempts += 1
+        self._items.append(item)
+        self._save()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    # ── persistence ───────────────────────────────────────────────────
+
+    def _save(self):
+        try:
+            data = [asdict(it) for it in self._items]
+            with open(self._file, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def _load(self):
+        if not self._file.exists():
+            return
+        try:
+            with open(self._file) as f:
+                data = json.load(f)
+            self._items = [
+                RedemptionItem(**d) for d in data
+            ]
+        except Exception:
+            self._items = []
 
 
 class LiveTradeTracker(OrderMixin, RedemptionMixin):
@@ -46,6 +135,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         exit_min_remaining_s: float = 60.0,
         max_positions: int = 4,
         maker_withdraw_s: float = 60.0,
+        exit_sell_buffer: float = 0.08,
         # Instance-level settings (formerly globals)
         debug: bool = False,
         dry_run: bool = False,
@@ -107,12 +197,12 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.max_drawdown: float = 0.0
         self.max_dd_pct: float = 0.0
 
-        # API balance tracking
-        self.api_balance: float | None = None
-        self.last_balance_check_ts: float = 0.0
-
         # On-chain redemption
         self.condition_id: str = ""
+        queue_file = self.state_file.parent / self.state_file.name.replace(
+            "live_state_", "live_redemption_queue_"
+        )
+        self.redemption_queue = RedemptionQueue(queue_file)
 
         # Early exit / position management
         self.exit_enabled = exit_enabled
@@ -122,6 +212,12 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.max_positions = max_positions
         self.position_count: int = 0
         self.exited_sides: set[str] = set()
+
+        # Maker sell order state
+        self.open_sell_orders: list[dict] = []
+        self.exit_sell_buffer = exit_sell_buffer
+        self.exit_sell_requote_cooldown_s: float = 3.0
+        self.last_exit_requote_ts: dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
 
         # Signal diagnostics
         self.flat_reason_counts: dict[str, int] = {}
@@ -133,6 +229,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             self._log_flat_summary()
         if self.open_orders:
             self._cancel_open_orders()
+        if self.open_sell_orders:
+            self._cancel_open_sell_orders()
         if self.pending_fills:
             for fill in self.pending_fills:
                 print(
@@ -158,6 +256,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.window_trade_count = 0
         self.position_count = 0
         self.exited_sides = set()
+        self.open_sell_orders = []
+        self.last_exit_requote_ts = {"UP": 0.0, "DOWN": 0.0}
         self.flat_reason_counts = {}
         self.signal_eval_count = 0
         self.last_diag_ts = 0.0
@@ -252,6 +352,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         if tau < self.maker_withdraw_s:
             if self.open_orders:
                 self._cancel_open_orders()
+            if self.open_sell_orders:
+                self._cancel_open_sell_orders()
             reason = f"maker end-of-window ({tau:.0f}s < {self.maker_withdraw_s:.0f}s)"
             self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
             self._bucket_flat_reason(reason)
@@ -385,16 +487,22 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
     # ── Early exit evaluation ──────────────────────────────────────────────
 
     def _evaluate_exits(self, snapshot: Snapshot, up_token: str, down_token: str):
-        """Evaluate filled positions for early exit based on EV comparison."""
+        """Always-on maker limit sell orders for filled positions.
+
+        After min hold time, always have a resting GTC limit sell on the book.
+        Sell price = max(best_bid, p_model_side + buffer). Continuously requoted
+        as the market moves. If sell_price >= 0.99, let it ride to $1.00.
+        """
         if not self.pending_fills:
             return
 
-        tau = snapshot.time_remaining_s
         now = _time.time()
 
-        if tau < self.exit_min_remaining_s:
-            return
+        # Poll existing sell orders for fills/cancellations
+        self._poll_open_sell_orders(snapshot)
 
+        # Compute model probability
+        tau = snapshot.time_remaining_s
         hist = self.ctx.get("price_history", [])
         ts_hist = self.ctx.get("ts_history", [])
         if len(hist) < max(2, self.signal.vol_lookback_s):
@@ -419,7 +527,6 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "DOWN": snapshot.best_bid_down,
         }
 
-        exits_to_process = []
         for fill in self.pending_fills:
             side = fill["side"]
 
@@ -434,25 +541,39 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             if best_bid is None or best_bid <= 0:
                 continue
 
-            entry_price = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
-            ev_hold = p_model if side == "UP" else (1.0 - p_model)
-            ev_sell = best_bid
+            # Sell price = max(best_bid, p_model_side + buffer)
+            p_model_side = p_model if side == "UP" else (1.0 - p_model)
+            floor_price = p_model_side + self.exit_sell_buffer
+            sell_price = max(best_bid, floor_price)
 
-            hard_stop = best_bid < entry_price * 0.50
-            ev_edge = ev_sell - ev_hold
-            should_exit = hard_stop or ev_edge > self.exit_threshold
+            # Near certainty — let it ride to $1.00
+            if sell_price >= 0.99:
+                # Cancel existing sell if any — we're letting it ride
+                existing = self._get_open_sell_order(side)
+                if existing is not None:
+                    self._cancel_single_sell_order(existing, "near_certainty_0.99")
+                continue
 
-            if should_exit:
-                token_id = token_map.get(side, "")
-                reason = "hard_stop" if hard_stop else "ev_edge"
-                exits_to_process.append((fill, token_id, best_bid, ev_hold, ev_sell, reason))
+            # Clamp to valid range
+            sell_price = round(min(sell_price, 0.99), 2)
+            if sell_price <= 0:
+                continue
 
-        for fill, token_id, sell_price, ev_hold, ev_sell, reason in exits_to_process:
-            success = self._execute_exit(fill, snapshot, token_id, sell_price, ev_hold, ev_sell, reason)
-            if success:
-                self.exited_sides.add(fill["side"])
-                self.pending_fills = [f for f in self.pending_fills if f is not fill]
-                self.position_count = max(0, self.position_count - 1)
+            token_id = token_map.get(side, "")
+            existing = self._get_open_sell_order(side)
+
+            if existing is None:
+                # No existing sell → place new one
+                self._place_limit_sell(fill, snapshot, token_id, side, sell_price)
+            elif abs(existing["price"] - sell_price) >= 0.01:
+                # Price changed → requote (with cooldown)
+                if now - self.last_exit_requote_ts.get(side, 0) >= self.exit_sell_requote_cooldown_s:
+                    old_price = existing["price"]
+                    cancelled = self._cancel_single_sell_order(existing, f"requote_{old_price:.2f}->{sell_price:.2f}")
+                    # If cancel returned False, order filled during cancel race — don't re-sell
+                    if cancelled:
+                        self._place_limit_sell(fill, snapshot, token_id, side, sell_price)
+                    self.last_exit_requote_ts[side] = now
 
     def _record_exit_result(self, fill: dict, proceeds: float, exit_pnl: float):
         """Record an early exit as a TradeResult for session stats."""
@@ -493,8 +614,16 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
     def resolve_window(
         self, slug: str, final_price: float | None,
         window_start_price: float | None,
+        condition_id: str = "",
     ):
-        """At window close: poll for resolution, compute PnL, verify balance."""
+        """At window close: poll for resolution, compute PnL, redeem.
+
+        condition_id is passed explicitly (captured at window end) to avoid
+        race conditions when the next window overwrites self.condition_id.
+        """
+        # Use explicit param; fall back to self.condition_id for backwards compat
+        cond_id = condition_id or self.condition_id
+
         if not self.pending_fills:
             print("  [RESOLVE] No pending fills — skipping resolution")
             return
@@ -505,7 +634,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         )
         print(f"\n  Polling Gamma API for market resolution...")
         print(f"  [RESOLVE] {len(self.pending_fills)} fills: {fill_summary}")
-        print(f"  [RESOLVE] conditionId: {self.condition_id[:16]}..." if self.condition_id else "  [RESOLVE] conditionId: MISSING")
+        print(f"  [RESOLVE] conditionId: {cond_id[:16]}..." if cond_id else "  [RESOLVE] conditionId: MISSING")
 
         outcome_up = poll_market_resolution(slug, debug=self.debug)
 
@@ -583,40 +712,25 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 "bankroll_after": round(self.bankroll, 2),
             })
 
-        # Redeem winning CTF positions on-chain (background thread)
+        # Enqueue winning CTF positions for on-chain redemption
         has_winning = any(
             (f["side"] == "UP" and outcome_up == 1) or
             (f["side"] == "DOWN" and outcome_up == 0)
             for f in self.pending_fills
         )
-        print(f"  [RESOLVE] has_winning={has_winning}, condition_id={'yes' if self.condition_id else 'MISSING'}")
-        if has_winning and self.condition_id:
-            cond_id = self.condition_id
+        print(f"  [RESOLVE] has_winning={has_winning}, condition_id={'yes' if cond_id else 'MISSING'}")
+        if has_winning and cond_id:
             self._log({
-                "type": "redemption_started",
+                "type": "redemption_enqueued",
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "condition_id": cond_id,
                 "market_slug": slug,
             })
-
-            def _safe_redeem():
-                try:
-                    self.redeem_positions(cond_id)
-                except Exception as exc:
-                    print(f"  [REDEEM] Thread crashed: {type(exc).__name__}: {exc}")
-                    self._log({
-                        "type": "redemption",
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "condition_id": cond_id,
-                        "status": "thread_crash",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    })
-
-            t = threading.Thread(target=_safe_redeem, daemon=True)
-            t.start()
-            print(f"  [REDEEM] Started background redemption thread "
-                  f"(conditionId: {cond_id[:10]}...)")
-        elif has_winning and not self.condition_id:
+            self.redemption_queue.enqueue(cond_id, slug)
+            print(f"  [REDEEM] Enqueued for redemption "
+                  f"(conditionId: {cond_id[:10]}..., "
+                  f"queue size: {len(self.redemption_queue)})")
+        elif has_winning and not cond_id:
             self._log({
                 "type": "redemption_skipped",
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -644,28 +758,94 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
         self.pending_fills = []
 
-    def check_api_balance(self):
-        """Periodically verify our balance matches the API."""
-        now = _time.time()
-        if now - self.last_balance_check_ts < 30:
+    # ── Redemption Queue Processing ──────────────────────────────────────────
+
+    def process_redemption_queue(self):
+        """Process one item from the redemption queue.
+
+        Called after resolve_window() and at startup. Handles TTL expiry,
+        max attempts, and retries with reduced poll count (resolution
+        should already be on-chain for retries).
+        """
+        item = self.redemption_queue.pop_next()
+        if item is None:
             return
-        self.last_balance_check_ts = now
+
+        now = _time.time()
+        age = now - item.enqueued_at
+
+        # Expired — discard
+        if age > RedemptionQueue.TTL_S:
+            print(f"  [REDEEM] Expired after {age / 60:.0f}m — discarding "
+                  f"(conditionId: {item.condition_id[:10]}...)")
+            self._log({
+                "type": "redemption_expired",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "condition_id": item.condition_id,
+                "market_slug": item.market_slug,
+                "age_s": round(age),
+                "attempts": item.attempts,
+            })
+            self.redemption_queue.remove_front()
+            return
+
+        # Max attempts — abandon
+        if item.attempts >= RedemptionQueue.MAX_ATTEMPTS:
+            print(f"  [REDEEM] Abandoned after {item.attempts} attempts "
+                  f"(conditionId: {item.condition_id[:10]}...)")
+            self._log({
+                "type": "redemption_abandoned",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "condition_id": item.condition_id,
+                "market_slug": item.market_slug,
+                "attempts": item.attempts,
+            })
+            self.redemption_queue.remove_front()
+            return
+
+        # Respect retry interval (except first attempt)
+        if item.attempts > 0:
+            time_since_enqueue = now - item.enqueued_at
+            min_wait = RedemptionQueue.RETRY_INTERVAL_S * item.attempts
+            if time_since_enqueue < min_wait:
+                return  # not ready yet, try next cycle
+
+        # Attempt redemption — retries use fewer poll attempts since
+        # the on-chain resolution should already exist
+        poll_attempts = 10 if item.attempts > 0 else 60
+        print(f"  [REDEEM] Processing queue item "
+              f"(conditionId: {item.condition_id[:10]}..., "
+              f"attempt #{item.attempts + 1}, "
+              f"queue size: {len(self.redemption_queue)})")
 
         try:
-            api_bal = self.client.get_balance()
+            result = self.redeem_positions(
+                item.condition_id,
+                max_poll_attempts=poll_attempts,
+                poll_interval_s=10.0 if item.attempts > 0 else 30.0,
+            )
         except Exception as exc:
-            if self.debug:
-                self._event(f"[BALANCE] error: {exc}")
-            api_bal = None
+            result = None
+            print(f"  [REDEEM] Queue processing error: "
+                  f"{type(exc).__name__}: {exc}")
+            self._log({
+                "type": "redemption_error",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "condition_id": item.condition_id,
+                "market_slug": item.market_slug,
+                "attempt": item.attempts + 1,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
 
-        if api_bal is not None:
-            self.api_balance = api_bal
-            drift = abs(api_bal - self.bankroll)
-            if drift > 1.0 and len(self.pending_fills) == 0:
-                self._event(
-                    f"[BALANCE DRIFT] API=${api_bal:,.2f} vs "
-                    f"tracked=${self.bankroll:,.2f} (drift=${drift:.2f})"
-                )
+        if result is not None:
+            print(f"  [REDEEM] Queue item redeemed successfully "
+                  f"(conditionId: {item.condition_id[:10]}...)")
+            self.redemption_queue.remove_front()
+        else:
+            self.redemption_queue.requeue_front()
+            print(f"  [REDEEM] Failed, re-enqueued at back "
+                  f"(attempt #{item.attempts}, "
+                  f"queue size: {len(self.redemption_queue)})")
 
     # ── Diagnostics & logging ──────────────────────────────────────────────
 
@@ -780,7 +960,6 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "peak_bankroll": round(self.peak_bankroll, 2),
             "max_drawdown": round(self.max_drawdown, 2),
             "max_dd_pct": round(self.max_dd_pct, 4),
-            "api_balance": round(self.api_balance, 2) if self.api_balance else None,
             "circuit_breaker": self.circuit_breaker_tripped,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }

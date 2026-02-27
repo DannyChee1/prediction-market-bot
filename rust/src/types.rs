@@ -87,10 +87,12 @@ pub fn post_response_to_py(
         dict.set_item("takingAmount", taking.to_string())?;
     }
 
-    // Determine status from response fields (matches CLOB API behavior)
+    // Determine status from response fields (matches CLOB API behavior).
+    // taking_amount can be Some(0) for GTC orders with no immediate match —
+    // only treat as MATCHED if taking_amount is present AND > 0.
     let status = if !resp.success {
         "REJECTED"
-    } else if resp.taking_amount.is_some() {
+    } else if resp.taking_amount.map_or(false, |v| !v.is_zero()) {
         "MATCHED"
     } else {
         "LIVE"

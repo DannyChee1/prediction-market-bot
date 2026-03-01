@@ -48,6 +48,75 @@ def norm_cdf(x: float) -> float:
     return 0.5 * math.erfc(-x / math.sqrt(2.0))
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued-fraction evaluation for regularized incomplete beta."""
+    _MAX_ITER = 64
+    _EPS = 1e-12
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < 1e-30:
+        d = 1e-30
+    d = 1.0 / d
+    h = d
+    for m in range(1, _MAX_ITER + 1):
+        m2 = 2 * m
+        # even step
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = 1.0 + aa / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        h *= d * c
+        # odd step
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = 1.0 + aa / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < _EPS:
+            break
+    return h
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta function I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_prefix = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                  + a * math.log(x) + b * math.log(1.0 - x))
+    prefix = math.exp(log_prefix)
+    # Use symmetry for better convergence
+    if x < (a + 1.0) / (a + b + 2.0):
+        return prefix * _betacf(a, b, x) / a
+    else:
+        return 1.0 - prefix * _betacf(b, a, 1.0 - x) / b
+
+
+def fast_t_cdf(x: float, nu: float) -> float:
+    """Student-t CDF via regularized incomplete beta function (exact)."""
+    if nu > 200:
+        return norm_cdf(x)
+    u = nu / (nu + x * x)
+    ib = _betainc(nu / 2.0, 0.5, u)
+    if x >= 0:
+        return 1.0 - 0.5 * ib
+    else:
+        return 0.5 * ib
+
+
 # ── Calibration table ──────────────────────────────────────────────────────
 
 def _build_ohlc_bars(
@@ -235,12 +304,16 @@ def build_calibration_table(
     data_dir: Path,
     max_z: float = 1.0,
     vol_lookback_s: int = 90,
-) -> CalibrationTable:
+    return_sigmas: bool = False,
+) -> CalibrationTable | tuple[CalibrationTable, list[float]]:
     """Build a walk-forward calibration table from all complete parquet windows.
 
     For each window, extracts signals every 30 rows (matching
     analyze_calibration.py), records (z_capped, tau, outcome_up) tuples,
     and builds the lookup from ALL past observations.
+
+    If return_sigmas=True, also returns per-window sigma values (computed
+    during the same file scan) for sigma_calibration rebuild.
     """
     # Load and sort all complete windows
     files = sorted(data_dir.glob("*.parquet"))
@@ -277,6 +350,7 @@ def build_calibration_table(
 
     # Walk-forward: accumulate observations, build table from all past data
     all_obs: list[tuple[float, float, int]] = []  # (z_capped, tau, outcome_up)
+    window_sigmas: list[float] = []  # one per window for sigma_calibration
 
     for df in windows:
         # Determine outcome
@@ -292,6 +366,12 @@ def build_calibration_table(
         # Extract signals every 30 rows after warmup
         prices = df["chainlink_price"].tolist()
         ts_list = df["ts_ms"].tolist()
+
+        # Per-window sigma for sigma_calibration (full window vol)
+        ws = _compute_vol_deduped(prices, ts_list)
+        if ws > 0:
+            window_sigmas.append(ws)
+
         for idx in range(vol_lookback_s, len(df), 30):
             row = df.iloc[idx]
             tau = row["time_remaining_s"]
@@ -322,7 +402,10 @@ def build_calibration_table(
             all_obs.append((z_capped, tau, outcome))
 
     # Build final table from all observations
-    return _build_table_from_obs(all_obs)
+    table = _build_table_from_obs(all_obs)
+    if return_sigmas:
+        return table, window_sigmas
+    return table
 
 
 def _build_table_from_obs(
@@ -571,7 +654,7 @@ class DiffusionSignal(Signal):
         edge_threshold: float = 0.04,
         early_edge_mult: float = 1.2,
         window_duration: float = 900.0,
-        max_bet_fraction: float = 0.0125,
+        max_bet_fraction: float = 0.05,
         min_order_shares: float = 5.0,
         kelly_fraction: float = 0.25,
         slippage: float = 0.0,
@@ -582,7 +665,7 @@ class DiffusionSignal(Signal):
         vol_regime_lookback_s: int = 300,
         vol_regime_mult: float = 3.0,
         max_entry_time_s: float | None = None,
-        reversion_discount: float = 0.07,
+        reversion_discount: float = 0.0,
         momentum_majority: float = 1.0,
         maker_mode: bool = False,
         edge_threshold_step: float = 0.0,
@@ -590,6 +673,7 @@ class DiffusionSignal(Signal):
         maker_warmup_s: float = 100.0,
         min_entry_price: float = 0.10,
         cal_prior_strength: float = 500.0,
+        cal_max_weight: float = 0.40,
         inventory_skew: float = 0.02,
         maker_withdraw_s: float = 60.0,
         sigma_ema_alpha: float = 0.30,
@@ -618,6 +702,24 @@ class DiffusionSignal(Signal):
         oracle_lag_mult: float = 2.0,
         # Order book imbalance alpha: shift p_model by obi_weight * OBI
         obi_weight: float = 0.03,
+        # Chainlink blend: seconds before expiry to start blending
+        # effective price from Binance toward Chainlink for z-score.
+        # At chainlink_blend_s remaining → 100% Binance;
+        # at 0 remaining → 100% Chainlink (matches resolution source).
+        chainlink_blend_s: float = 120.0,
+        # Fat-tail CDF: "student_t" uses kurtosis-estimated nu, "normal" = Gaussian
+        tail_mode: str = "student_t",
+        tail_nu_default: float = 3.0,
+        # Avellaneda-Stoikov unified quoting mode
+        as_mode: bool = False,
+        gamma_inv: float = 0.15,       # risk aversion for inventory penalty
+        gamma_spread: float = 0.75,    # risk aversion for base spread
+        min_edge: float = 0.05,        # floor on required edge
+        tox_spread: float = 0.05,      # additive spread from toxicity
+        vpin_spread: float = 0.05,     # additive spread from VPIN
+        lag_spread: float = 0.08,      # additive spread from oracle lag
+        edge_step: float = 0.01,       # additive spread per fill
+        contract_vol_lookback_s: int = 60,  # lookback for contract mid vol
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -644,6 +746,7 @@ class DiffusionSignal(Signal):
         self.maker_warmup_s = maker_warmup_s
         self.min_entry_price = min_entry_price
         self.cal_prior_strength = cal_prior_strength
+        self.cal_max_weight = cal_max_weight
         self.inventory_skew = inventory_skew
         self.maker_withdraw_s = maker_withdraw_s
         self.sigma_ema_alpha = sigma_ema_alpha
@@ -664,6 +767,18 @@ class DiffusionSignal(Signal):
         self.oracle_lag_threshold = oracle_lag_threshold
         self.oracle_lag_mult = oracle_lag_mult
         self.obi_weight = obi_weight
+        self.chainlink_blend_s = chainlink_blend_s
+        self.tail_mode = tail_mode
+        self.tail_nu_default = tail_nu_default
+        self.as_mode = as_mode
+        self.gamma_inv = gamma_inv
+        self.gamma_spread = gamma_spread
+        self.min_edge = min_edge
+        self.tox_spread = tox_spread
+        self.vpin_spread = vpin_spread
+        self.lag_spread = lag_spread
+        self.edge_step = edge_step
+        self.contract_vol_lookback_s = contract_vol_lookback_s
 
     def _compute_vol(
         self,
@@ -695,6 +810,33 @@ class DiffusionSignal(Signal):
             ema = min(ema, self.max_sigma)
         ema = max(ema, self.min_sigma)
         return ema
+
+    def _smoothed_sigma_p(self, raw: float, ctx: dict) -> float:
+        """EMA smoothing for contract mid vol (separate state from BTC sigma)."""
+        if raw == 0.0:
+            return 0.0
+        ema = ctx.get("_sigma_p_ema")
+        if ema is None:
+            ema = raw
+        else:
+            ema = self.sigma_ema_alpha * raw + (1 - self.sigma_ema_alpha) * ema
+        ctx["_sigma_p_ema"] = ema
+        return ema
+
+    def _contract_sigma_p(self, ctx: dict) -> float:
+        """Realized vol of contract mid price (sigma_p per second).
+
+        Uses the same Yang-Zhang estimator as BTC vol but on the UP
+        contract mid = (best_bid + best_ask) / 2 over a rolling window.
+        """
+        mids = ctx.get("_contract_mids", [])
+        ts = ctx.get("_contract_mid_ts", [])
+        if len(mids) < 10:
+            return 0.0  # insufficient data — min_edge floor covers warmup
+        cutoff = ts[-1] - self.contract_vol_lookback_s * 1000
+        start = next((i for i, t in enumerate(ts) if t >= cutoff), 0)
+        raw = _compute_vol_deduped(mids[start:], ts[start:])
+        return self._smoothed_sigma_p(raw, ctx)
 
     @staticmethod
     def _compute_toxicity(snapshot: "Snapshot", max_spread: float) -> float:
@@ -741,21 +883,21 @@ class DiffusionSignal(Signal):
 
     @staticmethod
     def _compute_vpin(bars, window: int) -> float:
-        """VPIN from trade bars: mean |sell - buy| / total over last W bars.
+        """Volume-weighted VPIN: sum(|sell - buy|) / sum(total) over last W bars.
 
         Returns 0.0 when insufficient bars (graceful warmup).
         """
         if len(bars) < window:
             return 0.0
         recent = list(bars)[-window:]
-        total_sum = 0.0
         imbalance_sum = 0.0
+        volume_sum = 0.0
         for buy_vol, sell_vol in recent:
-            total = buy_vol + sell_vol
-            if total > 0:
-                imbalance_sum += abs(sell_vol - buy_vol) / total
-            # Empty bars (no trades) contribute 0
-        return imbalance_sum / window
+            imbalance_sum += abs(sell_vol - buy_vol)
+            volume_sum += buy_vol + sell_vol
+        if volume_sum <= 0:
+            return 0.0
+        return imbalance_sum / volume_sum
 
     @staticmethod
     def _compute_oracle_lag(chainlink_price: float, binance_mid) -> float:
@@ -768,7 +910,14 @@ class DiffusionSignal(Signal):
             return 0.0
         return abs(binance_mid - chainlink_price) / chainlink_price
 
-    def _p_model(self, z_capped: float, tau: float) -> float:
+    def _model_cdf(self, z: float, ctx: dict) -> float:
+        """CDF dispatch: Student-t (fat-tail) or normal (Gaussian)."""
+        if self.tail_mode == "normal":
+            return norm_cdf(z)
+        nu = ctx.get("_tail_nu", self.tail_nu_default)
+        return fast_t_cdf(z, nu)
+
+    def _p_model(self, z_capped: float, tau: float, ctx: dict | None = None) -> float:
         """Model probability of UP via Bayesian fusion of GBM + calibration.
 
         p = w * p_calibrated + (1 - w) * p_gbm
@@ -777,11 +926,11 @@ class DiffusionSignal(Signal):
         With few observations, leans on GBM prior.
         With many observations, leans on calibration.
         """
-        p_gbm = norm_cdf(z_capped)
+        p_gbm = self._model_cdf(z_capped, ctx) if ctx is not None else norm_cdf(z_capped)
         if self.calibration_table is not None:
             p_cal, n = self.calibration_table.lookup_with_count(z_capped, tau)
             if n > 0:
-                w = n / (n + self.cal_prior_strength)
+                w = min(n / (n + self.cal_prior_strength), self.cal_max_weight)
                 return w * p_cal + (1 - w) * p_gbm
         return p_gbm
 
@@ -879,8 +1028,17 @@ class DiffusionSignal(Signal):
                 f"vol kill switch (sigma={sigma_per_s:.2e} "
                 f"> {self.vol_kill_sigma:.2e})")
 
+        # Near-expiry Chainlink blend (same as decide_both_sides)
+        price = effective_price
+        if (self.chainlink_blend_s > 0
+                and tau < self.chainlink_blend_s
+                and snapshot.chainlink_price
+                and snapshot.chainlink_price > 0):
+            blend_w = 1.0 - (tau / self.chainlink_blend_s)
+            price = (1.0 - blend_w) * effective_price + blend_w * snapshot.chainlink_price
+
         # Model probability (z capped to prevent overconfidence)
-        delta = (effective_price - snapshot.window_start_price) / snapshot.window_start_price
+        delta = (price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
 
         # Regime-scaled z (same as decide_both_sides)
@@ -893,7 +1051,7 @@ class DiffusionSignal(Signal):
         ctx["_regime_z_factor"] = regime_z_factor
 
         z = max(-self.max_z, min(self.max_z, z_raw))
-        p_model = self._p_model(z, tau)
+        p_model = self._p_model(z, tau, ctx)
 
         # Mean-reversion discount: pull p_model toward 0.5
         if self.reversion_discount > 0:
@@ -1094,7 +1252,7 @@ class DiffusionSignal(Signal):
                 _z = _delta / (_raw * math.sqrt(_tau))
                 _z = max(-self.max_z, min(self.max_z, _z))
                 ctx["_p_display"] = norm_cdf(_z)
-                ctx["_p_model_raw"] = self._p_model(_z, _tau)
+                ctx["_p_model_raw"] = self._p_model(_z, _tau, ctx)
                 ctx["_sigma_per_s"] = _raw
 
         # NOTE: maker warmup and end-of-window withdrawal are handled by
@@ -1128,6 +1286,14 @@ class DiffusionSignal(Signal):
                       f"max={self.max_spread})")
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
+
+        # Track contract mid prices for A-S realized vol (sigma_p)
+        if self.as_mode:
+            mid_up = (bid_up + ask_up) / 2.0
+            contract_mids = ctx.setdefault("_contract_mids", [])
+            contract_mid_ts = ctx.setdefault("_contract_mid_ts", [])
+            contract_mids.append(mid_up)
+            contract_mid_ts.append(snapshot.ts_ms)
 
         # VAMP computation
         vamp_up = compute_vamp(snapshot.bid_levels_up, snapshot.ask_levels_up)
@@ -1190,41 +1356,74 @@ class DiffusionSignal(Signal):
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
-        # Dynamic threshold with optional step for window_trade_count
-        window_trades = ctx.get("window_trade_count", 0)
-        base_threshold = self.edge_threshold + self.edge_threshold_step * window_trades
-        dyn_threshold = base_threshold * (
-            1.0 + self.early_edge_mult * math.sqrt(tau / self.window_duration)
-        )
+        # Rolling kurtosis → Student-t degrees of freedom
+        if self.tail_mode == "student_t" and len(hist) >= 30:
+            _k_n = min(90, len(hist))
+            _k_prices = hist[-_k_n:]
+            _k_rets = [math.log(_k_prices[i] / _k_prices[i - 1])
+                       for i in range(1, len(_k_prices))
+                       if _k_prices[i - 1] > 0 and _k_prices[i] > 0]
+            if len(_k_rets) >= 20:
+                _mean = sum(_k_rets) / len(_k_rets)
+                _var = sum((r - _mean) ** 2 for r in _k_rets) / len(_k_rets)
+                if _var > 0:
+                    _m4 = sum((r - _mean) ** 4 for r in _k_rets) / len(_k_rets)
+                    _excess_kurt = (_m4 / (_var * _var)) - 3.0
+                    if _excess_kurt > 0.2:
+                        ctx["_tail_nu"] = max(self.tail_nu_default, min(30.0, 4.0 + 6.0 / _excess_kurt))
+                    else:
+                        ctx["_tail_nu"] = 30.0  # near-Gaussian
 
-        # Toxicity penalty: widen edge threshold proportionally when
-        # microstructure is adverse.  The multiplier ramps linearly from
-        # 1.0 at toxicity <= threshold to (1 + toxicity_edge_mult) at
-        # toxicity = 1.0, so we still trade in mild conditions but
-        # demand much more edge in toxic ones.
-        if toxicity > self.toxicity_threshold:
-            excess = (toxicity - self.toxicity_threshold) / (1.0 - self.toxicity_threshold)
-            dyn_threshold *= 1.0 + self.toxicity_edge_mult * excess
-
-        # VPIN flow toxicity penalty (before DOWN bonus derivation
-        # so DOWN bonus sees the VPIN-widened threshold)
+        # Microstructure metrics: compute excess values for threshold/spread
         trade_bars = ctx.get("_trade_bars", [])
         vpin = self._compute_vpin(trade_bars, self.vpin_window)
         ctx["_vpin"] = vpin
-        if vpin > self.vpin_threshold:
-            vpin_excess = (vpin - self.vpin_threshold) / (1.0 - self.vpin_threshold)
-            dyn_threshold *= 1.0 + self.vpin_edge_mult * vpin_excess
+        tox_excess = (max(0.0, (toxicity - self.toxicity_threshold)
+                         / (1.0 - self.toxicity_threshold))
+                      if toxicity > self.toxicity_threshold else 0.0)
+        vpin_excess = (max(0.0, (vpin - self.vpin_threshold)
+                          / (1.0 - self.vpin_threshold))
+                       if vpin > self.vpin_threshold else 0.0)
 
-        # Oracle lag penalty: widen threshold when Binance mid diverges from Chainlink
         binance_mid = ctx.get("_binance_mid")
         oracle_lag = self._compute_oracle_lag(snapshot.chainlink_price, binance_mid)
         ctx["_oracle_lag"] = oracle_lag
-        if oracle_lag > self.oracle_lag_threshold:
-            lag_excess = min((oracle_lag - self.oracle_lag_threshold) / self.oracle_lag_threshold, 1.0)
-            dyn_threshold *= 1.0 + self.oracle_lag_mult * lag_excess
+        lag_excess = (min((oracle_lag - self.oracle_lag_threshold)
+                         / self.oracle_lag_threshold, 1.0)
+                      if oracle_lag > self.oracle_lag_threshold else 0.0)
+
+        # Legacy multiplicative threshold (used when as_mode=False)
+        if not self.as_mode:
+            window_trades = ctx.get("window_trade_count", 0)
+            base_threshold = self.edge_threshold + self.edge_threshold_step * window_trades
+            dyn_threshold = base_threshold * (
+                1.0 + self.early_edge_mult * math.sqrt(tau / self.window_duration)
+            )
+            if tox_excess > 0:
+                dyn_threshold *= 1.0 + self.toxicity_edge_mult * tox_excess
+            if vpin_excess > 0:
+                dyn_threshold *= 1.0 + self.vpin_edge_mult * vpin_excess
+            if lag_excess > 0:
+                dyn_threshold *= 1.0 + self.oracle_lag_mult * lag_excess
+        else:
+            dyn_threshold = 0.0  # placeholder, A-S computes opt_spread later
+
+        # Near-expiry Chainlink blend: as tau → 0, Chainlink determines
+        # resolution so we blend the pricing price from Binance toward
+        # Chainlink to avoid betting on a Binance-Chainlink divergence.
+        # Vol estimation keeps using Binance (more accurate tick data).
+        price = effective_price
+        chainlink_blend_w = 0.0
+        if (self.chainlink_blend_s > 0
+                and tau < self.chainlink_blend_s
+                and snapshot.chainlink_price
+                and snapshot.chainlink_price > 0):
+            chainlink_blend_w = 1.0 - (tau / self.chainlink_blend_s)
+            price = ((1.0 - chainlink_blend_w) * effective_price
+                     + chainlink_blend_w * snapshot.chainlink_price)
+        ctx["_chainlink_blend_w"] = chainlink_blend_w
 
         # z normalization: fractional delta / (sigma * sqrt(tau))
-        price = effective_price
         delta = (price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
 
@@ -1242,7 +1441,7 @@ class DiffusionSignal(Signal):
         ctx["_regime_z_factor"] = regime_z_factor
 
         z = max(-self.max_z, min(self.max_z, z_raw))
-        p_model = self._p_model(z, tau)
+        p_model = self._p_model(z, tau, ctx)
 
         # Expose model state so OrderMixin can snapshot it at fill time
         ctx["_p_model_raw"] = p_model
@@ -1284,25 +1483,6 @@ class DiffusionSignal(Signal):
         ctx["_cost_up"] = cost_up
         ctx["_cost_down"] = cost_down
 
-        # Edges — bid pricing already accounts for spread naturally
-        edge_up = p_model - cost_up - self.spread_edge_penalty * spread_up
-        edge_down = (1.0 - p_model) - cost_down - self.spread_edge_penalty * spread_down
-        ctx["_edge_up"] = edge_up
-        ctx["_edge_down"] = edge_down
-
-        # Avellaneda-Stoikov dynamic inventory skew: penalize adding to an
-        # existing side, scaled by tau/window_duration.  Full penalty at window
-        # start, near-zero at expiry (safe to load up when outcome is clearer).
-        if self.inventory_skew > 0:
-            n_up = ctx.get("inventory_up", 0)
-            n_down = ctx.get("inventory_down", 0)
-            skew = self.inventory_skew * (tau / self.window_duration)
-            ctx["_inventory_skew"] = skew
-            edge_up -= skew * n_up
-            edge_up += skew * n_down
-            edge_down -= skew * n_down
-            edge_down += skew * n_up
-
         # Store expected range in ctx
         move_1sig = sigma_per_s * math.sqrt(tau) * price
         ctx["_expected_range"] = {
@@ -1312,44 +1492,115 @@ class DiffusionSignal(Signal):
             "expected_high": snapshot.window_start_price + move_1sig,
         }
 
-        # NO/DOWN bias (optimism tax): YES/UP tends to be overpriced
-        # on prediction markets, so we lower the threshold for DOWN.
-        # Only applies when the book isn't already heavily one-sided
-        # (imbalance < 0.5) to avoid over-concentrating risk when
-        # the market clearly disagrees with our model.
-        dyn_threshold_down = dyn_threshold
+        # DOWN bonus: check book balance for down_edge_bonus
         down_bonus_active = False
         down_share = 0.5
         if self.down_edge_bonus > 0:
-            # Reuse depths computed for OBI above
             total_d = total_depth_up + total_depth_down
             down_d = total_depth_down
             down_share = down_d / total_d if total_d > 0 else 0.5
-            # Only apply bonus when book is reasonably balanced (30-70% range)
             if 0.3 <= down_share <= 0.7:
-                dyn_threshold_down = dyn_threshold * (1.0 - self.down_edge_bonus)
                 down_bonus_active = True
         ctx["_down_bonus_active"] = down_bonus_active
         ctx["_down_share"] = down_share
-        ctx["_dyn_threshold_down"] = dyn_threshold_down
 
-        # Evaluate each side independently
-        up_dec = flat
-        down_dec = flat
+        # ── A-S unified quoting ───────────────────────────────────────
+        if self.as_mode:
+            # Realized contract vol (model-free, from Yang-Zhang on contract mids)
+            sigma_p = self._contract_sigma_p(ctx)
+            sigma_p_sq = sigma_p ** 2
+            # A-S uses total remaining variance = sigma² * tau (NOT tau/T)
+            total_var = sigma_p_sq * tau
+            ctx["_sigma_p"] = sigma_p
 
-        if edge_up > dyn_threshold:
-            up_dec = self._size_decision(
-                "BUY_UP", edge_up, cost_up, p_model,
-                snapshot, sigma_per_s, tau, z, z_raw, p_model,
-                dyn_threshold, spread_up,
-            )
+            # Reservation price: shift belief by inventory risk
+            # Higher total_var → larger penalty (more uncertain contract)
+            n_up = ctx.get("inventory_up", 0)
+            n_down = ctx.get("inventory_down", 0)
+            q_up = n_up - n_down  # net long UP exposure
+            inv_pen = self.gamma_inv * total_var
+            r_up = p_model - inv_pen * q_up
+            r_down = (1.0 - p_model) + inv_pen * q_up
+            ctx["_inventory_skew"] = inv_pen
 
-        if edge_down > dyn_threshold_down:
-            down_dec = self._size_decision(
-                "BUY_DOWN", edge_down, cost_down, 1.0 - p_model,
-                snapshot, sigma_per_s, tau, z, z_raw, p_model,
-                dyn_threshold_down, spread_down,
-            )
+            # Edge from reservation value
+            edge_up = r_up - cost_up - self.spread_edge_penalty * spread_up
+            edge_down = r_down - cost_down - self.spread_edge_penalty * spread_down
+            ctx["_edge_up"] = edge_up
+            ctx["_edge_down"] = edge_down
+
+            # Optimal spread: additive adverse selection components
+            window_trades = ctx.get("window_trade_count", 0)
+            base_spread = max(self.gamma_spread * total_var / 2.0,
+                              self.min_edge)
+            opt_spread = (base_spread
+                          + self.tox_spread * tox_excess
+                          + self.vpin_spread * vpin_excess
+                          + self.lag_spread * lag_excess
+                          + self.edge_step * window_trades)
+            opt_spread_down = (opt_spread * (1.0 - self.down_edge_bonus)
+                               if down_bonus_active else opt_spread)
+
+            dyn_threshold = opt_spread
+            dyn_threshold_down = opt_spread_down
+            ctx["_dyn_threshold_up"] = opt_spread
+            ctx["_dyn_threshold_down"] = opt_spread_down
+
+            # Evaluate each side
+            up_dec = flat
+            down_dec = flat
+
+            if edge_up > opt_spread:
+                up_dec = self._size_decision(
+                    "BUY_UP", edge_up, cost_up, r_up,
+                    snapshot, sigma_per_s, tau, z, z_raw, p_model,
+                    opt_spread, spread_up,
+                )
+            if edge_down > opt_spread_down:
+                down_dec = self._size_decision(
+                    "BUY_DOWN", edge_down, cost_down, r_down,
+                    snapshot, sigma_per_s, tau, z, z_raw, p_model,
+                    opt_spread_down, spread_down,
+                )
+
+        # ── Legacy multiplicative quoting ─────────────────────────────
+        else:
+            edge_up = p_model - cost_up - self.spread_edge_penalty * spread_up
+            edge_down = (1.0 - p_model) - cost_down - self.spread_edge_penalty * spread_down
+            ctx["_edge_up"] = edge_up
+            ctx["_edge_down"] = edge_down
+
+            # Inventory skew (legacy)
+            if self.inventory_skew > 0:
+                n_up = ctx.get("inventory_up", 0)
+                n_down = ctx.get("inventory_down", 0)
+                skew = self.inventory_skew * (tau / self.window_duration)
+                ctx["_inventory_skew"] = skew
+                edge_up -= skew * n_up
+                edge_up += skew * n_down
+                edge_down -= skew * n_down
+                edge_down += skew * n_up
+
+            dyn_threshold_down = dyn_threshold
+            if down_bonus_active:
+                dyn_threshold_down = dyn_threshold * (1.0 - self.down_edge_bonus)
+            ctx["_dyn_threshold_down"] = dyn_threshold_down
+
+            up_dec = flat
+            down_dec = flat
+
+            if edge_up > dyn_threshold:
+                up_dec = self._size_decision(
+                    "BUY_UP", edge_up, cost_up, p_model,
+                    snapshot, sigma_per_s, tau, z, z_raw, p_model,
+                    dyn_threshold, spread_up,
+                )
+            if edge_down > dyn_threshold_down:
+                down_dec = self._size_decision(
+                    "BUY_DOWN", edge_down, cost_down, 1.0 - p_model,
+                    snapshot, sigma_per_s, tau, z, z_raw, p_model,
+                    dyn_threshold_down, spread_down,
+                )
 
         # If neither has edge, report combined reason
         if up_dec.action == "FLAT" and down_dec.action == "FLAT":
@@ -1935,7 +2186,7 @@ def main():
     if args.market == "eth":
         eth_overrides = dict(
             edge_threshold=0.15,        # higher bar (BTC default 0.10)
-            reversion_discount=0.10,    # ETH mean-reverts, discount p toward 0.5
+            reversion_discount=0.10,    # ETH 15m mean-reverts, keep discount
             momentum_lookback_s=15,     # shorter lookback (ETH oscillates more)
             momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
             spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
@@ -1996,7 +2247,7 @@ def main():
             maker_withdraw = 20.0
             five_m_kw["edge_threshold"] = 0.04
             five_m_kw["early_edge_mult"] = 0.4
-            five_m_kw["reversion_discount"] = 0.10
+            # reversion_discount=0.0 (default) — calibration hurts ETH 5m
             eth_engine_kw["max_trades_per_window"] = 2  # fewer trades = higher Sharpe
         print(f"  5m overrides: warmup={maker_warmup:.0f}s, withdraw={maker_withdraw:.0f}s")
 

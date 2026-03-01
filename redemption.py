@@ -112,8 +112,9 @@ class RedemptionMixin:
 
         if not resolved:
             print(f"  [REDEEM] On-chain resolution not found after "
-                  f"{max_poll_attempts * poll_interval_s / 60:.0f}m. "
-                  f"Claim manually on Polymarket.")
+                  f"{max_poll_attempts * poll_interval_s / 60:.0f}m — "
+                  f"will retry later via queue "
+                  f"(conditionId: {condition_id[:16]}...)")
             return None
 
         for attempt in range(max_retries):
@@ -126,8 +127,8 @@ class RedemptionMixin:
             if result is not None:
                 return result
 
-        print(f"  [REDEEM] Failed after {max_retries} tx attempts. "
-              f"Claim manually on Polymarket.")
+        print(f"  [REDEEM] Failed after {max_retries} tx attempt(s) — "
+              f"queue will retry later")
         return None
 
     def _try_redeem_once(self: "LiveTradeTracker", condition_id: str) -> str | None:
@@ -271,9 +272,9 @@ class RedemptionMixin:
 
             print(f"  [REDEEM] Waiting for confirmation...")
 
-            # 7. Poll /transaction until confirmed
+            # 7. Poll /transaction until confirmed (up to ~2 min)
             confirmed = False
-            for poll in range(30):
+            for poll in range(60):
                 _time.sleep(2)
                 poll_headers = self._builder_headers(
                     builder_key, builder_secret, builder_passphrase,
@@ -318,8 +319,8 @@ class RedemptionMixin:
                 })
                 return tx_hash
             else:
-                print(f"  [REDEEM] Relayer tx not confirmed after 60s "
-                      f"(id={tx_id}, hash={tx_hash})")
+                print(f"  [REDEEM] Relayer tx not confirmed after 120s "
+                      f"(id={tx_id}, hash={tx_hash}) — will retry")
                 self._log({
                     "type": "redemption",
                     "ts": datetime.now(timezone.utc).isoformat(),

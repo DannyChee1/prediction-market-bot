@@ -27,14 +27,15 @@ class RedemptionItem:
     market_slug: str
     enqueued_at: float      # time.time()
     attempts: int = 0
+    last_attempt_ts: float = 0.0  # time.time() of last redemption attempt
 
 
 class RedemptionQueue:
     """Persistent queue for retrying failed on-chain redemptions."""
 
-    TTL_S = 3600            # discard items older than 1 hour
-    MAX_ATTEMPTS = 5
-    RETRY_INTERVAL_S = 120  # min seconds between retries of the same item
+    TTL_S = 14400           # discard items older than 4 hours
+    MAX_ATTEMPTS = 10
+    RETRY_INTERVAL_S = 90   # min seconds between retries of the same item
 
     def __init__(self, queue_file: Path):
         self._file = queue_file
@@ -82,6 +83,27 @@ class RedemptionQueue:
         self._items.append(item)
         self._save()
 
+    def remove_by_id(self, condition_id: str):
+        """Remove an item by condition_id."""
+        self._items = [it for it in self._items if it.condition_id != condition_id]
+        self._save()
+
+    def requeue_by_id(self, condition_id: str):
+        """Increment attempts on item and move to back of queue."""
+        for i, it in enumerate(self._items):
+            if it.condition_id == condition_id:
+                item = self._items.pop(i)
+                item.attempts += 1
+                item.last_attempt_ts = _time.time()
+                self._items.append(item)
+                self._save()
+                return
+
+    @property
+    def items(self) -> list:
+        """Read-only snapshot of queue items."""
+        return list(self._items)
+
     def __len__(self) -> int:
         return len(self._items)
 
@@ -127,6 +149,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         edge_cancel_threshold: float = 0.02,
         max_order_age_s: float = 120.0,
         requote_cooldown_s: float = 3.0,
+        min_requote_ticks: int = 2,
+        tick_size: float = 0.01,
         max_exposure_pct: float = 20.0,
         maker_warmup_s: float = 100.0,
         exit_enabled: bool = False,
@@ -173,6 +197,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.edge_cancel_threshold = edge_cancel_threshold
         self.max_order_age_s = max_order_age_s
         self.requote_cooldown_s = requote_cooldown_s
+        self.min_requote_ticks = min_requote_ticks
+        self.tick_size = tick_size
         self.last_requote_ts: dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
 
         self.ctx: dict = {}
@@ -415,8 +441,12 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                             self._place_limit_order(snapshot, dec, token, side_label)
                     continue
 
+                # Queue priority: require minimum tick improvement AND edge increase
+                min_improve = self.min_requote_ticks * self.tick_size
+                edge_at_place = existing.get("edge_at_place", 0.0)
                 if (current_bid is not None
-                        and current_bid > existing["price"]
+                        and current_bid >= existing["price"] + min_improve
+                        and current_edge > edge_at_place
                         and now - self.last_requote_ts.get(side_label, 0) >= self.requote_cooldown_s):
                     old_price = existing["price"]
                     cancelled = self._cancel_single_order(
@@ -501,25 +531,17 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         # Poll existing sell orders for fills/cancellations
         self._poll_open_sell_orders(snapshot)
 
-        # Compute model probability
+        # Reuse sigma already computed by decide_both_sides() this tick
+        # to avoid double-updating the EMA.
         tau = snapshot.time_remaining_s
-        hist = self.ctx.get("price_history", [])
-        ts_hist = self.ctx.get("ts_history", [])
-        if len(hist) < max(2, self.signal.vol_lookback_s):
+        sigma_per_s = self.ctx.get("_sigma_per_s", 0.0)
+        if sigma_per_s <= 0 or tau <= 0:
             return
-
-        raw_sigma = self.signal._compute_vol(
-            hist[-self.signal.vol_lookback_s:],
-            ts_hist[-self.signal.vol_lookback_s:] if ts_hist else None,
-        )
-        if raw_sigma <= 0 or tau <= 0:
-            return
-        sigma_per_s = self.signal._smoothed_sigma(raw_sigma, self.ctx)
 
         delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
         z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
-        p_model = self.signal._p_model(z, tau)
+        p_model = self.signal._p_model(z, tau, self.ctx)
 
         token_map = {"UP": up_token, "DOWN": down_token}
         bid_map = {
@@ -760,92 +782,162 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
     # ── Redemption Queue Processing ──────────────────────────────────────────
 
-    def process_redemption_queue(self):
-        """Process one item from the redemption queue.
+    def process_redemption_queue(self, max_per_cycle: int = 3):
+        """Process ready items from the redemption queue.
 
-        Called after resolve_window() and at startup. Handles TTL expiry,
-        max attempts, and retries with reduced poll count (resolution
-        should already be on-chain for retries).
+        Called periodically by the background redemption loop and at startup.
+        Uses max_retries=1 per item (the queue itself handles retries with
+        backoff), keeping each cycle fast and non-blocking.
         """
-        item = self.redemption_queue.pop_next()
-        if item is None:
+        if not self.redemption_queue:
             return
 
         now = _time.time()
-        age = now - item.enqueued_at
 
-        # Expired — discard
-        if age > RedemptionQueue.TTL_S:
-            print(f"  [REDEEM] Expired after {age / 60:.0f}m — discarding "
-                  f"(conditionId: {item.condition_id[:10]}...)")
-            self._log({
-                "type": "redemption_expired",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "condition_id": item.condition_id,
-                "market_slug": item.market_slug,
-                "age_s": round(age),
-                "attempts": item.attempts,
-            })
-            self.redemption_queue.remove_front()
-            return
+        # ── Pass 1: discard expired / abandoned items ────────────────
+        for item in self.redemption_queue.items:       # snapshot
+            age = now - item.enqueued_at
 
-        # Max attempts — abandon
-        if item.attempts >= RedemptionQueue.MAX_ATTEMPTS:
-            print(f"  [REDEEM] Abandoned after {item.attempts} attempts "
-                  f"(conditionId: {item.condition_id[:10]}...)")
-            self._log({
-                "type": "redemption_abandoned",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "condition_id": item.condition_id,
-                "market_slug": item.market_slug,
-                "attempts": item.attempts,
-            })
-            self.redemption_queue.remove_front()
-            return
+            if age > RedemptionQueue.TTL_S:
+                print(f"  [REDEEM] Expired after {age / 60:.0f}m — discarding "
+                      f"(conditionId: {item.condition_id[:10]}...)")
+                self._log({
+                    "type": "redemption_expired",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "condition_id": item.condition_id,
+                    "market_slug": item.market_slug,
+                    "age_s": round(age),
+                    "attempts": item.attempts,
+                })
+                self.redemption_queue.remove_by_id(item.condition_id)
+                continue
 
-        # Respect retry interval (except first attempt)
-        if item.attempts > 0:
-            time_since_enqueue = now - item.enqueued_at
-            min_wait = RedemptionQueue.RETRY_INTERVAL_S * item.attempts
-            if time_since_enqueue < min_wait:
-                return  # not ready yet, try next cycle
+            if item.attempts >= RedemptionQueue.MAX_ATTEMPTS:
+                print(f"  [REDEEM] Abandoned after {item.attempts} attempts "
+                      f"(conditionId: {item.condition_id[:10]}...)")
+                self._log({
+                    "type": "redemption_abandoned",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "condition_id": item.condition_id,
+                    "market_slug": item.market_slug,
+                    "attempts": item.attempts,
+                })
+                self.redemption_queue.remove_by_id(item.condition_id)
 
-        # Attempt redemption — retries use fewer poll attempts since
-        # the on-chain resolution should already exist
-        poll_attempts = 10 if item.attempts > 0 else 60
-        print(f"  [REDEEM] Processing queue item "
-              f"(conditionId: {item.condition_id[:10]}..., "
-              f"attempt #{item.attempts + 1}, "
-              f"queue size: {len(self.redemption_queue)})")
+        # ── Pass 2: attempt redemption for ready items ───────────────
+        attempted = 0
+        for item in self.redemption_queue.items:       # fresh snapshot
+            if attempted >= max_per_cycle:
+                break
 
-        try:
-            result = self.redeem_positions(
-                item.condition_id,
-                max_poll_attempts=poll_attempts,
-                poll_interval_s=10.0 if item.attempts > 0 else 30.0,
-            )
-        except Exception as exc:
-            result = None
-            print(f"  [REDEEM] Queue processing error: "
-                  f"{type(exc).__name__}: {exc}")
-            self._log({
-                "type": "redemption_error",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "condition_id": item.condition_id,
-                "market_slug": item.market_slug,
-                "attempt": item.attempts + 1,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+            # Respect retry interval — use last_attempt_ts for accurate timing
+            if item.attempts > 0:
+                since_last = now - item.last_attempt_ts if item.last_attempt_ts else now - item.enqueued_at
+                min_wait = RedemptionQueue.RETRY_INTERVAL_S
+                if since_last < min_wait:
+                    continue          # skip, not ready yet
 
-        if result is not None:
-            print(f"  [REDEEM] Queue item redeemed successfully "
-                  f"(conditionId: {item.condition_id[:10]}...)")
-            self.redemption_queue.remove_front()
-        else:
-            self.redemption_queue.requeue_front()
-            print(f"  [REDEEM] Failed, re-enqueued at back "
-                  f"(attempt #{item.attempts}, "
+            # First attempt: generous polling (on-chain resolution may take a minute)
+            # Retries: shorter polling (should be resolved by now)
+            poll_attempts = 20 if item.attempts == 0 else 10
+            poll_interval = 5.0
+
+            print(f"  [REDEEM] Processing queue item "
+                  f"(conditionId: {item.condition_id[:10]}..., "
+                  f"attempt #{item.attempts + 1}, "
                   f"queue size: {len(self.redemption_queue)})")
+
+            try:
+                result = self.redeem_positions(
+                    item.condition_id,
+                    max_retries=1,          # queue handles retries — don't loop internally
+                    max_poll_attempts=poll_attempts,
+                    poll_interval_s=poll_interval,
+                )
+            except Exception as exc:
+                result = None
+                print(f"  [REDEEM] Queue processing error: "
+                      f"{type(exc).__name__}: {exc}")
+                self._log({
+                    "type": "redemption_error",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "condition_id": item.condition_id,
+                    "market_slug": item.market_slug,
+                    "attempt": item.attempts + 1,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+            if result is not None:
+                print(f"  [REDEEM] SUCCESS — redeemed "
+                      f"(conditionId: {item.condition_id[:10]}..., "
+                      f"tx: {result[:16]}...)")
+                self.redemption_queue.remove_by_id(item.condition_id)
+            else:
+                self.redemption_queue.requeue_by_id(item.condition_id)
+                print(f"  [REDEEM] Will retry later "
+                      f"(attempt #{item.attempts}, "
+                      f"queue size: {len(self.redemption_queue)})")
+
+            attempted += 1
+
+    # ── Startup: find unredeemed wins ──────────────────────────────────────
+
+    def scan_unredeemed_wins(self):
+        """Scan trade logs for winning positions that were never redeemed.
+
+        Scans ALL log files in the same directory matching the base asset
+        (e.g., live_trades_btc*.jsonl catches btc.jsonl, btc_15m.jsonl, btc_5m.jsonl).
+        Adds unredeemed condition_ids back to the queue for the periodic
+        processor to claim.
+        """
+        # Build list of log files to scan — current + any old per-timeframe logs
+        log_dir = self.trades_log.parent
+        base_name = self.trades_log.stem  # e.g., "live_trades_btc"
+        log_files = sorted(log_dir.glob(f"{base_name}*.jsonl"))
+        if not log_files:
+            return
+
+        enqueued: dict[str, str] = {}   # condition_id -> market_slug
+        redeemed: set[str] = set()      # condition_ids successfully redeemed
+
+        for log_file in log_files:
+            try:
+                with open(log_file) as f:
+                    for line in f:
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+
+                        typ = rec.get("type", "")
+
+                        # Catch both old ("redemption_started") and new ("redemption_enqueued")
+                        if typ in ("redemption_enqueued", "redemption_started"):
+                            cid = rec.get("condition_id")
+                            slug = rec.get("market_slug")
+                            if cid and slug:
+                                enqueued[cid] = slug
+
+                        if typ == "redemption" and rec.get("status") == "success":
+                            cid = rec.get("condition_id")
+                            if cid:
+                                redeemed.add(cid)
+            except Exception as exc:
+                print(f"  [STARTUP] Error scanning {log_file.name}: {exc}")
+
+        # Enqueue any unredeemed wins (enqueue() deduplicates)
+        unredeemed = set(enqueued.keys()) - redeemed
+        # Also skip items already in the queue
+        already_queued = {it.condition_id for it in self.redemption_queue.items}
+        unredeemed -= already_queued
+
+        for cid in unredeemed:
+            slug = enqueued[cid]
+            self.redemption_queue.enqueue(cid, slug)
+
+        if unredeemed:
+            print(f"  [STARTUP] Found {len(unredeemed)} unredeemed winning position(s) "
+                  f"across {len(log_files)} log file(s) — added to queue")
 
     # ── Diagnostics & logging ──────────────────────────────────────────────
 
@@ -878,7 +970,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
             z_raw = delta / (sigma_per_s * math.sqrt(tau))
             z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
-            p_model = self.signal._p_model(z, tau)
+            p_model = self.signal._p_model(z, tau, self.ctx)
             # Maker mode: edge at bid, 0% fee
             edge_up = p_model - bid_up - self.signal.spread_edge_penalty * spread_up
             edge_down = (1.0 - p_model) - bid_down - self.signal.spread_edge_penalty * spread_down

@@ -327,6 +327,7 @@ class OrderMixin:
                 "chainlink_price": snapshot.chainlink_price,
                 "window_start_price": snapshot.window_start_price,
                 "model_snapshot": model_snapshot,
+                "edge_at_place": round(decision.edge, 4),
             })
             return
 
@@ -416,6 +417,7 @@ class OrderMixin:
             "chainlink_price": snapshot.chainlink_price,
             "window_start_price": snapshot.window_start_price,
             "model_snapshot": model_snapshot,
+            "edge_at_place": round(decision.edge, 4),
         })
 
         self._event(

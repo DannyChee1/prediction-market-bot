@@ -301,14 +301,30 @@ async def run_window(
     """Run a single trading window. Returns (slug, final_price, start_price,
     condition_id) for resolution, or None if no market was found."""
 
-    # Rebuild calibration table from latest data
+    # Rebuild calibration table + sigma_calibration from latest data (single pass)
     if tracker.cal_data_dir is not None:
         try:
-            cal_table = build_calibration_table(tracker.cal_data_dir)
+            need_sigmas = tracker.signal.regime_z_scale
+            result = build_calibration_table(
+                tracker.cal_data_dir, return_sigmas=need_sigmas,
+            )
+            if need_sigmas:
+                cal_table, sigmas = result
+            else:
+                cal_table = result
             tracker.signal.calibration_table = cal_table
             n_obs = sum(cal_table.counts.values())
             print(f"  [{config.display_name}] Calibration rebuilt: "
                   f"{len(cal_table.table)} cells, {n_obs} obs")
+
+            # Update sigma_calibration from the same file scan
+            if need_sigmas and sigmas:
+                new_cal = max(float(np.median(sigmas[-200:])), 1e-7)
+                old_cal = tracker.signal.sigma_calibration
+                tracker.signal.sigma_calibration = new_cal
+                if old_cal and abs(new_cal - old_cal) / old_cal > 0.05:
+                    print(f"  [{config.display_name}] sigma_cal updated: "
+                          f"{old_cal:.2e} -> {new_cal:.2e}")
         except Exception as exc:
             print(f"  [{config.display_name}] WARNING: calibration rebuild failed: {exc}")
 
@@ -482,14 +498,52 @@ async def _resolve_background(
     condition_id: str,
     all_trackers: list[LiveTradeTracker],
 ):
-    """Background resolution: resolve window + process redemption queue + sync bankroll."""
-    await asyncio.to_thread(
-        tracker.resolve_window, slug, final_price, start_price, condition_id,
-    )
-    # Process one queued redemption (includes newly enqueued + retries)
-    await asyncio.to_thread(tracker.process_redemption_queue)
+    """Background resolution: resolve window + sync bankroll.
+
+    Queue processing is handled by _periodic_redeem_loop — NOT here.
+    This keeps resolution fast so the next window isn't blocked.
+    """
+    try:
+        await asyncio.to_thread(
+            tracker.resolve_window, slug, final_price, start_price, condition_id,
+        )
+    except Exception as exc:
+        print(f"  [RESOLVE] ERROR: {type(exc).__name__}: {exc}")
     _sync_bankroll(all_trackers)
     tracker.save_state()
+    # Fire-and-forget: kick off queue processing without blocking.
+    # The periodic loop also processes the queue, so this is just for speed.
+    if len(tracker.redemption_queue) > 0:
+        asyncio.create_task(_process_queue_bg(tracker))
+
+
+async def _process_queue_bg(tracker: LiveTradeTracker):
+    """Process redemption queue in background (fire-and-forget)."""
+    try:
+        await asyncio.to_thread(tracker.process_redemption_queue)
+        tracker.save_state()
+    except Exception as exc:
+        print(f"  [REDEEM] Background queue error: {type(exc).__name__}: {exc}")
+
+
+async def _periodic_redeem_loop(
+    all_trackers: list[LiveTradeTracker],
+    interval_s: float = 90.0,
+):
+    """Periodically process redemption queues for all trackers.
+
+    Runs independently of the trading loop so items get retried even when
+    no new trades are happening. This is the PRIMARY redemption driver.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        for tracker in all_trackers:
+            if len(tracker.redemption_queue) > 0:
+                try:
+                    await asyncio.to_thread(tracker.process_redemption_queue)
+                    tracker.save_state()
+                except Exception as exc:
+                    print(f"  [REDEEM] Periodic error: {type(exc).__name__}: {exc}")
 
 
 async def _window_loop(
@@ -615,13 +669,29 @@ async def run(
     )
     display_thread.start()
 
+    redeem_task = None
     try:
-        # Process any redemption queue items left from a previous session
+        # Scan trade logs for any unredeemed wins (catches historical misses)
+        for tracker, _, _ in trackers_and_configs:
+            try:
+                tracker.scan_unredeemed_wins()
+            except Exception as exc:
+                print(f"  [STARTUP] Scan error: {exc}")
+
+        # Process any queued redemptions from previous session + scan
         for tracker, _, _ in trackers_and_configs:
             if len(tracker.redemption_queue) > 0:
                 print(f"  [STARTUP] Processing {len(tracker.redemption_queue)} "
                       f"queued redemption(s)...")
-                await asyncio.to_thread(tracker.process_redemption_queue)
+                try:
+                    await asyncio.to_thread(tracker.process_redemption_queue)
+                except Exception as exc:
+                    print(f"  [STARTUP] Queue processing error: {exc}")
+
+        # Start periodic redemption processor (retries every 90s, independent of trading)
+        redeem_task = asyncio.create_task(
+            _periodic_redeem_loop(all_trackers, interval_s=90.0)
+        )
 
         # Run all timeframe loops concurrently
         window_loops = []
@@ -643,6 +713,13 @@ async def run(
             binance_poll.cancel()
             await asyncio.gather(binance_poll, return_exceptions=True)
         await asyncio.gather(price_poll, return_exceptions=True)
+        # Cancel periodic redemption task
+        if redeem_task is not None:
+            redeem_task.cancel()
+            try:
+                await redeem_task
+            except asyncio.CancelledError:
+                pass
 
 
 # ── Tracker Builder ──────────────────────────────────────────────────────────
@@ -656,27 +733,36 @@ def _build_tracker(
     is_5m = "_5m" in config_key
 
     # Per-market signal overrides
+    # BTC: max_z=0.5 (prevent overconfidence), reversion_discount=0.30
+    # ETH: max_z=0.7, reversion_discount=0.20 (15m) / 0.0 (5m)
+    # SOL / XRP: defaults
     signal_kw: dict = {}
-    if base_market == "eth":
+    if base_market == "btc":
         signal_kw = dict(
-            edge_threshold=0.08,
-            reversion_discount=0.10,
+            max_z=3.0 if not is_5m else 1.0,
+            reversion_discount=0.0,
+        )
+    elif base_market == "eth":
+        signal_kw = dict(
+            max_z=0.7,
+            edge_threshold=0.12,
+            reversion_discount=0.20 if not is_5m else 0.0,
             momentum_lookback_s=15,
             momentum_majority=0.7,
             spread_edge_penalty=0.2,
         )
     elif base_market == "sol":
         signal_kw = dict(
-            edge_threshold=0.08,
-            reversion_discount=0.10,
+            edge_threshold=0.12,
+            reversion_discount=0.0,
             momentum_lookback_s=15,
             momentum_majority=0.7,
             spread_edge_penalty=0.2,
         )
     elif base_market == "xrp":
         signal_kw = dict(
-            edge_threshold=0.08,
-            reversion_discount=0.10,
+            edge_threshold=0.12,
+            reversion_discount=0.0,
             momentum_lookback_s=15,
             momentum_majority=0.7,
             spread_edge_penalty=0.2,
@@ -685,15 +771,17 @@ def _build_tracker(
     # Maker signal overrides
     signal_kw["window_duration"] = config.window_duration_s
     signal_kw["maker_mode"] = True
-    signal_kw["max_bet_fraction"] = 0.02
-    signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", 0.08)
+    signal_kw["max_bet_fraction"] = args.max_bet_fraction
+    signal_kw["kelly_fraction"] = args.kelly_fraction
+    signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", 0.12)
     signal_kw["momentum_majority"] = 0.0
     signal_kw["spread_edge_penalty"] = signal_kw.get("spread_edge_penalty", 0.0)
     cooldown_ms = 30_000
     stale_timeout = 60.0
 
-    # Calibration
-    if args.calibrated:
+    # Calibration — enabled for all markets when --calibrated is set
+    use_calibration = args.calibrated
+    if use_calibration:
         from backtest import DATA_DIR
         cal_data_dir = DATA_DIR / config.data_subdir
         print(f"  [{config.display_name}] Building calibration table...")
@@ -703,10 +791,10 @@ def _build_tracker(
             n_obs = sum(cal_table.counts.values())
             print(f"  [{config.display_name}] Calibration: {n_cells} cells, {n_obs} obs")
             signal_kw["calibration_table"] = cal_table
+            signal_kw["cal_prior_strength"] = 50.0
+            signal_kw["cal_max_weight"] = 0.70
         except Exception as exc:
             print(f"  [{config.display_name}] WARNING: calibration failed: {exc}")
-        signal_kw["edge_threshold"] = 0.08
-        signal_kw["early_edge_mult"] = 1.2
 
     signal_kw["inventory_skew"] = args.inventory_skew
     signal_kw["maker_warmup_s"] = args.maker_warmup
@@ -726,6 +814,19 @@ def _build_tracker(
     signal_kw["oracle_lag_threshold"] = args.oracle_lag_threshold
     signal_kw["oracle_lag_mult"] = args.oracle_lag_mult
     signal_kw["obi_weight"] = args.obi_weight
+    signal_kw["tail_mode"] = args.tail_mode
+    signal_kw["tail_nu_default"] = args.tail_nu
+
+    # A-S quoting params
+    signal_kw["as_mode"] = args.as_mode
+    signal_kw["gamma_inv"] = args.gamma_inv
+    signal_kw["gamma_spread"] = args.gamma_spread
+    signal_kw["min_edge"] = args.min_edge
+    signal_kw["tox_spread"] = args.tox_spread
+    signal_kw["vpin_spread"] = args.vpin_spread_as
+    signal_kw["lag_spread"] = args.lag_spread
+    signal_kw["edge_step"] = args.edge_step
+    signal_kw["contract_vol_lookback_s"] = args.contract_vol_lookback
 
     # Compute sigma_calibration from recorded data when regime-z-scale is on
     if args.regime_z_scale and args.calibrated:
@@ -769,9 +870,15 @@ def _build_tracker(
         signal_kw["vamp_mode"] = "filter"
         signal_kw["vamp_filter_threshold"] = 0.07
 
+    # 15m: withdraw 60s before end; 5m: withdraw 20s before end
+    if not is_5m:
+        maker_withdraw_override = 60.0
+    else:
+        maker_withdraw_override = 20.0
+
     # 5m overrides
     maker_warmup = args.maker_warmup
-    maker_withdraw = args.maker_withdraw
+    maker_withdraw = maker_withdraw_override
     max_order_age = args.max_order_age
     requote_cooldown = args.requote_cooldown
     exit_min_hold = args.exit_min_hold
@@ -779,21 +886,18 @@ def _build_tracker(
 
     if is_5m:
         signal_kw["vol_lookback_s"] = 30
-        signal_kw["edge_threshold"] = 0.10
+        signal_kw["edge_threshold"] = 0.15
         maker_warmup = 30.0
-        maker_withdraw = 20.0
         if base_market == "eth":
             signal_kw["edge_threshold"] = 0.10
             signal_kw["early_edge_mult"] = 1.2
-            signal_kw["reversion_discount"] = 0.10
         elif base_market in ("sol", "xrp"):
             signal_kw["edge_threshold"] = 0.10
             signal_kw["early_edge_mult"] = 1.2
-            signal_kw["reversion_discount"] = 0.10
         signal_kw["maker_warmup_s"] = maker_warmup
         signal_kw["maker_withdraw_s"] = maker_withdraw
         cooldown_ms = 10_000
-        max_order_age = 40.0
+        max_order_age = 20.0
         requote_cooldown = 2.0
         exit_min_hold = 10.0
         exit_min_remaining = 20.0
@@ -832,8 +936,9 @@ def _build_tracker(
         dry_run=args.dry_run,
         trades_log=trades_log,
         state_file=state_file,
+        min_requote_ticks=args.min_requote_ticks,
     )
-    if args.calibrated:
+    if use_calibration:
         from backtest import DATA_DIR
         tracker.cal_data_dir = DATA_DIR / config.data_subdir
 
@@ -888,12 +993,12 @@ def main():
         help="Resume from saved state file",
     )
     parser.add_argument(
-        "--edge-cancel-threshold", type=float, default=0.02,
-        help="Cancel open orders when edge drops below this (default: 0.02)",
+        "--edge-cancel-threshold", type=float, default=0.06,
+        help="Cancel open orders when edge drops below this (default: 0.06)",
     )
     parser.add_argument(
-        "--max-order-age", type=float, default=120.0,
-        help="Auto-cancel orders resting longer than this (seconds, default: 120)",
+        "--max-order-age", type=float, default=30.0,
+        help="Auto-cancel orders resting longer than this (seconds, default: 30)",
     )
     parser.add_argument(
         "--requote-cooldown", type=float, default=3.0,
@@ -921,6 +1026,8 @@ def main():
                         help="Edge penalty per same-side position (default 0.02)")
     parser.add_argument("--maker-withdraw", type=float, default=30.0,
                         help="Stop new orders when tau < N seconds (default 30)")
+    parser.add_argument("--min-requote-ticks", type=int, default=2,
+                        help="Min tick improvement before requoting (default: 2 = $0.02)")
     parser.add_argument("--toxicity-threshold", type=float, default=0.75,
                         help="Toxicity score above which edge threshold widens (default: 0.75)")
     parser.add_argument("--toxicity-edge-mult", type=float, default=1.5,
@@ -945,6 +1052,35 @@ def main():
                         help="Max edge threshold multiplier at full oracle lag (default: 2.0)")
     parser.add_argument("--obi-weight", type=float, default=0.03,
                         help="Order book imbalance alpha weight on p_model (default: 0.03)")
+    parser.add_argument("--kelly-fraction", type=float, default=0.25,
+                        help="Kelly fraction for sizing (0.25 = quarter-Kelly, default: 0.25)")
+    parser.add_argument("--max-bet-fraction", type=float, default=0.05,
+                        help="Max fraction of bankroll per trade (default: 0.05)")
+    parser.add_argument("--tail-mode", choices=["student_t", "normal"],
+                        default="student_t",
+                        help="CDF for z→probability (default: student_t)")
+    parser.add_argument("--tail-nu", type=float, default=3.0,
+                        help="Student-t nu floor / default (default: 3.0 = data-driven)")
+    # Avellaneda-Stoikov unified quoting
+    parser.add_argument("--as-mode", action="store_true", default=False,
+                        help="Enable A-S reservation price quoting")
+    parser.add_argument("--gamma-inv", type=float, default=0.15,
+                        help="A-S gamma for inventory penalty (default: 0.15)")
+    parser.add_argument("--gamma-spread", type=float, default=0.75,
+                        help="A-S gamma for base spread (default: 0.75)")
+    parser.add_argument("--min-edge", type=float, default=0.05,
+                        help="Floor on required edge in A-S mode (default: 0.05)")
+    parser.add_argument("--tox-spread", type=float, default=0.05,
+                        help="Additive spread from toxicity (default: 0.05)")
+    parser.add_argument("--vpin-spread-as", type=float, default=0.05,
+                        help="Additive spread from VPIN in A-S mode (default: 0.05)")
+    parser.add_argument("--lag-spread", type=float, default=0.08,
+                        help="Additive spread from oracle lag (default: 0.08)")
+    parser.add_argument("--edge-step", type=float, default=0.01,
+                        help="Additive spread per fill (default: 0.01)")
+    parser.add_argument("--contract-vol-lookback", type=int, default=60,
+                        help="Lookback (s) for contract mid vol (default: 60)")
+
     parser.add_argument("--no-record", action="store_true",
                         help="Disable integrated parquet recording")
     parser.add_argument("--debug", action="store_true")
@@ -1040,6 +1176,9 @@ def main():
     print(f"  Timeframes:      {timeframes}")
     print(f"  Max loss:        {args.max_loss_pct}%")
     print(f"  Max exposure:    {args.max_exposure_pct}%")
+    print(f"  Kelly:           {args.kelly_fraction}x Kelly, max {args.max_bet_fraction*100:.0f}% per trade")
+    if args.as_mode:
+        print(f"  A-S mode:        gamma_inv={args.gamma_inv}, gamma_spread={args.gamma_spread}, min_edge={args.min_edge}")
     if args.early_exit:
         print(f"  Early exit:      ON (threshold={args.exit_threshold})")
     print(f"  VPIN:            thresh={args.vpin_threshold} mult={args.vpin_edge_mult}")

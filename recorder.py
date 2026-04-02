@@ -108,6 +108,26 @@ shared_price: dict = {
     "price_history": collections.deque(maxlen=600),
 }
 
+# ── Shared Binance trade flow state ─────────────────────────────────────────
+# aggTrade stream accumulates buy/sell volume; sampler snaps+resets each tick.
+binance_trade_state: dict = {
+    # accumulator (reset each second by sampler)
+    "acc_buy_vol":  0.0,
+    "acc_sell_vol": 0.0,
+    "acc_n":        0,
+    "acc_vwap_num": 0.0,   # sum(price * qty) for buy+sell
+    # last snapped values (what goes into the parquet row)
+    "snap_buy_vol":  0.0,
+    "snap_sell_vol": 0.0,
+    "snap_n":        0,
+    "snap_vwap":     None,
+}
+
+# ── Shared Deribit implied-vol state ────────────────────────────────────────
+deribit_state: dict = {
+    "dvol": None,   # annualised 30-day implied vol % (e.g. 65.0 = 65%)
+}
+
 
 def _ensure_list(val):
     return json.loads(val) if isinstance(val, str) else val
@@ -231,7 +251,122 @@ def build_row(
             row[f"last_trade_sz_{label}"] = None
             row[f"last_trade_side_{label}"] = None
 
+    # Binance trade flow (snapped by sampler before each call)
+    bv_buy  = binance_trade_state["snap_buy_vol"]
+    bv_sell = binance_trade_state["snap_sell_vol"]
+    bv_tot  = bv_buy + bv_sell
+    row["binance_buy_vol"]       = round(bv_buy,  6)
+    row["binance_sell_vol"]      = round(bv_sell, 6)
+    row["binance_net_flow"]      = round(bv_buy - bv_sell, 6)
+    row["binance_flow_imbalance"] = (
+        round((bv_buy - bv_sell) / bv_tot, 6) if bv_tot > 0 else None
+    )
+    row["binance_n_trades"]      = binance_trade_state["snap_n"]
+    row["binance_vwap"]          = binance_trade_state["snap_vwap"]
+
+    # Deribit 30-day implied vol index
+    row["deribit_dvol"] = deribit_state["dvol"]
+
     return row
+
+
+# ── Binance aggTrade WebSocket (shared) ──────────────────────────────────────
+async def binance_trade_ws(symbol: str, cancel: asyncio.Event):
+    """Stream Binance aggTrades and accumulate buy/sell volume each second."""
+    url = f"wss://stream.binance.com:9443/ws/{symbol}@aggTrade"
+    backoff = 2
+
+    while not cancel.is_set():
+        try:
+            async with websockets.connect(
+                url, ssl=SSL_CTX, ping_interval=20
+            ) as ws:
+                backoff = 2
+                async for raw in ws:
+                    if cancel.is_set():
+                        break
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    # m=True  → buyer is maker (seller aggressed) → sell flow
+                    # m=False → seller is maker (buyer aggressed) → buy flow
+                    qty   = float(msg.get("q", 0))
+                    price = float(msg.get("p", 0))
+                    s = binance_trade_state
+                    if msg.get("m", False):
+                        s["acc_sell_vol"] += qty
+                    else:
+                        s["acc_buy_vol"] += qty
+                    s["acc_n"] += 1
+                    s["acc_vwap_num"] += price * qty
+        except Exception as exc:
+            if cancel.is_set():
+                return
+            if DEBUG:
+                print(f"  [Binance] {type(exc).__name__}: {exc}")
+            await asyncio.sleep(min(backoff, 30))
+            backoff = min(backoff * 2, 60)
+
+
+# ── Deribit DVOL WebSocket (shared, BTC/ETH only) ────────────────────────────
+async def deribit_ws(asset: str, cancel: asyncio.Event):
+    """Stream Deribit volatility index (annualised 30-day IV %)."""
+    if asset not in {"btc", "eth"}:
+        return   # Deribit DVOL only exists for BTC and ETH
+
+    url     = "wss://www.deribit.com/ws/api/v2"
+    channel = f"deribit_volatility_index.{asset}_usd"
+    backoff = 2
+
+    while not cancel.is_set():
+        try:
+            async with websockets.connect(
+                url, ssl=SSL_CTX, ping_interval=None
+            ) as ws:
+                backoff = 2
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "public/subscribe",
+                    "params": {"channels": [channel]},
+                }))
+
+                async def heartbeat():
+                    try:
+                        while not cancel.is_set():
+                            await asyncio.sleep(15)
+                            await ws.send(json.dumps({
+                                "jsonrpc": "2.0", "id": 9999,
+                                "method": "public/test",
+                                "params": {},
+                            }))
+                    except Exception:
+                        pass
+
+                hb = asyncio.create_task(heartbeat())
+                try:
+                    async for raw in ws:
+                        if cancel.is_set():
+                            break
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        data = msg.get("params", {}).get("data", {})
+                        if isinstance(data, dict) and "volatility" in data:
+                            deribit_state["dvol"] = float(data["volatility"])
+                            if DEBUG:
+                                print(f"  [Deribit] DVOL={data['volatility']:.2f}")
+                finally:
+                    hb.cancel()
+
+        except Exception as exc:
+            if cancel.is_set():
+                return
+            if DEBUG:
+                print(f"  [Deribit] {type(exc).__name__}: {exc}")
+            await asyncio.sleep(min(backoff, 30))
+            backoff = min(backoff * 2, 60)
 
 
 # ── CLOB WebSocket (per-window, per-timeframe) ──────────────────────────────
@@ -432,6 +567,25 @@ async def sampler(
         await asyncio.sleep(interval)
         if cancel.is_set():
             break
+
+        # Snap and reset Binance trade flow accumulator atomically
+        s = binance_trade_state
+        bv_buy  = s["acc_buy_vol"]
+        bv_sell = s["acc_sell_vol"]
+        bv_n    = s["acc_n"]
+        bv_vnum = s["acc_vwap_num"]
+        s["acc_buy_vol"]  = 0.0
+        s["acc_sell_vol"] = 0.0
+        s["acc_n"]        = 0
+        s["acc_vwap_num"] = 0.0
+        s["snap_buy_vol"]  = bv_buy
+        s["snap_sell_vol"] = bv_sell
+        s["snap_n"]        = bv_n
+        s["snap_vwap"] = (
+            round(bv_vnum / (bv_buy + bv_sell), 6)
+            if (bv_buy + bv_sell) > 0 else None
+        )
+
         rows.append(build_row(
             book_up, book_down, meta,
             trade_state.get("last_trade_up"),
@@ -624,10 +778,22 @@ async def _window_loop(config: MarketConfig):
 
 async def main(configs: list[MarketConfig]):
     """Run all timeframe recorders concurrently with shared RTDS."""
-    # Start persistent RTDS websocket (shared across all timeframes)
     base_config = configs[0]
-    rtds_cancel = asyncio.Event()
-    rtds_task = asyncio.create_task(rtds_ws(rtds_cancel, base_config))
+
+    # Derive asset name for Deribit (btc/eth/sol/xrp) from chainlink_symbol
+    # chainlink_symbol is e.g. "btc/usd" → asset = "btc"
+    asset = base_config.chainlink_symbol.split("/")[0].lower()
+
+    shared_cancel = asyncio.Event()
+
+    # Persistent shared feeds
+    shared_tasks = [
+        asyncio.create_task(rtds_ws(shared_cancel, base_config)),
+        asyncio.create_task(
+            binance_trade_ws(base_config.binance_symbol, shared_cancel)
+        ),
+        asyncio.create_task(deribit_ws(asset, shared_cancel)),
+    ]
 
     try:
         # Run all timeframe loops concurrently
@@ -635,9 +801,10 @@ async def main(configs: list[MarketConfig]):
             *[_window_loop(c) for c in configs]
         )
     finally:
-        rtds_cancel.set()
-        rtds_task.cancel()
-        await asyncio.gather(rtds_task, return_exceptions=True)
+        shared_cancel.set()
+        for t in shared_tasks:
+            t.cancel()
+        await asyncio.gather(*shared_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

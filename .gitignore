@@ -7,3 +7,13 @@ data/
 paper/
 live_state_*.json
 live_trades_*.jsonl
+live_redemption_queue_*.json
+session.txt
+.relayer_rate_limit
+rust/target/
+rust/*.exe
+rust/*.dll
+rust/*.dll.a
+rust/*.d
+Claude.md
+

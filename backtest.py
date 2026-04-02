@@ -38,9 +38,18 @@ MAX_START_GAP_S = 30.0
 
 # ── Fee & math helpers ──────────────────────────────────────────────────────
 
-def poly_fee(p: float) -> float:
-    """Polymarket taker fee for 15-min crypto markets."""
-    return 0.25 * (p * (1.0 - p)) ** 2
+def poly_fee(p: float, maker: bool = False) -> float:
+    """Polymarket fee for 15-min crypto markets.
+
+    Taker: 2% * p * (1-p)  — standard Polymarket binary market fee.
+    Maker: 0%              — no fee for limit orders that provide liquidity.
+
+    NOTE: verify taker fee rate against current Polymarket documentation
+    before relying on backtest P&L figures for taker-mode strategies.
+    """
+    if maker:
+        return 0.0
+    return 0.02 * p * (1.0 - p)
 
 
 def norm_cdf(x: float) -> float:
@@ -720,6 +729,15 @@ class DiffusionSignal(Signal):
         lag_spread: float = 0.08,      # additive spread from oracle lag
         edge_step: float = 0.01,       # additive spread per fill
         contract_vol_lookback_s: int = 60,  # lookback for contract mid vol
+        # Kalman filter for sigma estimation (replaces EMA when True)
+        use_kalman_sigma: bool = True,
+        kalman_q: float = 0.10,   # process noise ratio (vol-of-vol / vol)
+        kalman_r: float = 0.075,  # observation noise ratio (≈ 1/sqrt(2*90))
+        # XGBoost filtration model (optional confidence gate)
+        filtration_model=None,         # FiltrationModel instance or None
+        filtration_threshold: float = 0.55,
+        filtration_asset_id: int = 0,  # see filtration_model.ASSET_IDS
+        filtration_baseline_vol_s: int = 300,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -779,6 +797,13 @@ class DiffusionSignal(Signal):
         self.lag_spread = lag_spread
         self.edge_step = edge_step
         self.contract_vol_lookback_s = contract_vol_lookback_s
+        self.use_kalman_sigma = use_kalman_sigma
+        self.kalman_q = kalman_q
+        self.kalman_r = kalman_r
+        self.filtration_model = filtration_model
+        self.filtration_threshold = filtration_threshold
+        self.filtration_asset_id = filtration_asset_id
+        self.filtration_baseline_vol_s = filtration_baseline_vol_s
 
     def _compute_vol(
         self,
@@ -797,19 +822,144 @@ class DiffusionSignal(Signal):
         return _compute_vol_deduped(prices, timestamps)
 
     def _smoothed_sigma(self, raw_sigma: float, ctx: dict) -> float:
-        """Apply EMA smoothing and asset-specific cap to raw sigma."""
+        """Kalman filter for sigma estimation (falls back to EMA if disabled).
+
+        Kalman filter advantages over EMA:
+          - Adaptive gain: reacts fast to vol spikes, smooth during calm periods
+          - Principled noise model: Q (process noise) and R (observation noise)
+          - Tracks uncertainty explicitly via posterior variance P
+
+        State:   x  = true (latent) volatility
+        Process: x_t = x_{t-1} + w,  w ~ N(0, Q)
+        Obs:     y_t = x_t + v,       v ~ N(0, R)
+
+        Q = (x * kalman_q)^2  — vol-of-vol proportional to current vol
+        R = (x * kalman_r)^2  — measurement noise (Yang-Zhang ~90 samples
+                                 has std ≈ sigma/sqrt(2N), so r ≈ 1/sqrt(180))
+        """
         if raw_sigma == 0.0:
             return 0.0
-        ema = ctx.get("_sigma_ema")
-        if ema is None:
-            ema = raw_sigma
-        else:
-            ema = self.sigma_ema_alpha * raw_sigma + (1 - self.sigma_ema_alpha) * ema
-        ctx["_sigma_ema"] = ema
+
+        if not self.use_kalman_sigma:
+            # Legacy EMA path
+            ema = ctx.get("_sigma_ema")
+            ema = raw_sigma if ema is None else (
+                self.sigma_ema_alpha * raw_sigma + (1 - self.sigma_ema_alpha) * ema
+            )
+            ctx["_sigma_ema"] = ema
+            if self.max_sigma is not None:
+                ema = min(ema, self.max_sigma)
+            return max(ema, self.min_sigma)
+
+        # Kalman filter path
+        x = ctx.get("_kalman_x")
+        P = ctx.get("_kalman_P")
+
+        if x is None:
+            # Initialise: start at first observation, high uncertainty
+            x = raw_sigma
+            P = (raw_sigma * self.kalman_r) ** 2
+
+        # Process and observation noise (scale with current estimate)
+        Q = (x * self.kalman_q) ** 2
+        R = (x * self.kalman_r) ** 2
+        if R < 1e-20:
+            R = 1e-20
+
+        # Predict
+        P_pred = P + Q
+
+        # Update (Kalman gain)
+        K = P_pred / (P_pred + R)
+        x_new = x + K * (raw_sigma - x)
+        P_new = (1.0 - K) * P_pred
+
+        ctx["_kalman_x"] = x_new
+        ctx["_kalman_P"] = P_new
+        ctx["_kalman_gain"] = K  # expose for diagnostics
+
         if self.max_sigma is not None:
-            ema = min(ema, self.max_sigma)
-        ema = max(ema, self.min_sigma)
-        return ema
+            x_new = min(x_new, self.max_sigma)
+        return max(x_new, self.min_sigma)
+
+    def _check_filtration(
+        self,
+        z: float,
+        sigma: float,
+        tau: float,
+        snapshot: "Snapshot",
+        ctx: dict,
+    ) -> bool:
+        """Return True if filtration model approves this trade, False to filter out.
+
+        Returns True unconditionally when no filtration model is loaded,
+        or when |z| is too small to have meaningful signal direction.
+        """
+        if self.filtration_model is None:
+            return True
+        if abs(z) < 0.10:
+            return True  # no directional signal to filter
+
+        from filtration_model import extract_features
+
+        # Baseline vol for regime ratio (use longer lookback from history)
+        hist = ctx.get("price_history", [])
+        ts_hist = ctx.get("ts_history", [])
+        lo_base = max(0, len(hist) - self.filtration_baseline_vol_s)
+        sigma_base = _compute_vol_deduped(hist[lo_base:], ts_hist[lo_base:])
+        vol_regime_ratio = sigma / sigma_base if sigma_base > 0 else 1.0
+
+        # Buy pressure from recent trade side history
+        trade_sides = ctx.get("_trade_side_history", [])
+        if trade_sides:
+            recent = trade_sides[-60:]
+            buy_pressure = sum(1 for s in recent if s == "BUY") / len(recent)
+        else:
+            buy_pressure = 0.5
+
+        # Mid momentum
+        mid_history = ctx.get("_mid_up_history", [])
+        mid_momentum = (float(mid_history[-1]) - float(mid_history[-61]))  \
+            if len(mid_history) >= 62 else 0.0
+
+        ts_ms = ctx.get("_last_ts_ms", 0)
+        dt = pd.Timestamp(ts_ms, unit="ms", tz="UTC") if ts_ms else None
+        hour_of_day = dt.hour if dt else 12
+        is_weekend  = int(dt.weekday() >= 5) if dt else 0
+
+        spread_up   = (snapshot.best_ask_up or 0.5) - (snapshot.best_bid_up or 0.5)
+        spread_down = (snapshot.best_ask_down or 0.5) - (snapshot.best_bid_down or 0.5)
+        imb_up   = sum(sz for _, sz in snapshot.bid_levels_up) - \
+                   sum(sz for _, sz in snapshot.ask_levels_up)
+        total_up = sum(sz for _, sz in snapshot.bid_levels_up) + \
+                   sum(sz for _, sz in snapshot.ask_levels_up)
+        imb_up = imb_up / total_up if total_up > 0 else 0.0
+
+        imb_dn   = sum(sz for _, sz in snapshot.bid_levels_down) - \
+                   sum(sz for _, sz in snapshot.ask_levels_down)
+        total_dn = sum(sz for _, sz in snapshot.bid_levels_down) + \
+                   sum(sz for _, sz in snapshot.ask_levels_down)
+        imb_dn = imb_dn / total_dn if total_dn > 0 else 0.0
+
+        features = extract_features(
+            z=z,
+            sigma=sigma,
+            tau=tau,
+            spread_up=max(0.0, spread_up),
+            spread_down=max(0.0, spread_down),
+            imbalance5_up=imb_up,
+            imbalance5_down=imb_dn,
+            buy_pressure=buy_pressure,
+            vol_regime_ratio=vol_regime_ratio,
+            mid_up_momentum=mid_momentum,
+            hour_of_day=hour_of_day,
+            is_weekend=is_weekend,
+            asset_id=self.filtration_asset_id,
+        )
+
+        confidence = self.filtration_model.predict_proba(features)
+        ctx["_filtration_confidence"] = confidence
+        return confidence >= self.filtration_threshold
 
     def _smoothed_sigma_p(self, raw: float, ctx: dict) -> float:
         """EMA smoothing for contract mid vol (separate state from BTC sigma)."""
@@ -1053,11 +1203,17 @@ class DiffusionSignal(Signal):
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = self._p_model(z, tau, ctx)
 
+        # Filtration gate: XGBoost confidence check
+        if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx):
+            conf = ctx.get("_filtration_confidence", 0.0)
+            return Decision("FLAT", 0.0, 0.0,
+                            f"filtration ({conf:.3f} < {self.filtration_threshold})")
+
         # Mean-reversion discount: pull p_model toward 0.5
         if self.reversion_discount > 0:
             p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
 
-        # Effective costs
+        # Effective costs (taker mode)
         p_up_cost = ask_up + poly_fee(ask_up) + self.slippage
         p_down_cost = ask_down + poly_fee(ask_down) + self.slippage
 
@@ -1442,6 +1598,13 @@ class DiffusionSignal(Signal):
 
         z = max(-self.max_z, min(self.max_z, z_raw))
         p_model = self._p_model(z, tau, ctx)
+
+        # Filtration gate: XGBoost confidence check
+        if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx):
+            conf = ctx.get("_filtration_confidence", 0.0)
+            reason = f"filtration ({conf:.3f} < {self.filtration_threshold})"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
 
         # Expose model state so OrderMixin can snapshot it at fill time
         ctx["_p_model_raw"] = p_model

@@ -1,0 +1,45 @@
+Work Term:	2026 - Spring
+Job Type:	Co-op Main
+Job Title:	Backend Developer
+Number of Job Openings:	1
+Level:	
+Intermediate
+Senior
+Region:	ON - Toronto
+Job - Address Line One:	973 Dovercourt Road
+Job - Address Line Two:	Main
+Job - City:	Toronto
+Job - Province/State:	Ontario
+Job - Postal/Zip Code:	M6H 2X6
+Job - Country:	Canada
+Employment Location Arrangement:	Hybrid
+Work Term Duration:	8 month consecutive work term preferred
+Special Job Requirements:	Students are responsible for ensuring they are eligible for an 8-month work term before applying. Please discuss your work/study sequence flexibility with your academic advisor as soon as possible.
+Job Summary:	Trailfund (trailfund.com) is a fast-growing startup building AI-powered tools for commercial real estate development. Our platform supports over $1B in deal volume, helping developers, lenders, and investors make faster, smarter financing decisions. As a co-op student, you'll work directly with the founding team to design and ship features that real users depend on. This is a rare opportunity to join an early-stage company in the finance and proptech space where your contributions will have immediate, visible impact on the product and business.
+Job Responsibilities:	
+Build and improve AI/ML models and pipelines that power our construction development platform
+Develop full-stack features across our web application (frontend and backend)
+Work with real-world financial data to train, evaluate, and deploy models in production
+Collaborate closely with founders and senior engineers on product direction and technical architecture
+Research and prototype new AI capabilities such as document intelligence, deal scoring, and automated underwriting
+Participate in code reviews, ship regularly, and iterate based on user feedback
+Required Skills:	
+Required:
+Strong Typescript foundation
+REST backend monoliths and relational databases (postgres)
+Experience working in large monorepos and complex codebases
+Comfort navigating unfamiliar code and understanding system architecture
+Strong communication skills
+Nice to have:
+
+Experience with AI agent context management and orchestration
+Experience building business software (document processing, financial data pipelines, or similar)
+Familiarity with finance concepts and financial software
+Compensation and Benefits:	$30/hr to $40/hr depending on experience. Equity is negotiable depending on candidate fit.
+Targeted Degrees and Disciplines:	
+Targeted Clusters
+ENG - Software Engineering
+ENG - Systems Design
+MATH - Applied Mathematics
+MATH - Computer Science
+MATH - Computing and Financial Management

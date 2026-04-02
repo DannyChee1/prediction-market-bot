@@ -1824,9 +1824,9 @@ class BacktestEngine:
                         last_fill_ts = snap.ts_ms
                         ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
                         if "UP" in decision.action:
-                            ctx["inventory_up"] = ctx.get("inventory_up", 0) + 1
+                            ctx["inventory_up"] = ctx.get("inventory_up", 0) + fill.shares
                         elif "DOWN" in decision.action:
-                            ctx["inventory_down"] = ctx.get("inventory_down", 0) + 1
+                            ctx["inventory_down"] = ctx.get("inventory_down", 0) + fill.shares
                     pending = None
 
             # Cooldown between bets
@@ -1867,9 +1867,9 @@ class BacktestEngine:
                             last_fill_ts = snap.ts_ms
                             ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
                             if "UP" in decision.action:
-                                ctx["inventory_up"] = ctx.get("inventory_up", 0) + 1
+                                ctx["inventory_up"] = ctx.get("inventory_up", 0) + fill.shares
                             elif "DOWN" in decision.action:
-                                ctx["inventory_down"] = ctx.get("inventory_down", 0) + 1
+                                ctx["inventory_down"] = ctx.get("inventory_down", 0) + fill.shares
                 continue
 
             # FOK mode: run single-side signal
@@ -1885,9 +1885,9 @@ class BacktestEngine:
                         last_fill_ts = snap.ts_ms
                         ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
                         if "UP" in decision.action:
-                            ctx["inventory_up"] = ctx.get("inventory_up", 0) + 1
+                            ctx["inventory_up"] = ctx.get("inventory_up", 0) + fill.shares
                         elif "DOWN" in decision.action:
-                            ctx["inventory_down"] = ctx.get("inventory_down", 0) + 1
+                            ctx["inventory_down"] = ctx.get("inventory_down", 0) + fill.shares
                 else:
                     pending = (snap.ts_ms + self.latency_ms, decision)
 

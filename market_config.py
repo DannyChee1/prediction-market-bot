@@ -46,7 +46,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         display_name="BTC 5m",
         window_duration_s=300.0,
         window_align_m=5,
-        min_sigma=3e-05,
+        min_sigma=7e-05,
         binance_symbol="btcusdt",
     ),
     "eth_5m": MarketConfig(

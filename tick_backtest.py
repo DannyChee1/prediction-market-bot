@@ -257,10 +257,19 @@ def run_window(
             if len(fills) >= max_fills:
                 continue
 
-            # Anti-hedge check (single-side mode only)
-            if not dual_side:
-                opposite = "DOWN" if side == "UP" else "UP"
-                if any(f.side == opposite for f in fills):
+            # Anti-hedge / exposure gating
+            opposite = "DOWN" if side == "UP" else "UP"
+            has_opposite = any(f.side == opposite for f in fills)
+            if has_opposite:
+                if not dual_side:
+                    continue
+                # Smart dual-side: only allow if it reduces net imbalance
+                up_sh = sum(f.shares for f in fills if f.side == "UP")
+                dn_sh = sum(f.shares for f in fills if f.side == "DOWN")
+                net_exp = up_sh - dn_sh
+                if side == "UP" and net_exp > 0:
+                    continue
+                if side == "DOWN" and net_exp < 0:
                     continue
 
             if best_bid is None or best_bid <= 0 or best_bid >= 1.0:
@@ -407,8 +416,17 @@ def run_window_instant(
             if len(fills) >= max_fills:
                 continue
 
-            if not dual_side and any(f.side != side for f in fills):
-                continue
+            has_opposite = any(f.side != side for f in fills)
+            if has_opposite:
+                if not dual_side:
+                    continue
+                up_sh = sum(f.shares for f in fills if f.side == "UP")
+                dn_sh = sum(f.shares for f in fills if f.side == "DOWN")
+                net_exp = up_sh - dn_sh
+                if side == "UP" and net_exp > 0:
+                    continue
+                if side == "DOWN" and net_exp < 0:
+                    continue
 
             best_bid = snap.best_bid_up if side == "UP" else snap.best_bid_down
             if best_bid is None or best_bid <= 0 or best_bid >= 1.0:
@@ -697,6 +715,8 @@ def main():
                         help="Max fills (positions) per window (default: 6)")
     parser.add_argument("--min-requote-ticks", type=int, default=2,
                         help="Min tick improvement before requoting (default: 2 = $0.02)")
+    parser.add_argument("--min-sigma", type=float, default=None,
+                        help="Override min_sigma floor (default: from market_config)")
 
     # Fat-tail CDF
     parser.add_argument("--tail-mode", choices=["student_t", "normal"],
@@ -819,7 +839,7 @@ def main():
         momentum_majority=0.0,       # disabled for maker mode
         spread_edge_penalty=0.0,     # handled by fill model instead
         slippage=0.0,                # no slippage for maker
-        min_sigma=config.min_sigma,
+        min_sigma=args.min_sigma if args.min_sigma is not None else config.min_sigma,
         max_sigma=config.max_sigma,
         vol_lookback_s=30 if is_5m else 90,
     )

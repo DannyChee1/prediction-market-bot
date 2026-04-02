@@ -692,3 +692,209 @@ async fn binance_feed_task(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
+
+// ── UserFeed ──────────────────────────────────────────────────────────────
+
+/// Polymarket user WebSocket feed for real-time order/trade events.
+///
+/// Connects to the CLOB user channel with API-key auth and buffers
+/// events (fills, cancellations) in a VecDeque.  Python drains events
+/// via `drain_events()` each tick for instant fill handling.
+#[pyclass]
+pub struct UserFeed {
+    events: Arc<RwLock<std::collections::VecDeque<std::collections::HashMap<String, String>>>>,
+    _cancel: Arc<tokio::sync::Notify>,
+}
+
+#[pymethods]
+impl UserFeed {
+    /// Create a UserFeed and start streaming user order events.
+    ///
+    /// Args:
+    ///     api_key:        Polymarket API key
+    ///     api_secret:     Polymarket API secret
+    ///     api_passphrase: Polymarket API passphrase
+    ///     asset_ids:      Token IDs to filter for (e.g. [up_token, down_token])
+    #[new]
+    #[pyo3(signature = (api_key, api_secret, api_passphrase, asset_ids))]
+    fn new(
+        api_key: String,
+        api_secret: String,
+        api_passphrase: String,
+        asset_ids: Vec<String>,
+    ) -> PyResult<Self> {
+        let events = Arc::new(RwLock::new(
+            std::collections::VecDeque::with_capacity(256),
+        ));
+        let cancel = Arc::new(tokio::sync::Notify::new());
+
+        let events_clone = events.clone();
+        let cancel_clone = cancel.clone();
+
+        RUNTIME.spawn(async move {
+            user_feed_task(
+                api_key, api_secret, api_passphrase,
+                asset_ids, events_clone, cancel_clone,
+            )
+            .await;
+        });
+
+        Ok(Self {
+            events,
+            _cancel: cancel,
+        })
+    }
+
+    /// Drain accumulated user events.
+    ///
+    /// Returns list of dicts with string keys/values (event_type, order_id,
+    /// status, size_matched, price, asset_id, side, etc.).
+    /// Call each tick from Python — events are removed from the buffer.
+    fn drain_events(&self) -> Vec<std::collections::HashMap<String, String>> {
+        let mut buf = RUNTIME.block_on(async { self.events.write().await });
+        buf.drain(..).collect()
+    }
+}
+
+/// Flatten a serde_json::Value into a HashMap<String, String>.
+/// Nested objects/arrays are serialised as JSON strings.
+fn flatten_json(val: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(obj) = val.as_object() {
+        for (k, v) in obj {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => "null".to_string(),
+                _ => v.to_string(), // arrays/objects → JSON string
+            };
+            map.insert(k.clone(), s);
+        }
+    }
+    map
+}
+
+async fn user_feed_task(
+    api_key: String,
+    api_secret: String,
+    api_passphrase: String,
+    asset_ids: Vec<String>,
+    events: Arc<RwLock<std::collections::VecDeque<std::collections::HashMap<String, String>>>>,
+    cancel: Arc<tokio::sync::Notify>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::connect_async;
+
+    let url = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
+    let mut backoff = 2u64;
+
+    loop {
+        let result = connect_async(url).await;
+        let (mut ws, _) = match result {
+            Ok(conn) => {
+                backoff = 2;
+                conn
+            }
+            Err(e) => {
+                eprintln!("[UserFeed] connect error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff.min(60))).await;
+                backoff = (backoff * 2).min(60);
+                continue;
+            }
+        };
+
+        // Subscribe with auth
+        let sub_msg = serde_json::json!({
+            "auth": {
+                "apiKey": api_key,
+                "secret": api_secret,
+                "passphrase": api_passphrase,
+            },
+            "assets_ids": asset_ids,
+            "type": "user",
+        });
+        if let Err(e) = ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                sub_msg.to_string(),
+            ))
+            .await
+        {
+            eprintln!("[UserFeed] subscribe error: {e}");
+            continue;
+        }
+
+        eprintln!("[UserFeed] connected, subscribed to {} assets", asset_ids.len());
+
+        // Heartbeat
+        let (mut write, mut read) = ws.split();
+        let cancel_clone = cancel.clone();
+        let hb = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                        let _ = write
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                "PING".to_string(),
+                            ))
+                            .await;
+                    }
+                    _ = cancel_clone.notified() => break,
+                }
+            }
+            write
+        });
+
+        // Read with timeout
+        let read_timeout = std::time::Duration::from_secs(60);
+        loop {
+            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break,
+                Err(_) => {
+                    eprintln!("[UserFeed] no data for 60s, reconnecting");
+                    break;
+                }
+            };
+            let text = match msg {
+                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("[UserFeed] read error: {e}");
+                    break;
+                }
+            };
+
+            if text == "PONG" || text.is_empty() {
+                continue;
+            }
+
+            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&text) {
+                let msgs = if payload.is_array() {
+                    payload.as_array().cloned().unwrap_or_default()
+                } else {
+                    vec![payload]
+                };
+
+                let mut buf = events.write().await;
+                for msg in msgs {
+                    let flat = flatten_json(&msg);
+                    // Only buffer events with meaningful content
+                    if flat.contains_key("event_type") || flat.contains_key("status")
+                        || flat.contains_key("order_id")
+                    {
+                        buf.push_back(flat);
+                        // Cap buffer to prevent unbounded growth
+                        if buf.len() > 1000 {
+                            buf.pop_front();
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = hb.await;
+        tokio::time::sleep(std::time::Duration::from_secs(backoff.min(30))).await;
+        backoff = (backoff * 2).min(60);
+    }
+}

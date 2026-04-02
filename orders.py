@@ -94,8 +94,19 @@ class OrderMixin:
 
                 if status == "MATCHED" or fill_pct >= 0.99:
                     # Order filled before cancel — treat as a fill
-                    actual_cost = size_matched * order["price"]
-                    drift = order["cost_est"] - actual_cost
+                    # Account for shares already recorded from prior partial fills
+                    prev_matched = order.get("_last_matched", 0)
+                    new_fill_shares = size_matched - prev_matched
+                    if new_fill_shares < 0.001:
+                        # Already fully accounted for by prior partial fills
+                        self.open_orders = [
+                            o for o in self.open_orders
+                            if o["order_id"] != order_id
+                        ]
+                        return False
+
+                    new_fill_cost = new_fill_shares * order["price"]
+                    drift = order["cost_est"] - new_fill_cost
                     self.bankroll += drift
                     self.signal.bankroll = self.bankroll
 
@@ -107,8 +118,8 @@ class OrderMixin:
                     self.pending_fills.append({
                         "market_slug": order["market_slug"],
                         "side": order["side"],
-                        "cost_usd": actual_cost,
-                        "shares": size_matched,
+                        "cost_usd": new_fill_cost,
+                        "shares": new_fill_shares,
                         "order_id": order_id,
                         "entry_ts": order["placed_ts"],
                         "fill_ts_unix": _time.time(),
@@ -120,13 +131,11 @@ class OrderMixin:
                     self.window_trade_count += 1
                     self.position_count += 1
 
-                    entry_px = (
-                        actual_cost / size_matched if size_matched > 0 else 0
-                    )
+                    entry_px = order["price"]
                     self._event(
                         f"[CANCEL->FILL] {order['side']} "
-                        f"{size_matched:.1f}sh @ {entry_px:.4f} "
-                        f"(${actual_cost:.2f}) — filled before cancel"
+                        f"{new_fill_shares:.1f}sh @ {entry_px:.4f} "
+                        f"(${new_fill_cost:.2f}) — filled before cancel"
                         + self._model_fill_line(order)
                     )
                     self._log({
@@ -134,9 +143,9 @@ class OrderMixin:
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "order_id": order_id,
                         "side": order["side"],
-                        "shares": round(size_matched, 2),
+                        "shares": round(new_fill_shares, 2),
                         "price": order["price"],
-                        "cost_usd": round(actual_cost, 2),
+                        "cost_usd": round(new_fill_cost, 2),
                         "note": f"filled_before_cancel: {reason}",
                         **self._model_log_fields(order),
                     })
@@ -144,8 +153,30 @@ class OrderMixin:
 
                 elif size_matched > 0:
                     # Partial fill before cancel — record filled, refund unfilled
-                    filled_cost = size_matched * order["price"]
-                    unfilled_cost_est = order["cost_est"] - filled_cost
+                    # Account for shares already recorded from prior partial fills
+                    prev_matched = order.get("_last_matched", 0)
+                    new_fill_shares = size_matched - prev_matched
+
+                    if new_fill_shares < 0.001:
+                        # All matched shares already recorded; just refund remaining
+                        self.bankroll += order["cost_est"]
+                        self.signal.bankroll = self.bankroll
+                        self.open_orders = [
+                            o for o in self.open_orders
+                            if o["order_id"] != order_id
+                        ]
+                        self._log({
+                            "type": "limit_cancel",
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "order_id": order_id,
+                            "side": order["side"],
+                            "status": "cancelled_partial_done",
+                            "refund": round(order["cost_est"], 2),
+                        })
+                        return True
+
+                    new_fill_cost = new_fill_shares * order["price"]
+                    unfilled_cost_est = order["cost_est"] - new_fill_cost
 
                     self.bankroll += unfilled_cost_est
                     self.signal.bankroll = self.bankroll
@@ -158,8 +189,8 @@ class OrderMixin:
                     self.pending_fills.append({
                         "market_slug": order["market_slug"],
                         "side": order["side"],
-                        "cost_usd": filled_cost,
-                        "shares": size_matched,
+                        "cost_usd": new_fill_cost,
+                        "shares": new_fill_shares,
                         "order_id": order_id,
                         "entry_ts": order["placed_ts"],
                         "fill_ts_unix": _time.time(),
@@ -171,13 +202,11 @@ class OrderMixin:
                     self.window_trade_count += 1
                     self.position_count += 1
 
-                    entry_px = (
-                        filled_cost / size_matched if size_matched > 0 else 0
-                    )
+                    entry_px = order["price"]
                     self._event(
                         f"[CANCEL->PARTIAL] {order['side']} "
-                        f"{size_matched:.1f}/{original_size:.1f}sh "
-                        f"@ {entry_px:.4f} (${filled_cost:.2f}) — "
+                        f"{new_fill_shares:.1f}/{original_size:.1f}sh "
+                        f"@ {entry_px:.4f} (${new_fill_cost:.2f}) — "
                         f"refunding ${unfilled_cost_est:.2f}"
                         + self._model_fill_line(order)
                     )
@@ -186,9 +215,9 @@ class OrderMixin:
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "order_id": order_id,
                         "side": order["side"],
-                        "filled_shares": round(size_matched, 2),
+                        "filled_shares": round(new_fill_shares, 2),
                         "price": order["price"],
-                        "cost_usd": round(filled_cost, 2),
+                        "cost_usd": round(new_fill_cost, 2),
                         "refund": round(unfilled_cost_est, 2),
                         "note": f"partial_before_cancel: {reason}",
                         **self._model_log_fields(order),
@@ -495,16 +524,23 @@ class OrderMixin:
             fill_pct = size_matched / original_size if original_size > 0 else 0
 
             if status == "MATCHED" or fill_pct >= 0.99:
-                actual_cost = size_matched * order["price"]
-                drift = order["cost_est"] - actual_cost
+                # Account for shares already recorded from prior partial fills
+                prev_matched = order.get("_last_matched", 0)
+                new_fill_shares = size_matched - prev_matched
+                if new_fill_shares < 0.001:
+                    # Already fully accounted for by prior partial fills
+                    continue
+
+                new_fill_cost = new_fill_shares * order["price"]
+                drift = order["cost_est"] - new_fill_cost
                 self.bankroll += drift
                 self.signal.bankroll = self.bankroll
 
                 self.pending_fills.append({
                     "market_slug": order["market_slug"],
                     "side": order["side"],
-                    "cost_usd": actual_cost,
-                    "shares": size_matched,
+                    "cost_usd": new_fill_cost,
+                    "shares": new_fill_shares,
                     "order_id": order_id,
                     "entry_ts": order["placed_ts"],
                     "fill_ts_unix": _time.time(),
@@ -517,10 +553,10 @@ class OrderMixin:
                 self.window_trade_count += 1
                 self.position_count += 1
 
-                entry_px = actual_cost / size_matched if size_matched > 0 else 0
+                entry_px = order["price"]
                 self._event(
-                    f"[LIMIT FILLED] {order['side']} {size_matched:.1f}sh "
-                    f"@ {entry_px:.4f} (${actual_cost:.2f})"
+                    f"[LIMIT FILLED] {order['side']} {new_fill_shares:.1f}sh "
+                    f"@ {entry_px:.4f} (${new_fill_cost:.2f})"
                     + self._model_fill_line(order)
                 )
                 self._log({
@@ -528,9 +564,9 @@ class OrderMixin:
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "order_id": order_id,
                     "side": order["side"],
-                    "shares": round(size_matched, 2),
+                    "shares": round(new_fill_shares, 2),
                     "price": order["price"],
-                    "cost_usd": round(actual_cost, 2),
+                    "cost_usd": round(new_fill_cost, 2),
                     **self._model_log_fields(order),
                 })
 
@@ -598,6 +634,124 @@ class OrderMixin:
                 still_open.append(order)
 
         self.open_orders = still_open
+
+    def _process_user_events(self: "LiveTradeTracker", snapshot: Snapshot):
+        """Process buffered UserFeed WS events for instant fill/cancel handling.
+
+        Called each tick BEFORE _poll_open_orders. Events from the Polymarket
+        user WebSocket arrive as dicts with string keys/values.
+        """
+        if not hasattr(self, "user_feed") or self.user_feed is None:
+            return
+        if not self.open_orders:
+            return
+
+        try:
+            events = self.user_feed.drain_events()
+        except Exception:
+            return
+
+        if not events:
+            return
+
+        # Index open orders by order_id for fast lookup
+        order_map: dict[str, dict] = {}
+        for order in self.open_orders:
+            order_map[order["order_id"]] = order
+
+        processed_ids: set[str] = set()
+
+        for evt in events:
+            order_id = evt.get("order_id", "")
+            if not order_id or order_id not in order_map:
+                continue
+
+            order = order_map[order_id]
+            status = evt.get("status", "").upper()
+            event_type = evt.get("event_type", "").lower()
+
+            # Full fill
+            if status == "MATCHED" or event_type == "trade":
+                size_matched_str = evt.get("size_matched", "0")
+                try:
+                    size_matched = float(size_matched_str)
+                except (ValueError, TypeError):
+                    size_matched = 0.0
+
+                if size_matched <= 0:
+                    size_matched = order["shares"]
+
+                # Account for shares already recorded from prior partial fills
+                prev_matched = order.get("_last_matched", 0)
+                new_fill_shares = size_matched - prev_matched
+                if new_fill_shares < 0.001:
+                    # Already fully accounted for
+                    processed_ids.add(order_id)
+                    continue
+
+                new_fill_cost = new_fill_shares * order["price"]
+                drift = order["cost_est"] - new_fill_cost
+                self.bankroll += drift
+                self.signal.bankroll = self.bankroll
+
+                self.pending_fills.append({
+                    "market_slug": order["market_slug"],
+                    "side": order["side"],
+                    "cost_usd": new_fill_cost,
+                    "shares": new_fill_shares,
+                    "order_id": order_id,
+                    "entry_ts": order["placed_ts"],
+                    "fill_ts_unix": _time.time(),
+                    "time_remaining_s": order["time_remaining_s"],
+                    "chainlink_price": order["chainlink_price"],
+                    "window_start_price": order["window_start_price"],
+                    "model_snapshot": order.get("model_snapshot"),
+                })
+                self.last_fill_ts_ms = snapshot.ts_ms
+                self.window_trade_count += 1
+                self.position_count += 1
+
+                entry_px = order["price"]
+                self._event(
+                    f"[WS FILL] {order['side']} {new_fill_shares:.1f}sh "
+                    f"@ {entry_px:.4f} (${new_fill_cost:.2f})"
+                    + self._model_fill_line(order)
+                )
+                self._log({
+                    "type": "ws_fill",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "order_id": order_id,
+                    "side": order["side"],
+                    "shares": round(new_fill_shares, 2),
+                    "price": order["price"],
+                    "cost_usd": round(new_fill_cost, 2),
+                    **self._model_log_fields(order),
+                })
+                processed_ids.add(order_id)
+
+            elif status in ("CANCELLED", "EXPIRED"):
+                self.bankroll += order["cost_est"]
+                self.signal.bankroll = self.bankroll
+                self._event(
+                    f"[WS {status}] {order['side']} "
+                    f"{order['shares']:.1f}sh @ {order['price']:.4f} "
+                    f"— refunded ${order['cost_est']:.2f}"
+                )
+                self._log({
+                    "type": "ws_cancel",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "order_id": order_id,
+                    "side": order["side"],
+                    "status": status,
+                    "refund": round(order["cost_est"], 2),
+                })
+                processed_ids.add(order_id)
+
+        # Remove processed orders
+        if processed_ids:
+            self.open_orders = [
+                o for o in self.open_orders if o["order_id"] not in processed_ids
+            ]
 
     def _cancel_open_orders(self: "LiveTradeTracker"):
         """Cancel all open limit orders and refund reserved bankroll."""

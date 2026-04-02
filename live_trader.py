@@ -36,7 +36,7 @@ load_dotenv()
 
 from web3 import Web3
 
-from polybot_core import OrderClient, BookFeed, PriceFeed, BinanceFeed
+from polybot_core import OrderClient, BookFeed, PriceFeed, BinanceFeed, UserFeed
 
 from backtest import (
     Decision, DiffusionSignal, build_calibration_table,
@@ -365,6 +365,22 @@ async def run_window(
 
     book_feed = BookFeed([up_token, down_token])
 
+    # UserFeed for real-time fill/cancel events (requires API creds)
+    api_key = os.getenv("POLY_API_KEY", "")
+    api_secret = os.getenv("POLY_API_SECRET", "")
+    api_passphrase = os.getenv("POLY_PASSPHRASE", "")
+    if api_key and api_secret and api_passphrase and not tracker.dry_run:
+        try:
+            user_feed = UserFeed(api_key, api_secret, api_passphrase,
+                                 [up_token, down_token])
+            tracker.user_feed = user_feed
+            print(f"  [{config.display_name}] UserFeed started (WS fills enabled)")
+        except Exception as exc:
+            print(f"  [{config.display_name}] UserFeed failed: {exc} (using REST polling)")
+            tracker.user_feed = None
+    else:
+        tracker.user_feed = None
+
     # Wait until eventStartTime + 5s so the RTDS buffer has the start price
     now = datetime.now(timezone.utc)
     target = start + timedelta(seconds=5)
@@ -534,10 +550,17 @@ async def _periodic_redeem_loop(
 
     Runs independently of the trading loop so items get retried even when
     no new trades are happening. This is the PRIMARY redemption driver.
+    Deduplicates by queue file path so shared queues (e.g. BTC 15m + 5m)
+    are only processed once per cycle.
     """
     while True:
         await asyncio.sleep(interval_s)
+        seen_queues: set[str] = set()
         for tracker in all_trackers:
+            qpath = str(tracker.redemption_queue._file)
+            if qpath in seen_queues:
+                continue
+            seen_queues.add(qpath)
             if len(tracker.redemption_queue) > 0:
                 try:
                     await asyncio.to_thread(tracker.process_redemption_queue)
@@ -679,7 +702,13 @@ async def run(
                 print(f"  [STARTUP] Scan error: {exc}")
 
         # Process any queued redemptions from previous session + scan
+        # Dedup by queue file path (BTC 15m + 5m share the same queue)
+        seen_startup_queues: set[str] = set()
         for tracker, _, _ in trackers_and_configs:
+            qpath = str(tracker.redemption_queue._file)
+            if qpath in seen_startup_queues:
+                continue
+            seen_startup_queues.add(qpath)
             if len(tracker.redemption_queue) > 0:
                 print(f"  [STARTUP] Processing {len(tracker.redemption_queue)} "
                       f"queued redemption(s)...")
@@ -744,7 +773,7 @@ def _build_tracker(
         )
     elif base_market == "eth":
         signal_kw = dict(
-            max_z=0.7,
+            max_z=3.0 if not is_5m else 0.7,
             edge_threshold=0.12,
             reversion_discount=0.20 if not is_5m else 0.0,
             momentum_lookback_s=15,
@@ -821,6 +850,11 @@ def _build_tracker(
     signal_kw["as_mode"] = args.as_mode
     signal_kw["gamma_inv"] = args.gamma_inv
     signal_kw["gamma_spread"] = args.gamma_spread
+    # Per-market gamma_spread overrides (CLI default is 1.5)
+    if base_market == "eth" and not is_5m:
+        signal_kw["gamma_spread"] = 0.75   # ETH 15m
+    elif base_market == "btc" and is_5m:
+        signal_kw["gamma_spread"] = 2.0    # BTC 5m
     signal_kw["min_edge"] = args.min_edge
     signal_kw["tox_spread"] = args.tox_spread
     signal_kw["vpin_spread"] = args.vpin_spread_as
@@ -886,13 +920,8 @@ def _build_tracker(
 
     if is_5m:
         signal_kw["vol_lookback_s"] = 30
-        signal_kw["edge_threshold"] = 0.15
         maker_warmup = 30.0
-        if base_market == "eth":
-            signal_kw["edge_threshold"] = 0.10
-            signal_kw["early_edge_mult"] = 1.2
-        elif base_market in ("sol", "xrp"):
-            signal_kw["edge_threshold"] = 0.10
+        if base_market in ("eth", "sol", "xrp"):
             signal_kw["early_edge_mult"] = 1.2
         signal_kw["maker_warmup_s"] = maker_warmup
         signal_kw["maker_withdraw_s"] = maker_withdraw
@@ -937,6 +966,9 @@ def _build_tracker(
         trades_log=trades_log,
         state_file=state_file,
         min_requote_ticks=args.min_requote_ticks,
+        dual_side=args.dual_side,
+        max_net_exposure=args.max_net_exposure,
+        max_gross_exposure=args.max_gross_exposure,
     )
     if use_calibration:
         from backtest import DATA_DIR
@@ -1020,7 +1052,7 @@ def main():
                         help="Don't exit when < this many seconds remain (default: 60)")
     parser.add_argument("--exit-sell-buffer", type=float, default=0.08,
                         help="Buffer above model value for sell price floor (default: 0.08)")
-    parser.add_argument("--max-positions", type=int, default=1,
+    parser.add_argument("--max-positions", type=int, default=2,
                         help="Max simultaneous filled positions (default: 1)")
     parser.add_argument("--inventory-skew", type=float, default=0.02,
                         help="Edge penalty per same-side position (default 0.02)")
@@ -1028,6 +1060,12 @@ def main():
                         help="Stop new orders when tau < N seconds (default 30)")
     parser.add_argument("--min-requote-ticks", type=int, default=2,
                         help="Min tick improvement before requoting (default: 2 = $0.02)")
+    parser.add_argument("--dual-side", action="store_true", default=False,
+                        help="Allow opposite-side positions only when it reduces net exposure")
+    parser.add_argument("--max-net-exposure", type=float, default=0.0,
+                        help="Max |UP_shares - DOWN_shares| (0=disabled)")
+    parser.add_argument("--max-gross-exposure", type=float, default=0.0,
+                        help="Max total shares across both sides (0=disabled)")
     parser.add_argument("--toxicity-threshold", type=float, default=0.75,
                         help="Toxicity score above which edge threshold widens (default: 0.75)")
     parser.add_argument("--toxicity-edge-mult", type=float, default=1.5,
@@ -1066,7 +1104,7 @@ def main():
                         help="Enable A-S reservation price quoting")
     parser.add_argument("--gamma-inv", type=float, default=0.15,
                         help="A-S gamma for inventory penalty (default: 0.15)")
-    parser.add_argument("--gamma-spread", type=float, default=0.75,
+    parser.add_argument("--gamma-spread", type=float, default=1.5,
                         help="A-S gamma for base spread (default: 0.75)")
     parser.add_argument("--min-edge", type=float, default=0.05,
                         help="Floor on required edge in A-S mode (default: 0.05)")

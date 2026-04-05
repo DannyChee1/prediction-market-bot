@@ -16,6 +16,8 @@ class MarketConfig:
     max_sigma: float = 8e-05           # per-second sigma ceiling
     min_sigma: float = 1e-6            # per-second sigma floor
     binance_symbol: str = ""           # e.g. "btcusdt" for Binance bookTicker
+    tail_mode: str = "normal"          # "normal" or "student_t"
+    tail_nu_default: float = 20.0      # Student-t degrees of freedom (ignored for normal)
 
 
 MARKET_CONFIGS: dict[str, MarketConfig] = {
@@ -38,6 +40,8 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=15,
         max_sigma=1.0e-04,
         binance_symbol="ethusdt",
+        tail_mode="student_t",
+        tail_nu_default=13.0,
     ),
     "btc_5m": MarketConfig(
         slug_prefix="btc-updown-5m",
@@ -48,6 +52,8 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=5,
         min_sigma=7e-05,
         binance_symbol="btcusdt",
+        tail_mode="student_t",
+        tail_nu_default=20.0,
     ),
     "eth_5m": MarketConfig(
         slug_prefix="eth-updown-5m",
@@ -58,6 +64,8 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=5,
         max_sigma=1.0e-04,
         binance_symbol="ethusdt",
+        tail_mode="student_t",
+        tail_nu_default=15.0,
     ),
     "sol": MarketConfig(
         slug_prefix="sol-updown-15m",

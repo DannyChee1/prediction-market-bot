@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 # ── WS endpoints ─────────────────────────────────────────────────────────────
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RTDS_WS = "wss://ws-live-data.polymarket.com"
-BINANCE_WS = "wss://stream.binance.com:9443/ws"
+BINANCE_WS = "wss://data-stream.binance.vision/ws"
 
 
 # ── Live snapshot builder ────────────────────────────────────────────────────
@@ -181,6 +181,9 @@ async def clob_ws(
                                     size = float(msg.get("size", 0))
                                     trade_side = msg.get("side", "").upper()
                                     if size > 0 and trade_side in ("BUY", "SELL"):
+                                        sides = trade_state.get("sides")
+                                        if sides is not None:
+                                            sides.append(trade_side)
                                         bar = trade_state["current_bar"]
                                         now_ts = _time.time()
                                         if bar["start_ts"] == 0:

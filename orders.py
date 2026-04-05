@@ -62,6 +62,18 @@ class OrderMixin:
             f" | tau={ms['tau']:.0f}s"
         )
 
+    def _latency_log_fields(self: "LiveTradeTracker") -> dict:
+        return {
+            "signal_trigger_source": self.ctx.get("_signal_trigger_source"),
+            "signal_trigger_age_ms": round(self.ctx.get("_signal_trigger_age_ms", 0.0), 1),
+            "signal_trigger_feed_age_ms": round(self.ctx.get("_signal_trigger_feed_age_ms", 0.0), 1),
+            "signal_eval_ms": round(self.ctx.get("_signal_eval_ms", 0.0), 1),
+            "decision_total_ms": round(self.ctx.get("_decision_total_ms", 0.0), 1),
+            "chainlink_age_ms": round(self.ctx.get("_chainlink_age_ms", 0.0), 1),
+            "binance_age_ms": round(self.ctx.get("_binance_age_ms", 0.0), 1),
+            "book_age_ms": round(self.ctx.get("_book_age_ms", 0.0), 1),
+        }
+
     # ── Cancel ─────────────────────────────────────────────────────────────
 
     def _cancel_single_order(self: "LiveTradeTracker", order: dict, reason: str) -> bool:
@@ -328,7 +340,9 @@ class OrderMixin:
             "signal_reason": decision.reason,
             "bankroll_before": round(self.bankroll, 2),
             "chainlink_price": round(snapshot.chainlink_price, 2),
+            "signal_trigger_ts_ms": int(self.ctx.get("_signal_trigger_ts_ms", 0) or 0),
             **model_snapshot,
+            **self._latency_log_fields(),
         }
 
         if self.dry_run:
@@ -362,7 +376,9 @@ class OrderMixin:
 
         # Place GTC limit order via Rust OrderClient (single call: sign + HTTP/2 POST)
         try:
+            post_start_ms = int(_time.time() * 1000)
             resp = self.client.place_order(token_id, limit_price, shares, "BUY", "GTC", 1000)
+            post_done_ms = int(_time.time() * 1000)
         except Exception as exc:
             trade_record["status"] = "error"
             trade_record["error"] = str(exc)
@@ -378,6 +394,11 @@ class OrderMixin:
         trade_record["status"] = status
         trade_record["success"] = success
         trade_record["response"] = resp
+        trade_record["order_post_ms"] = post_done_ms - post_start_ms
+        trigger_ts_ms = int(self.ctx.get("_signal_trigger_ts_ms", 0) or 0)
+        if trigger_ts_ms > 0:
+            trade_record["signal_to_post_ms"] = max(0, post_start_ms - trigger_ts_ms)
+            trade_record["signal_to_ack_ms"] = max(0, post_done_ms - trigger_ts_ms)
 
         if not success:
             trade_record["filled"] = False
@@ -412,6 +433,8 @@ class OrderMixin:
                 "chainlink_price": snapshot.chainlink_price,
                 "window_start_price": snapshot.window_start_price,
                 "model_snapshot": model_snapshot,
+                "signal_trigger_ts_ms": trigger_ts_ms,
+                "order_posted_ts_ms": post_start_ms,
             })
             self.last_fill_ts_ms = snapshot.ts_ms
             self.window_trade_count += 1
@@ -447,6 +470,8 @@ class OrderMixin:
             "window_start_price": snapshot.window_start_price,
             "model_snapshot": model_snapshot,
             "edge_at_place": round(decision.edge, 4),
+            "signal_trigger_ts_ms": trigger_ts_ms,
+            "order_posted_ts_ms": post_start_ms,
         })
 
         self._event(

@@ -282,6 +282,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.flat_reason_counts: dict[str, int] = {}
         self.signal_eval_count: int = 0
         self.last_diag_ts: float = 0.0
+        self.latency_samples: collections.deque = collections.deque(maxlen=512)
 
     def new_window(self, window_end: datetime):
         if self.flat_reason_counts:
@@ -321,6 +322,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.signal_eval_count = 0
         self.last_diag_ts = 0.0
         self.last_requote_ts = {"UP": 0.0, "DOWN": 0.0}
+        self.latency_samples = collections.deque(maxlen=512)
 
     def _check_circuit_breakers(self) -> str | None:
         """Returns reason string if trading should stop, None if OK."""
@@ -1086,6 +1088,14 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "vpin": round(self.ctx.get("_vpin", 0.0), 4),
             "oracle_lag": round(self.ctx.get("_oracle_lag", 0.0), 6),
             "regime_z_factor": round(self.ctx.get("_regime_z_factor", 1.0), 4),
+            "signal_trigger_source": self.ctx.get("_signal_trigger_source"),
+            "signal_trigger_age_ms": round(self.ctx.get("_signal_trigger_age_ms", 0.0), 1),
+            "signal_trigger_feed_age_ms": round(self.ctx.get("_signal_trigger_feed_age_ms", 0.0), 1),
+            "signal_eval_ms": round(self.ctx.get("_signal_eval_ms", 0.0), 1),
+            "decision_total_ms": round(self.ctx.get("_decision_total_ms", 0.0), 1),
+            "chainlink_age_ms": round(self.ctx.get("_chainlink_age_ms", 0.0), 1),
+            "binance_age_ms": round(self.ctx.get("_binance_age_ms", 0.0), 1),
+            "book_age_ms": round(self.ctx.get("_book_age_ms", 0.0), 1),
             "down_bonus_active": self.ctx.get("_down_bonus_active", False),
             "down_share": round(self.ctx.get("_down_share", 0.5), 4),
             "reason": decision.reason,

@@ -1,3 +1,4 @@
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -208,12 +209,25 @@ async fn book_feed_task(
             write
         });
 
-        // Read messages
-        while let Some(msg) = read.next().await {
+        // Read messages with timeout — detects silent server-side drops
+        let read_timeout = std::time::Duration::from_secs(30);
+        loop {
+            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break,
+                Err(_) => {
+                    eprintln!("[BookFeed] no data for 30s, reconnecting");
+                    break;
+                }
+            };
             let text = match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
+                Ok(tokio_tungstenite::tungstenite::Message::Pong(_)) => continue,
                 Ok(_) => continue,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("[BookFeed] read error: {e}");
+                    break;
+                }
             };
 
             if text == "PONG" || text.is_empty() {
@@ -554,12 +568,38 @@ async fn price_feed_task(
         }
 
         let _ = hb.await;
-        backoff = 2;  // reset backoff on every reconnect attempt
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(backoff.min(30))).await;
+        backoff = (backoff * 2).min(60);
     }
 }
 
 // ── BinanceFeed ─────────────────────────────────────────────────────────────
+
+const SBE_STREAM_SCHEMA_ID: u16 = 1;
+const SBE_STREAM_SCHEMA_VERSION: u16 = 0;
+const SBE_TEMPLATE_BEST_BID_ASK: u16 = 10_001;
+const SBE_HEADER_LEN: usize = 8;
+const SBE_BEST_BID_ASK_BLOCK_LEN: usize = 50;
+
+#[derive(Clone, Copy)]
+enum BinanceFeedMode {
+    JsonBookTicker,
+    SbeBestBidAsk,
+}
+
+impl BinanceFeedMode {
+    fn parse(mode: Option<&str>) -> PyResult<Self> {
+        match mode.unwrap_or("json").trim().to_ascii_lowercase().as_str() {
+            "" | "json" | "bookticker" | "book_ticker" => Ok(Self::JsonBookTicker),
+            "sbe" | "bestbidask" | "best_bid_ask" | "sbe_best_bid_ask" => {
+                Ok(Self::SbeBestBidAsk)
+            }
+            other => Err(PyValueError::new_err(format!(
+                "unsupported BinanceFeed mode '{other}'"
+            ))),
+        }
+    }
+}
 
 /// Binance bookTicker WebSocket feed for oracle lag detection.
 ///
@@ -574,12 +614,16 @@ pub struct BinanceFeed {
 
 #[pymethods]
 impl BinanceFeed {
-    /// Create a BinanceFeed and start streaming bookTicker data.
+    /// Create a BinanceFeed and start streaming Binance best bid/ask data.
     ///
     /// Args:
     ///     symbol: Binance symbol in lowercase (e.g. "btcusdt")
+    ///     mode:   "json" (default) or "sbe"
+    ///     api_key: Binance API key required for SBE feeds
     #[new]
-    fn new(symbol: String) -> Self {
+    #[pyo3(signature = (symbol, mode=None, api_key=None))]
+    fn new(symbol: String, mode: Option<String>, api_key: Option<String>) -> PyResult<Self> {
+        let feed_mode = BinanceFeedMode::parse(mode.as_deref())?;
         let mid = Arc::new(AtomicU64::new(0));
         let last_update_ts = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(tokio::sync::Notify::new());
@@ -589,14 +633,14 @@ impl BinanceFeed {
         let c = cancel.clone();
 
         RUNTIME.spawn(async move {
-            binance_feed_task(symbol, m, ts, c).await;
+            binance_feed_task(symbol, feed_mode, api_key, m, ts, c).await;
         });
 
-        Self {
+        Ok(Self {
             mid,
             last_update_ts,
             _cancel: cancel,
-        }
+        })
     }
 
     /// Get the latest Binance mid price, or None if no data yet.
@@ -617,15 +661,78 @@ impl BinanceFeed {
 
 async fn binance_feed_task(
     symbol: String,
+    mode: BinanceFeedMode,
+    api_key: Option<String>,
     mid: Arc<AtomicU64>,
     last_update_ts: Arc<AtomicU64>,
     _cancel: Arc<tokio::sync::Notify>,
+) {
+    match mode {
+        BinanceFeedMode::JsonBookTicker => {
+            binance_json_feed_task(symbol, mid, last_update_ts).await;
+        }
+        BinanceFeedMode::SbeBestBidAsk => {
+            if let Some(key) = api_key {
+                binance_sbe_feed_task(symbol, key, mid, last_update_ts).await;
+            } else {
+                eprintln!("[BinanceFeed] SBE mode requires X-MBX-APIKEY");
+            }
+        }
+    }
+}
+
+fn now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+fn decode_sbe_decimal(mantissa: i64, exponent: i8) -> f64 {
+    (mantissa as f64) * 10_f64.powi(exponent as i32)
+}
+
+fn decode_best_bid_ask_frame(frame: &[u8]) -> Option<(f64, f64)> {
+    if frame.len() < SBE_HEADER_LEN + SBE_BEST_BID_ASK_BLOCK_LEN {
+        return None;
+    }
+
+    let block_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+    let template_id = u16::from_le_bytes([frame[2], frame[3]]);
+    let schema_id = u16::from_le_bytes([frame[4], frame[5]]);
+    let version = u16::from_le_bytes([frame[6], frame[7]]);
+
+    if template_id != SBE_TEMPLATE_BEST_BID_ASK
+        || schema_id != SBE_STREAM_SCHEMA_ID
+        || version != SBE_STREAM_SCHEMA_VERSION
+        || block_len < SBE_BEST_BID_ASK_BLOCK_LEN
+    {
+        return None;
+    }
+
+    let body = &frame[SBE_HEADER_LEN..];
+    let price_exponent = body[16] as i8;
+    let bid_price = i64::from_le_bytes(body[18..26].try_into().ok()?);
+    let ask_price = i64::from_le_bytes(body[34..42].try_into().ok()?);
+    let bid = decode_sbe_decimal(bid_price, price_exponent);
+    let ask = decode_sbe_decimal(ask_price, price_exponent);
+    if bid > 0.0 && ask > 0.0 {
+        Some((bid, ask))
+    } else {
+        None
+    }
+}
+
+async fn binance_json_feed_task(
+    symbol: String,
+    mid: Arc<AtomicU64>,
+    last_update_ts: Arc<AtomicU64>,
 ) {
     use futures_util::StreamExt;
     use tokio_tungstenite::connect_async;
 
     let url = format!(
-        "wss://stream.binance.com:9443/ws/{}@bookTicker",
+        "wss://data-stream.binance.vision/ws/{}@bookTicker",
         symbol.to_lowercase()
     );
     let mut backoff = 2u64;
@@ -647,6 +754,9 @@ async fn binance_feed_task(
 
         let (_write, mut read) = ws.split();
 
+        // No client heartbeat needed: bookTicker sends hundreds of updates/second
+        // so the 30s read timeout is sufficient to detect dead connections.
+        // Sending application-level PING confuses the CDN and causes resets.
         let read_timeout = std::time::Duration::from_secs(30);
         loop {
             let msg = match tokio::time::timeout(read_timeout, read.next()).await {
@@ -679,11 +789,92 @@ async fn binance_feed_task(
                 if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
                     let mid_val = (bid + ask) / 2.0;
                     store_f64(&mid, mid_val);
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
-                    store_f64(&last_update_ts, now);
+                    store_f64(&last_update_ts, now_s());
+                }
+            }
+        }
+
+        backoff = (backoff * 2).min(60);
+        tokio::time::sleep(std::time::Duration::from_secs(backoff.min(30))).await;
+    }
+}
+
+async fn binance_sbe_feed_task(
+    symbol: String,
+    api_key: String,
+    mid: Arc<AtomicU64>,
+    last_update_ts: Arc<AtomicU64>,
+) {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::{
+        client::IntoClientRequest,
+        http::HeaderValue,
+        Message,
+    };
+
+    let url = format!(
+        "wss://stream-sbe.binance.com/ws/{}@bestBidAsk",
+        symbol.to_lowercase()
+    );
+    let mut backoff = 2u64;
+
+    loop {
+        let mut req = match url.clone().into_client_request() {
+            Ok(req) => req,
+            Err(e) => {
+                eprintln!("[BinanceFeed:SBE] request build error: {e}");
+                return;
+            }
+        };
+        match HeaderValue::from_str(api_key.trim()) {
+            Ok(header) => {
+                req.headers_mut().insert("X-MBX-APIKEY", header);
+            }
+            Err(e) => {
+                eprintln!("[BinanceFeed:SBE] invalid API key header: {e}");
+                return;
+            }
+        }
+
+        let result = connect_async(req).await;
+        let (ws, _) = match result {
+            Ok(conn) => {
+                backoff = 2;
+                conn
+            }
+            Err(e) => {
+                eprintln!("[BinanceFeed:SBE] connect error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff.min(60))).await;
+                backoff = (backoff * 2).min(60);
+                continue;
+            }
+        };
+
+        let (_write, mut read) = ws.split();
+        let read_timeout = std::time::Duration::from_secs(30);
+        loop {
+            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break,
+                Err(_) => {
+                    eprintln!("[BinanceFeed:SBE] no data for 30s, reconnecting");
+                    break;
+                }
+            };
+
+            match msg {
+                Ok(Message::Binary(buf)) => {
+                    if let Some((bid, ask)) = decode_best_bid_ask_frame(buf.as_ref()) {
+                        store_f64(&mid, (bid + ask) / 2.0);
+                        store_f64(&last_update_ts, now_s());
+                    }
+                }
+                Ok(Message::Text(_)) => continue,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("[BinanceFeed:SBE] read error: {e}");
+                    break;
                 }
             }
         }

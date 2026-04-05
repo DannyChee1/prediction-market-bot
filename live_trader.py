@@ -53,6 +53,12 @@ from recording import record_sampler
 from tracker import LiveTradeTracker
 from redemption import POLYGON_RPC
 
+FAST_PRICE_POLL_S = 0.005
+FAST_BINANCE_POLL_S = 0.005
+FAST_BOOK_POLL_S = 0.005
+FAST_SIGNAL_IDLE_S = 0.01
+FAST_SIGNAL_MIN_INTERVAL_S = 0.005
+
 
 # ── Signal Ticker ────────────────────────────────────────────────────────────
 
@@ -65,16 +71,66 @@ async def signal_ticker(
     skip_trading: bool = False,
     trade_state: dict | None = None,
     binance_state: dict | None = None,
+    book_state: dict | None = None,
     window_start_price: float | None = None,
+    wake_event: asyncio.Event | None = None,
+    wake_state: dict | None = None,
+    signal_idle_s: float = 0.05,
+    signal_min_interval_s: float = 0.025,
 ):
+    last_seen = (-1, -1, -1)
+    last_eval_ms = 0
     while not cancel.is_set():
-        await asyncio.sleep(1)
+        timed_out = False
+        if wake_event is not None:
+            try:
+                await asyncio.wait_for(wake_event.wait(), timeout=signal_idle_s)
+            except asyncio.TimeoutError:
+                timed_out = True
+            wake_event.clear()
+        else:
+            await asyncio.sleep(signal_idle_s)
+            timed_out = True
         if cancel.is_set():
             break
+
+        now_ms = int(_time.time() * 1000)
+        sig = (
+            int(price_state.get("seq", 0) or 0),
+            int(binance_state.get("seq", 0) or 0) if binance_state is not None else 0,
+            int(book_state.get("seq", 0) or 0) if book_state is not None else 0,
+        )
+        if not timed_out and sig == last_seen:
+            continue
+        if (not timed_out
+                and signal_min_interval_s > 0
+                and last_eval_ms > 0
+                and (now_ms - last_eval_ms) < int(signal_min_interval_s * 1000)):
+            continue
+        last_seen = sig
+        eval_start_ms = int(_time.time() * 1000)
 
         try:
             # Clear previous error on successful tick start
             tracker.ctx.pop("_signal_error", None)
+            tracker.ctx["_signal_trigger_ts_ms"] = int(
+                (wake_state or {}).get("trigger_wall_ts_ms", eval_start_ms)
+            )
+            tracker.ctx["_signal_trigger_source"] = (wake_state or {}).get("trigger_source")
+            tracker.ctx["_signal_trigger_age_ms"] = max(
+                0.0,
+                eval_start_ms - float((wake_state or {}).get("trigger_wall_ts_ms", eval_start_ms)),
+            )
+            tracker.ctx["_signal_trigger_feed_age_ms"] = max(
+                0.0,
+                eval_start_ms - float((wake_state or {}).get("trigger_feed_ts_ms", eval_start_ms)),
+            )
+            cl_ts = float(price_state.get("last_update_ts", 0.0) or 0.0)
+            bn_ts = float(binance_state.get("last_update_ts", 0.0) or 0.0) if binance_state is not None else 0.0
+            bk_ts = float(book_state.get("last_update_ts", 0.0) or 0.0) if book_state is not None else 0.0
+            tracker.ctx["_chainlink_age_ms"] = max(0.0, eval_start_ms - cl_ts * 1000.0) if cl_ts > 0 else None
+            tracker.ctx["_binance_age_ms"] = max(0.0, eval_start_ms - bn_ts * 1000.0) if bn_ts > 0 else None
+            tracker.ctx["_book_age_ms"] = max(0.0, eval_start_ms - bk_ts * 1000.0) if bk_ts > 0 else None
 
             # Inject Binance mid into ctx only if fresh (< 10s old).
             # Stale Binance data (WS dropped) would poison vol/z/oracle-lag.
@@ -111,7 +167,22 @@ async def signal_ticker(
                 if trade_state is not None:
                     tracker.ctx["_trade_bars"] = trade_state["bars"]
                     tracker.ctx["_trade_total_bars"] = trade_state.get("total_bars", 0)
+                    tracker.ctx["_trade_side_history"] = trade_state.get("sides", [])
                 await asyncio.to_thread(tracker.evaluate, snap, up_token, down_token)
+            eval_done_ms = int(_time.time() * 1000)
+            tracker.ctx["_signal_eval_ms"] = eval_done_ms - eval_start_ms
+            trigger_ts_ms = int(tracker.ctx.get("_signal_trigger_ts_ms", eval_start_ms) or eval_start_ms)
+            tracker.ctx["_decision_total_ms"] = eval_done_ms - trigger_ts_ms
+            tracker.latency_samples.append({
+                "signal_trigger_age_ms": tracker.ctx.get("_signal_trigger_age_ms"),
+                "signal_trigger_feed_age_ms": tracker.ctx.get("_signal_trigger_feed_age_ms"),
+                "signal_eval_ms": tracker.ctx.get("_signal_eval_ms"),
+                "decision_total_ms": tracker.ctx.get("_decision_total_ms"),
+                "chainlink_age_ms": tracker.ctx.get("_chainlink_age_ms"),
+                "binance_age_ms": tracker.ctx.get("_binance_age_ms"),
+                "book_age_ms": tracker.ctx.get("_book_age_ms"),
+            })
+            last_eval_ms = eval_done_ms
 
         except Exception as exc:
             err_msg = f"{type(exc).__name__}: {exc}"
@@ -157,10 +228,43 @@ def _display_thread_fn(
 
 # ── Rust Feed Polling ────────────────────────────────────────────────────────
 
+def _notify_signal_wakeup(
+    wake_event: asyncio.Event | None,
+    wake_state: dict | None,
+    source: str,
+    feed_ts_s: float | None,
+):
+    if wake_state is not None:
+        now_ms = int(_time.time() * 1000)
+        wake_state["trigger_source"] = source
+        wake_state["trigger_wall_ts_ms"] = now_ms
+        wake_state["trigger_feed_ts_ms"] = int(feed_ts_s * 1000) if feed_ts_s else now_ms
+    if wake_event is not None:
+        wake_event.set()
+
+
+def _make_binance_feed(symbol: str) -> tuple[BinanceFeed, str]:
+    """Build BinanceFeed, preferring SBE only when the extension supports it."""
+    mode = (os.getenv("BINANCE_FEED_MODE", "json") or "json").strip().lower()
+    api_key = (os.getenv("BINANCE_SBE_API_KEY", "") or "").strip()
+    if mode == "sbe":
+        if not api_key:
+            raise RuntimeError("BINANCE_SBE_API_KEY is required when BINANCE_FEED_MODE=sbe")
+        try:
+            return BinanceFeed(symbol, mode, api_key), "sbe"
+        except TypeError:
+            raise RuntimeError(
+                "installed polybot_core extension is JSON-only; rebuild it before using BINANCE_FEED_MODE=sbe"
+            )
+    return BinanceFeed(symbol), "json"
+
 async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
                            trackers: list[LiveTradeTracker],
                            cancel: asyncio.Event, debug: bool = False,
-                           symbol: str = ""):
+                           symbol: str = "",
+                           wake_event: asyncio.Event | None = None,
+                           wake_state: dict | None = None,
+                           poll_interval_s: float = 0.02):
     """Bridge Rust PriceFeed → Python price_state dict (shared across trackers).
 
     Auto-restarts the Rust WS feed if the price stays stale for >60s
@@ -170,7 +274,7 @@ async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
     _stale_warned = False
     _STALE_RESTART_S = 60.0
     while not cancel.is_set():
-        await asyncio.sleep(0.1)  # fast poll — captures every Chainlink round for accurate start price
+        await asyncio.sleep(poll_interval_s)
         if cancel.is_set():
             break
         try:
@@ -180,10 +284,13 @@ async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
                 last_ts = ts
                 _stale_warned = False
                 price_state["price"] = px
+                price_state["last_update_ts"] = ts
+                price_state["seq"] = int(price_state.get("seq", 0) or 0) + 1
                 for t in trackers:
                     t.last_price_update_ts = ts
                 ts_ms = int(ts * 1000)
                 price_state["price_history"].append((ts_ms, px))
+                _notify_signal_wakeup(wake_event, wake_state, "chainlink", ts)
             elif last_ts > 0:
                 age = _time.time() - last_ts
                 if age > _STALE_RESTART_S and symbol:
@@ -200,7 +307,10 @@ async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
 
 
 async def _poll_binance_feed(binance_feed: BinanceFeed, binance_state: dict,
-                             cancel: asyncio.Event, symbol: str = ""):
+                             cancel: asyncio.Event, symbol: str = "",
+                             wake_event: asyncio.Event | None = None,
+                             wake_state: dict | None = None,
+                             poll_interval_s: float = 0.02):
     """Bridge Rust BinanceFeed → Python binance_state dict.
 
     Auto-restarts if no update for >60s.
@@ -208,7 +318,7 @@ async def _poll_binance_feed(binance_feed: BinanceFeed, binance_state: dict,
     _last_ts = 0.0
     _STALE_RESTART_S = 60.0
     while not cancel.is_set():
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(poll_interval_s)
         if cancel.is_set():
             break
         try:
@@ -218,6 +328,8 @@ async def _poll_binance_feed(binance_feed: BinanceFeed, binance_state: dict,
                 _last_ts = ts
                 binance_state["mid_price"] = mid
                 binance_state["last_update_ts"] = ts
+                binance_state["seq"] = int(binance_state.get("seq", 0) or 0) + 1
+                _notify_signal_wakeup(wake_event, wake_state, "binance", ts)
             elif _last_ts > 0:
                 age = _time.time() - _last_ts
                 if age > _STALE_RESTART_S and symbol:
@@ -230,24 +342,44 @@ async def _poll_binance_feed(binance_feed: BinanceFeed, binance_state: dict,
 
 async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
                           flat_state: dict, trade_state: dict | None,
-                          cancel: asyncio.Event):
+                          cancel: asyncio.Event,
+                          book_state: dict | None = None,
+                          wake_event: asyncio.Event | None = None,
+                          wake_state: dict | None = None,
+                          poll_interval_s: float = 0.02):
     """Bridge Rust BookFeed → Python flat_state + trade_state for VPIN."""
     while not cancel.is_set():
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(poll_interval_s)
         if cancel.is_set():
             break
         try:
+            latest_book_ts = 0.0
+            latest_bbo = {}
+            changed = False
+            trade_changed = False
             # Update flat_state BBO for display thread
             for side, token in [("up", up_token), ("down", down_token)]:
                 snap = book_feed.snapshot(token)
                 bb = snap.best_bid
                 ba = snap.best_ask
+                latest_book_ts = max(latest_book_ts, float(snap.timestamp or 0.0))
+                latest_bbo[f"{side}_best_bid"] = bb
+                latest_bbo[f"{side}_best_ask"] = ba
+                prev_bb = flat_state.get(f"{side}_best_bid")
+                prev_ba = flat_state.get(f"{side}_best_ask")
                 flat_state[f"{side}_best_bid"] = str(bb) if bb is not None else None
                 flat_state[f"{side}_best_ask"] = str(ba) if ba is not None else None
+                if flat_state[f"{side}_best_bid"] != prev_bb or flat_state[f"{side}_best_ask"] != prev_ba:
+                    changed = True
 
             # Drain trade events for VPIN bar accumulation
             if trade_state is not None:
                 for size, trade_side in book_feed.drain_trades():
+                    changed = True
+                    trade_changed = True
+                    sides = trade_state.get("sides")
+                    if sides is not None and trade_side in ("BUY", "SELL"):
+                        sides.append(trade_side)
                     bar = trade_state["current_bar"]
                     now_ts = _time.time()
                     if bar["start_ts"] == 0:
@@ -267,6 +399,23 @@ async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
                         bar["buy_vol"] = 0.0
                         bar["sell_vol"] = 0.0
                         bar["start_ts"] = now_ts
+            if book_state is not None:
+                prev_ts = float(book_state.get("last_update_ts", 0.0) or 0.0)
+                prev_bbo = book_state.get("last_bbo", {})
+                if latest_book_ts > prev_ts or latest_bbo != prev_bbo or trade_changed:
+                    book_state["last_update_ts"] = (
+                        latest_book_ts if latest_book_ts > 0 else _time.time()
+                    )
+                    book_state["seq"] = int(book_state.get("seq", 0) or 0) + 1
+                    book_state["last_bbo"] = latest_bbo
+                    changed = True
+            if changed:
+                _notify_signal_wakeup(
+                    wake_event,
+                    wake_state,
+                    "book",
+                    latest_book_ts or _time.time(),
+                )
         except Exception:
             pass
 
@@ -294,6 +443,8 @@ async def run_window(
     tracker: LiveTradeTracker, config, price_state: dict,
     trade_state: dict | None,
     binance_state: dict | None,
+    signal_wakeup: asyncio.Event,
+    wake_state: dict,
     section: dict,
     pending_resolve: asyncio.Task | None = None,
     record: bool = True,
@@ -423,6 +574,7 @@ async def run_window(
         "up_best_bid": None, "up_best_ask": None,
         "down_best_bid": None, "down_best_ask": None,
     }
+    book_state = {"seq": 0, "last_update_ts": 0.0, "last_bbo": {}}
 
     # Wait for any pending resolution from previous window before trading
     # (bankroll must be settled before we size new orders)
@@ -462,7 +614,11 @@ async def run_window(
     tasks = [
         asyncio.create_task(
             _poll_book_feed(book_feed, up_token, down_token,
-                            flat_state, trade_state, cancel)
+                            flat_state, trade_state, cancel,
+                            book_state=book_state,
+                            wake_event=signal_wakeup,
+                            wake_state=wake_state,
+                            poll_interval_s=FAST_BOOK_POLL_S)
         ),
         asyncio.create_task(
             signal_ticker(tracker, book_feed, price_state,
@@ -470,7 +626,12 @@ async def run_window(
                           skip_trading=skip_trading,
                           trade_state=trade_state,
                           binance_state=binance_state,
-                          window_start_price=window_start_price)
+                          book_state=book_state,
+                          window_start_price=window_start_price,
+                          wake_event=signal_wakeup,
+                          wake_state=wake_state,
+                          signal_idle_s=FAST_SIGNAL_IDLE_S,
+                          signal_min_interval_s=FAST_SIGNAL_MIN_INTERVAL_S)
         ),
     ]
 
@@ -488,6 +649,7 @@ async def run_window(
                 book_feed, up_token, down_token, rec_meta,
                 price_state, window_start_price,
                 slug, config.data_subdir, cancel,
+                binance_state=binance_state,
             )
         ))
 
@@ -574,6 +736,8 @@ async def _window_loop(
     config,
     price_state: dict,
     binance_state: dict,
+    signal_wakeup: asyncio.Event,
+    wake_state: dict,
     section: dict,
     all_trackers: list[LiveTradeTracker],
     record: bool = True,
@@ -583,6 +747,7 @@ async def _window_loop(
     vpin_bar_s = tracker.signal.vpin_bar_s
     trade_state: dict = {
         "bars": collections.deque(maxlen=200),
+        "sides": collections.deque(maxlen=300),
         "current_bar": {"buy_vol": 0.0, "sell_vol": 0.0, "start_ts": 0},
         "bar_duration_s": vpin_bar_s,
         "total_bars": 0,
@@ -593,7 +758,7 @@ async def _window_loop(
     while True:
         result = await run_window(
             tracker, config, price_state, trade_state,
-            binance_state, section,
+            binance_state, signal_wakeup, wake_state, section,
             pending_resolve=pending_resolve,
             record=record,
         )
@@ -640,29 +805,39 @@ async def run(
     price_state: dict = {
         "price": None,
         "price_history": collections.deque(maxlen=600),
+        "seq": 0,
+        "last_update_ts": 0.0,
     }
-    binance_state: dict = {}
+    binance_state: dict = {"seq": 0, "last_update_ts": 0.0}
+    signal_wakeup = asyncio.Event()
+    wake_state: dict = {}
 
     # Shared Rust feeds — one PriceFeed + one BinanceFeed for the asset
     price_feed = PriceFeed(base_config.chainlink_symbol)
     print(f"  [PriceFeed] started (filtering for {base_config.chainlink_symbol})")
 
     binance_feed = None
+    binance_mode = "disabled"
     if base_config.binance_symbol:
-        binance_feed = BinanceFeed(base_config.binance_symbol)
-        print(f"  [BinanceFeed] started ({base_config.binance_symbol}@bookTicker)")
+        binance_feed, binance_mode = _make_binance_feed(base_config.binance_symbol)
+        print(f"  [BinanceFeed] started ({base_config.binance_symbol}, mode={binance_mode})")
 
     # Shared polling loops
     feed_cancel = asyncio.Event()
     price_poll = asyncio.create_task(
         _poll_price_feed(price_feed, price_state, all_trackers, feed_cancel,
-                         debug=debug, symbol=base_config.chainlink_symbol)
+                         debug=debug, symbol=base_config.chainlink_symbol,
+                         wake_event=signal_wakeup, wake_state=wake_state,
+                         poll_interval_s=FAST_PRICE_POLL_S)
     )
     binance_poll = None
     if binance_feed is not None:
         binance_poll = asyncio.create_task(
             _poll_binance_feed(binance_feed, binance_state, feed_cancel,
-                               symbol=base_config.binance_symbol)
+                               symbol=base_config.binance_symbol,
+                               wake_event=signal_wakeup,
+                               wake_state=wake_state,
+                               poll_interval_s=FAST_BINANCE_POLL_S)
         )
 
     # Display sections — one per timeframe, updated by each _window_loop
@@ -728,6 +903,7 @@ async def run(
             window_loops.append(
                 _window_loop(
                     tracker, config, price_state, binance_state,
+                    signal_wakeup, wake_state,
                     display_sections[i], all_trackers,
                     record=record,
                 )
@@ -1075,7 +1251,7 @@ def main():
     parser.add_argument("--down-edge-bonus", type=float, default=0.05,
                         help="Fraction to reduce DOWN edge threshold (optimism tax, default: 0.05)")
     parser.add_argument("--regime-z-scale", action="store_true",
-                        help="Scale z-scores by sigma_ema / sigma_calibration (requires --calibrated)")
+                        help="Scale z-scores by sigma_calibration / sigma_ema (requires --calibrated)")
     parser.add_argument("--vpin-threshold", type=float, default=0.95,
                         help="VPIN above which edge threshold widens (default: 0.95)")
     parser.add_argument("--vpin-edge-mult", type=float, default=1.5,
@@ -1121,6 +1297,9 @@ def main():
 
     parser.add_argument("--no-record", action="store_true",
                         help="Disable integrated parquet recording")
+    parser.add_argument("--no-binance", action="store_true",
+                        help="Disable Binance feed (use when another process already connects "
+                             "to the same symbol, e.g. dashboard + recorder running together)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -1141,21 +1320,29 @@ def main():
     print(f"  {mode} [{order_mode}] -- {timeframes}")
     print(f"  {'='*62}")
 
-    # Build authenticated client (shared across all trackers)
-    client = OrderClient(
-        host="https://clob.polymarket.com",
-        private_key=os.getenv("PRIVATE_KEY"),
-        chain_id=137,
-        api_key=os.getenv("POLY_API_KEY", ""),
-        api_secret=os.getenv("POLY_API_SECRET", ""),
-        api_passphrase=os.getenv("POLY_PASSPHRASE", ""),
-        sig_type=int(os.getenv("SIGNATURE_TYPE", "1")),
-        funder=os.getenv("POLY_FUNDER") or None,
-    )
+    # Build authenticated client (skipped in dry-run if no key present)
+    private_key = os.getenv("PRIVATE_KEY")
+    if not args.dry_run and not private_key:
+        print("  ERROR: PRIVATE_KEY not set. Create a .env file with your credentials.")
+        return
+    client = None
+    if private_key:
+        client = OrderClient(
+            host="https://clob.polymarket.com",
+            private_key=private_key,
+            chain_id=137,
+            api_key=os.getenv("POLY_API_KEY", ""),
+            api_secret=os.getenv("POLY_API_SECRET", ""),
+            api_passphrase=os.getenv("POLY_PASSPHRASE", ""),
+            sig_type=int(os.getenv("SIGNATURE_TYPE", "1")),
+            funder=os.getenv("POLY_FUNDER") or None,
+        )
 
     # Determine bankroll
+    api_balance = None
     try:
-        api_balance = client.get_balance()
+        if client is not None:
+            api_balance = client.get_balance()
     except Exception as exc:
         api_balance = None
         if args.debug:
@@ -1191,11 +1378,10 @@ def main():
               f"warmup={tracker.maker_warmup_s:.0f}s, "
               f"withdraw={tracker.maker_withdraw_s:.0f}s)")
 
-    # Gas balance check (once, shared)
+    # Gas balance check (once, shared — skipped in dry-run without key)
     try:
         w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
-        if w3.is_connected():
-            private_key = os.getenv("PRIVATE_KEY", "")
+        if w3.is_connected() and private_key:
             signer = w3.eth.account.from_key(private_key)
             pol_balance = w3.eth.get_balance(signer.address)
             pol_ether = w3.from_wei(pol_balance, "ether")
@@ -1222,7 +1408,15 @@ def main():
     print(f"  VPIN:            thresh={args.vpin_threshold} mult={args.vpin_edge_mult}")
     print(f"  Oracle lag:      thresh={args.oracle_lag_threshold} mult={args.oracle_lag_mult} "
           f"binance={base_config.binance_symbol or 'disabled'}")
+    print(f"  Feed cadence:    price={FAST_PRICE_POLL_S*1000:.0f}ms "
+          f"binance={FAST_BINANCE_POLL_S*1000:.0f}ms "
+          f"book={FAST_BOOK_POLL_S*1000:.0f}ms "
+          f"signal_idle={FAST_SIGNAL_IDLE_S*1000:.0f}ms "
+          f"signal_min={FAST_SIGNAL_MIN_INTERVAL_S*1000:.0f}ms")
     record = not args.no_record
+    if args.no_binance:
+        import dataclasses
+        base_config = dataclasses.replace(base_config, binance_symbol="")
     print(f"  Recording:       {'ON' if record else 'OFF'}")
     print(f"  Trades log:      live_trades_{base_market}.jsonl")
     print(f"  State file:      {state_file}")

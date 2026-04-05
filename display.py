@@ -31,6 +31,12 @@ def _safe_dict(obj):
         return {}
 
 
+def _pct(vals: list[float], q: float) -> float | None:
+    if not vals:
+        return None
+    return float(np.percentile(np.asarray(vals, dtype=float), q))
+
+
 def _fp(flat_state: dict, key: str) -> str:
     v = flat_state.get(key)
     if v is None:
@@ -145,6 +151,42 @@ def _render_section(
     if p_model is not None:
         sig_parts.append(f"p_up={p_model:.4f}")
     lines.append(f"  Signal: {'  |  '.join(sig_parts)}")
+
+    lat_samples = _safe_list(getattr(tracker, "latency_samples", []))
+    total_vals = [
+        float(s.get("decision_total_ms", 0.0))
+        for s in lat_samples
+        if s.get("decision_total_ms") is not None
+    ]
+    eval_vals = [
+        float(s.get("signal_eval_ms", 0.0))
+        for s in lat_samples
+        if s.get("signal_eval_ms") is not None
+    ]
+    trigger_source = tracker.ctx.get("_signal_trigger_source") or "---"
+    trigger_age = tracker.ctx.get("_signal_trigger_age_ms")
+    eval_ms = tracker.ctx.get("_signal_eval_ms")
+    chainlink_age = tracker.ctx.get("_chainlink_age_ms")
+    binance_age = tracker.ctx.get("_binance_age_ms")
+    book_age = tracker.ctx.get("_book_age_ms")
+    lat_parts = [
+        f"src={trigger_source}",
+        f"trig={trigger_age:.1f}ms" if trigger_age is not None else "trig=---",
+        f"eval={eval_ms:.1f}ms" if eval_ms is not None else "eval=---",
+        f"CL={chainlink_age:.0f}ms" if chainlink_age is not None else "CL=---",
+        f"BN={binance_age:.0f}ms" if binance_age is not None else "BN=---",
+        f"Book={book_age:.0f}ms" if book_age is not None else "Book=---",
+    ]
+    if total_vals:
+        p50_total = _pct(total_vals, 50)
+        p95_total = _pct(total_vals, 95)
+        lat_parts.append(
+            f"e2e p50/p95={p50_total:.1f}/{p95_total:.1f}ms"
+        )
+    if eval_vals:
+        p95_eval = _pct(eval_vals, 95)
+        lat_parts.append(f"eval p95={p95_eval:.1f}ms")
+    lines.append(f"  Lat: {'  |  '.join(lat_parts)}")
 
     # Bankroll + trades compact line
     open_orders = _safe_list(tracker.open_orders)

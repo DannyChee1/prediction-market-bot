@@ -25,6 +25,7 @@ def build_row(
     meta: dict,
     chainlink_price: float | None,
     window_start_price: float | None,
+    binance_mid: float | None = None,
 ) -> dict:
     """Sample current book state into a flat dict for one parquet row.
 
@@ -45,6 +46,7 @@ def build_row(
         "time_remaining_s": round(remaining_s, 3),
         "chainlink_price": chainlink_price,
         "window_start_price": window_start_price,
+        "binance_mid": binance_mid,
     }
 
     for label, token in [("up", up_token), ("down", down_token)]:
@@ -118,6 +120,9 @@ def flush_parquet(rows: list[dict], slug: str, data_subdir: str) -> Path | None:
     if path.exists():
         try:
             existing = pd.read_parquet(path)
+            # Normalize legacy column name so old and new rows share one column
+            if "chainlink_btc" in existing.columns and "chainlink_price" not in existing.columns:
+                existing = existing.rename(columns={"chainlink_btc": "chainlink_price"})
             df = pd.concat([existing, df], ignore_index=True)
         except Exception:
             pass
@@ -138,6 +143,7 @@ async def record_sampler(
     slug: str,
     data_subdir: str,
     cancel: asyncio.Event,
+    binance_state: dict | None = None,
 ):
     """Sample 1 row/s, auto-flush every 60s, final flush on cancel."""
     pending: list[dict] = []
@@ -154,6 +160,7 @@ async def record_sampler(
                 book_feed, up_token, down_token, meta,
                 price_state.get("price"),
                 window_start_price,
+                binance_state.get("mid_price") if binance_state else None,
             )
             pending.append(row)
         except Exception:

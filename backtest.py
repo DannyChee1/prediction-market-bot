@@ -309,17 +309,117 @@ class CalibrationTable:
         return len(self.TAU_EDGES) - 2  # clamp to last bucket
 
 
+_CROSS_ASSET_TAU_CHECKPOINTS = [750, 600, 450, 300, 150, 60]
+
+
+def _cross_asset_compute_sigma(prices: list[float], timestamps: list[int]) -> float:
+    """Realized vol from log returns normalized by sqrt(dt)."""
+    changes: list[tuple[int, float]] = []
+    for i, p in enumerate(prices):
+        if p > 0 and (not changes or p != changes[-1][1]):
+            changes.append((timestamps[i], p))
+    if len(changes) < 3:
+        return 0.0
+    log_rets = []
+    for j in range(1, len(changes)):
+        dt = (changes[j][0] - changes[j - 1][0]) / 1000.0
+        if dt > 0:
+            lr = math.log(changes[j][1] / changes[j - 1][1])
+            log_rets.append(lr / math.sqrt(dt))
+    if len(log_rets) < 2:
+        return 0.0
+    return float(np.std(log_rets, ddof=1))
+
+
+def build_cross_asset_lookup(
+    secondary_dir: Path,
+    vol_lookback: int = 90,
+    max_z: float = 1.5,
+) -> dict[int, dict[int, float]]:
+    """
+    Precompute z-scores for a secondary asset at fixed tau checkpoints.
+
+    Returns: {window_start_ms: {tau_checkpoint: z}}
+
+    Usage: pass as cross_asset_z_lookup= to DiffusionSignal.
+    The backtester injects _window_start_ms into ctx per window.
+    """
+    result: dict[int, dict[int, float]] = {}
+    for f in sorted(secondary_dir.glob("*.parquet")):
+        df = pd.read_parquet(f)
+        if df.empty:
+            continue
+        if "chainlink_btc" in df.columns and "chainlink_price" not in df.columns:
+            df.rename(columns={"chainlink_btc": "chainlink_price"}, inplace=True)
+        if "chainlink_price" not in df.columns or "window_start_ms" not in df.columns:
+            continue
+        sp_series = df["window_start_price"].dropna()
+        if sp_series.empty:
+            continue
+        start_px = float(sp_series.iloc[0])
+        if start_px == 0:
+            continue
+        wstart = int(df["window_start_ms"].iloc[0])
+        prices  = df["chainlink_price"].tolist()
+        ts_list = df["ts_ms"].tolist()
+        tau_all = df["time_remaining_s"].tolist()
+
+        tau_map: dict[int, float] = {}
+        for target_tau in _CROSS_ASSET_TAU_CHECKPOINTS:
+            best_idx = min(range(len(tau_all)), key=lambda i: abs(tau_all[i] - target_tau))
+            if abs(tau_all[best_idx] - target_tau) > 30:
+                continue
+            lo = max(0, best_idx - vol_lookback)
+            sigma = _cross_asset_compute_sigma(prices[lo:best_idx + 1], ts_list[lo:best_idx + 1])
+            if sigma <= 0:
+                continue
+            actual_tau = tau_all[best_idx]
+            if actual_tau <= 0:
+                continue
+            delta = (prices[best_idx] - start_px) / start_px
+            z_raw = delta / (sigma * math.sqrt(actual_tau))
+            tau_map[target_tau] = float(max(-max_z, min(max_z, z_raw)))
+
+        if tau_map:
+            result[wstart] = tau_map
+    return result
+
+
+def _lookup_cross_asset_z(
+    lookup: dict[int, dict[int, float]],
+    window_start_ms: int | None,
+    tau: float,
+) -> float | None:
+    """Return secondary asset z at the nearest tau checkpoint for the given window."""
+    if window_start_ms is None or window_start_ms not in lookup:
+        return None
+    tau_map = lookup[window_start_ms]
+    if not tau_map:
+        return None
+    closest = min(tau_map.keys(), key=lambda t: abs(t - tau))
+    # Only use if within 120s of a checkpoint (avoid stale lookups near expiry)
+    if abs(closest - tau) > 120:
+        return None
+    return tau_map[closest]
+
+
 def build_calibration_table(
     data_dir: Path,
     max_z: float = 1.0,
     vol_lookback_s: int = 90,
     return_sigmas: bool = False,
+    train_frac: float = 1.0,
 ) -> CalibrationTable | tuple[CalibrationTable, list[float]]:
-    """Build a walk-forward calibration table from all complete parquet windows.
+    """Build a walk-forward calibration table from complete parquet windows.
 
-    For each window, extracts signals every 30 rows (matching
-    analyze_calibration.py), records (z_capped, tau, outcome_up) tuples,
-    and builds the lookup from ALL past observations.
+    train_frac controls how much of the data (by time order) is used to
+    build the table.  train_frac=1.0 uses everything (backward-compatible).
+    train_frac=0.7 uses the first 70% of windows by timestamp — the correct
+    walk-forward split so the table never contains future windows.
+
+    When train_frac < 1.0 the function also attaches `val_cutoff_ts` to the
+    returned CalibrationTable so callers can skip train-period windows during
+    evaluation.
 
     If return_sigmas=True, also returns per-window sigma values (computed
     during the same file scan) for sigma_calibration rebuild.
@@ -357,11 +457,19 @@ def build_calibration_table(
 
     windows.sort(key=lambda d: d["ts_ms"].iloc[0])
 
-    # Walk-forward: accumulate observations, build table from all past data
+    # Walk-forward split: only use first train_frac windows to build the table
+    val_cutoff_ts: int | None = None
+    if train_frac < 1.0:
+        split_idx = max(1, int(len(windows) * train_frac))
+        val_cutoff_ts = int(windows[split_idx]["ts_ms"].iloc[0])
+        train_windows = windows[:split_idx]
+    else:
+        train_windows = windows
+
     all_obs: list[tuple[float, float, int]] = []  # (z_capped, tau, outcome_up)
     window_sigmas: list[float] = []  # one per window for sigma_calibration
 
-    for df in windows:
+    for df in train_windows:
         # Determine outcome
         start_prices = df["window_start_price"].dropna()
         if start_prices.empty:
@@ -410,8 +518,10 @@ def build_calibration_table(
 
             all_obs.append((z_capped, tau, outcome))
 
-    # Build final table from all observations
+    # Build table from training observations only
     table = _build_table_from_obs(all_obs)
+    if val_cutoff_ts is not None:
+        table.val_cutoff_ts = val_cutoff_ts  # attach for caller use
     if return_sigmas:
         return table, window_sigmas
     return table
@@ -698,7 +808,7 @@ class DiffusionSignal(Signal):
         toxicity_edge_mult: float = 1.5,
         # Volatility kill switch (absolute EMA ceiling)
         vol_kill_sigma: float | None = None,
-        # Regime-scaled z: scale z by sigma_ema / sigma_calibration
+        # Regime-scaled z: scale z by sigma_calibration / sigma_ema
         regime_z_scale: bool = False,
         sigma_calibration: float | None = None,
         # VPIN flow toxicity filter
@@ -717,8 +827,8 @@ class DiffusionSignal(Signal):
         # at 0 remaining → 100% Chainlink (matches resolution source).
         chainlink_blend_s: float = 120.0,
         # Fat-tail CDF: "student_t" uses kurtosis-estimated nu, "normal" = Gaussian
-        tail_mode: str = "student_t",
-        tail_nu_default: float = 3.0,
+        tail_mode: str = "normal",
+        tail_nu_default: float = 20.0,
         # Avellaneda-Stoikov unified quoting mode
         as_mode: bool = False,
         gamma_inv: float = 0.15,       # risk aversion for inventory penalty
@@ -738,6 +848,17 @@ class DiffusionSignal(Signal):
         filtration_threshold: float = 0.55,
         filtration_asset_id: int = 0,  # see filtration_model.ASSET_IDS
         filtration_baseline_vol_s: int = 300,
+        # Oracle hard cancel: return FLAT immediately when Binance-Chainlink
+        # gap exceeds this fraction.  Set to 0.0 to disable (default).
+        # 0.004 = cancel when gap > 0.4% (Chainlink triggers at 0.5%).
+        oracle_cancel_threshold: float = 0.0,
+        # Cross-asset disagreement gate: skip trade when a correlated asset
+        # (e.g. ETH when trading BTC) has a z-score pointing the other way.
+        # Requires cross_asset_z_lookup precomputed by build_cross_asset_lookup().
+        cross_asset_z_lookup: dict | None = None,
+        cross_asset_min_z: float = 0.3,   # both |z| must exceed this to veto
+        # Minimum |z| to enter: filter out low-conviction setups
+        min_entry_z: float = 0.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -804,6 +925,10 @@ class DiffusionSignal(Signal):
         self.filtration_threshold = filtration_threshold
         self.filtration_asset_id = filtration_asset_id
         self.filtration_baseline_vol_s = filtration_baseline_vol_s
+        self.oracle_cancel_threshold = oracle_cancel_threshold
+        self.cross_asset_z_lookup = cross_asset_z_lookup
+        self.cross_asset_min_z = cross_asset_min_z
+        self.min_entry_z = min_entry_z
 
     def _compute_vol(
         self,
@@ -820,6 +945,71 @@ class DiffusionSignal(Signal):
         available (e.g. during early warmup).
         """
         return _compute_vol_deduped(prices, timestamps)
+
+    def _record_book_state(self, snapshot: "Snapshot", ctx: dict) -> None:
+        """Persist lightweight book state for diagnostics/filtration features."""
+        ctx["_last_ts_ms"] = snapshot.ts_ms
+        if snapshot.best_bid_up is None or snapshot.best_ask_up is None:
+            return
+        mid_up = (snapshot.best_bid_up + snapshot.best_ask_up) / 2.0
+        mid_hist = ctx.setdefault("_mid_up_history", [])
+        mid_hist.append(float(mid_up))
+        if len(mid_hist) > 600:
+            del mid_hist[:-600]
+
+    def _maybe_update_tail_nu(self, hist: list[float], ctx: dict) -> None:
+        """Estimate Student-t degrees of freedom from recent realized kurtosis."""
+        if self.tail_mode != "student_t" or len(hist) < 30:
+            return
+
+        k_n = min(90, len(hist))
+        k_prices = hist[-k_n:]
+        k_rets = [
+            math.log(k_prices[i] / k_prices[i - 1])
+            for i in range(1, len(k_prices))
+            if k_prices[i - 1] > 0 and k_prices[i] > 0
+        ]
+        if len(k_rets) < 20:
+            return
+
+        mean = sum(k_rets) / len(k_rets)
+        var = sum((r - mean) ** 2 for r in k_rets) / len(k_rets)
+        if var <= 0:
+            return
+
+        m4 = sum((r - mean) ** 4 for r in k_rets) / len(k_rets)
+        excess_kurt = (m4 / (var * var)) - 3.0
+        if excess_kurt > 0.2:
+            ctx["_tail_nu"] = max(
+                self.tail_nu_default,
+                min(30.0, 4.0 + 6.0 / excess_kurt),
+            )
+        else:
+            ctx["_tail_nu"] = 30.0  # near-Gaussian
+
+    def _apply_regime_z_scale(
+        self,
+        z_raw: float,
+        sigma_per_s: float,
+        ctx: dict,
+    ) -> tuple[float, float]:
+        """Adjust z by current-vs-calibration vol regime.
+
+        When live vol is above the calibration regime, shrink z.
+        When live vol is below the calibration regime, amplify z.
+        """
+        factor = 1.0
+        if (
+            self.regime_z_scale
+            and self.sigma_calibration
+            and self.sigma_calibration > 0
+            and sigma_per_s > 0
+        ):
+            factor = self.sigma_calibration / sigma_per_s
+            factor = max(0.5, min(2.0, factor))
+            z_raw *= factor
+        ctx["_regime_z_factor"] = factor
+        return z_raw, factor
 
     def _smoothed_sigma(self, raw_sigma: float, ctx: dict) -> float:
         """Kalman filter for sigma estimation (falls back to EMA if disabled).
@@ -995,7 +1185,7 @@ class DiffusionSignal(Signal):
         Components (each normalized to [0, 1]):
           1. Spread width:   avg(spread_up, spread_down) / max_spread
           2. Book imbalance: abs(total_bid_depth - total_ask_depth) / total_depth
-          3. Mid-oracle gap: abs(book_mid - chainlink) / chainlink
+          3. Parity gap:     abs(up_mid + down_mid - 1.0)
 
         Final score = weighted average (40% spread, 30% imbalance, 30% gap).
         """
@@ -1020,7 +1210,7 @@ class DiffusionSignal(Signal):
         total_depth = total_bid + total_ask
         imbalance_score = abs(total_bid - total_ask) / total_depth if total_depth > 0 else 0.0
 
-        # 3. Mid–oracle deviation
+        # 3. Mid-parity deviation
         # Book mid = average of up-mid and (1 - down-mid) — they should agree
         mid_up = (bid_up + ask_up) / 2.0
         mid_down = (bid_down + ask_down) / 2.0
@@ -1108,6 +1298,7 @@ class DiffusionSignal(Signal):
             return Decision("FLAT", 0.0, 0.0, "missing book")
         if ask_up <= 0 or ask_up >= 1 or ask_down <= 0 or ask_down >= 1:
             return Decision("FLAT", 0.0, 0.0, "invalid asks")
+        self._record_book_state(snapshot, ctx)
 
         # Spread gate: wide spreads signal uncertain/illiquid pricing
         spread_up = ask_up - bid_up
@@ -1152,6 +1343,10 @@ class DiffusionSignal(Signal):
         binance_mid = ctx.get("_binance_mid")
         oracle_lag = self._compute_oracle_lag(snapshot.chainlink_price, binance_mid)
         ctx["_oracle_lag"] = oracle_lag
+        # Hard cancel: skip this tick entirely when gap exceeds cancel threshold
+        if self.oracle_cancel_threshold > 0 and oracle_lag > self.oracle_cancel_threshold:
+            return Decision("FLAT", 0.0, 0.0,
+                            f"oracle hard cancel (lag={oracle_lag:.4f} > {self.oracle_cancel_threshold:.4f})")
         if oracle_lag > self.oracle_lag_threshold:
             lag_excess = min((oracle_lag - self.oracle_lag_threshold) / self.oracle_lag_threshold, 1.0)
             dyn_threshold *= 1.0 + self.oracle_lag_mult * lag_excess
@@ -1178,6 +1373,8 @@ class DiffusionSignal(Signal):
                 f"vol kill switch (sigma={sigma_per_s:.2e} "
                 f"> {self.vol_kill_sigma:.2e})")
 
+        self._maybe_update_tail_nu(hist, ctx)
+
         # Near-expiry Chainlink blend (same as decide_both_sides)
         price = effective_price
         if (self.chainlink_blend_s > 0
@@ -1192,16 +1389,32 @@ class DiffusionSignal(Signal):
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
 
         # Regime-scaled z (same as decide_both_sides)
-        regime_z_factor = 1.0
-        if self.regime_z_scale and self.sigma_calibration and self.sigma_calibration > 0:
-            scale = sigma_per_s / self.sigma_calibration
-            scale = max(0.5, min(2.0, scale))
-            z_raw *= scale
-            regime_z_factor = scale
-        ctx["_regime_z_factor"] = regime_z_factor
+        z_raw, _ = self._apply_regime_z_scale(z_raw, sigma_per_s, ctx)
 
         z = max(-self.max_z, min(self.max_z, z_raw))
+        ctx["_z_raw"] = z_raw
+        ctx["_z"] = z
+
+        # Minimum z gate: filter low-conviction setups
+        if self.min_entry_z > 0 and abs(z) < self.min_entry_z:
+            return Decision("FLAT", 0.0, 0.0,
+                            f"min_z gate (|z|={abs(z):.3f} < {self.min_entry_z:.3f})")
+
+        # Cross-asset disagreement veto
+        if self.cross_asset_z_lookup is not None:
+            wstart = ctx.get("_window_start_ms")
+            z2 = _lookup_cross_asset_z(self.cross_asset_z_lookup, wstart, tau)
+            if (z2 is not None
+                    and abs(z) >= self.cross_asset_min_z
+                    and abs(z2) >= self.cross_asset_min_z
+                    and z * z2 < 0):
+                return Decision("FLAT", 0.0, 0.0,
+                                f"cross-asset veto (z={z:.3f}, z2={z2:.3f})")
+
         p_model = self._p_model(z, tau, ctx)
+        ctx["_p_model_raw"] = p_model
+        ctx["_p_display"] = norm_cdf(z)
+        ctx["_sigma_per_s"] = sigma_per_s
 
         # Filtration gate: XGBoost confidence check
         if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx):
@@ -1212,6 +1425,7 @@ class DiffusionSignal(Signal):
         # Mean-reversion discount: pull p_model toward 0.5
         if self.reversion_discount > 0:
             p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
+        ctx["_p_model_trade"] = p_model
 
         # Effective costs (taker mode)
         p_up_cost = ask_up + poly_fee(ask_up) + self.slippage
@@ -1220,6 +1434,10 @@ class DiffusionSignal(Signal):
         # Edges (penalized by spread — wider spread = less trustworthy pricing)
         edge_up = p_model - p_up_cost - self.spread_edge_penalty * spread_up
         edge_down = (1.0 - p_model) - p_down_cost - self.spread_edge_penalty * spread_down
+        ctx["_edge_up"] = edge_up
+        ctx["_edge_down"] = edge_down
+        ctx["_dyn_threshold_up"] = dyn_threshold
+        ctx["_dyn_threshold_down"] = dyn_threshold
 
         if edge_up >= edge_down and edge_up > dyn_threshold:
             side, edge, eff_price, p_side = "BUY_UP", edge_up, p_up_cost, p_model
@@ -1433,6 +1651,7 @@ class DiffusionSignal(Signal):
             reason = "invalid asks"
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
+        self._record_book_state(snapshot, ctx)
 
         # Spread gate
         spread_up = ask_up - bid_up
@@ -1512,23 +1731,7 @@ class DiffusionSignal(Signal):
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
-        # Rolling kurtosis → Student-t degrees of freedom
-        if self.tail_mode == "student_t" and len(hist) >= 30:
-            _k_n = min(90, len(hist))
-            _k_prices = hist[-_k_n:]
-            _k_rets = [math.log(_k_prices[i] / _k_prices[i - 1])
-                       for i in range(1, len(_k_prices))
-                       if _k_prices[i - 1] > 0 and _k_prices[i] > 0]
-            if len(_k_rets) >= 20:
-                _mean = sum(_k_rets) / len(_k_rets)
-                _var = sum((r - _mean) ** 2 for r in _k_rets) / len(_k_rets)
-                if _var > 0:
-                    _m4 = sum((r - _mean) ** 4 for r in _k_rets) / len(_k_rets)
-                    _excess_kurt = (_m4 / (_var * _var)) - 3.0
-                    if _excess_kurt > 0.2:
-                        ctx["_tail_nu"] = max(self.tail_nu_default, min(30.0, 4.0 + 6.0 / _excess_kurt))
-                    else:
-                        ctx["_tail_nu"] = 30.0  # near-Gaussian
+        self._maybe_update_tail_nu(hist, ctx)
 
         # Microstructure metrics: compute excess values for threshold/spread
         trade_bars = ctx.get("_trade_bars", [])
@@ -1544,6 +1747,11 @@ class DiffusionSignal(Signal):
         binance_mid = ctx.get("_binance_mid")
         oracle_lag = self._compute_oracle_lag(snapshot.chainlink_price, binance_mid)
         ctx["_oracle_lag"] = oracle_lag
+        # Hard cancel: skip both sides when gap exceeds cancel threshold
+        if self.oracle_cancel_threshold > 0 and oracle_lag > self.oracle_cancel_threshold:
+            reason = f"oracle hard cancel (lag={oracle_lag:.4f} > {self.oracle_cancel_threshold:.4f})"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
         lag_excess = (min((oracle_lag - self.oracle_lag_threshold)
                          / self.oracle_lag_threshold, 1.0)
                       if oracle_lag > self.oracle_lag_threshold else 0.0)
@@ -1588,15 +1796,30 @@ class DiffusionSignal(Signal):
         # distribution → less confident directional signal), low-vol
         # regimes amplify it.  Clamped to [0.5, 2.0] to avoid extreme
         # suppression or overconfidence from a single bar.
-        regime_z_factor = 1.0
-        if self.regime_z_scale and self.sigma_calibration and self.sigma_calibration > 0:
-            scale = sigma_per_s / self.sigma_calibration
-            scale = max(0.5, min(2.0, scale))
-            z_raw *= scale
-            regime_z_factor = scale
-        ctx["_regime_z_factor"] = regime_z_factor
+        z_raw, _ = self._apply_regime_z_scale(z_raw, sigma_per_s, ctx)
 
         z = max(-self.max_z, min(self.max_z, z_raw))
+        ctx["_z_raw"] = z_raw
+        ctx["_z"] = z
+
+        # Minimum z gate: filter low-conviction setups
+        if self.min_entry_z > 0 and abs(z) < self.min_entry_z:
+            reason = f"min_z gate (|z|={abs(z):.3f} < {self.min_entry_z:.3f})"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # Cross-asset disagreement veto
+        if self.cross_asset_z_lookup is not None:
+            wstart = ctx.get("_window_start_ms")
+            z2 = _lookup_cross_asset_z(self.cross_asset_z_lookup, wstart, tau)
+            if (z2 is not None
+                    and abs(z) >= self.cross_asset_min_z
+                    and abs(z2) >= self.cross_asset_min_z
+                    and z * z2 < 0):
+                reason = f"cross-asset veto (z={z:.3f}, z2={z2:.3f})"
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+
         p_model = self._p_model(z, tau, ctx)
 
         # Filtration gate: XGBoost confidence check
@@ -1633,6 +1856,7 @@ class DiffusionSignal(Signal):
             # Positive OBI on DOWN side → buy pressure → p_down higher (p_up lower)
             p_model += self.obi_weight * (obi_up - obi_down)
             p_model = max(0.01, min(0.99, p_model))
+        ctx["_p_model_trade"] = p_model
 
         # Cost basis: VAMP (volume-weighted mid) or best bid
         if self.vamp_mode == "cost":
@@ -1774,6 +1998,15 @@ class DiffusionSignal(Signal):
                 up_dec = Decision("FLAT", 0.0, 0.0, reason)
                 down_dec = Decision("FLAT", 0.0, 0.0, reason)
 
+        # Min entry price gate: override any non-FLAT decision if bid is too cheap
+        if self.min_entry_price > 0:
+            if up_dec.action != "FLAT" and cost_up < self.min_entry_price:
+                up_dec = Decision("FLAT", 0.0, 0.0,
+                    f"entry {cost_up:.3f} < min {self.min_entry_price:.2f}")
+            if down_dec.action != "FLAT" and cost_down < self.min_entry_price:
+                down_dec = Decision("FLAT", 0.0, 0.0,
+                    f"entry {cost_down:.3f} < min {self.min_entry_price:.2f}")
+
         return (up_dec, down_dec)
 
 
@@ -1820,7 +2053,7 @@ class BacktestEngine:
         latency_ms: int = 0,
         slippage: float = 0.0,
         initial_bankroll: float = 10_000.0,
-        max_trades_per_window: int | None = None,
+        max_trades_per_window: int = 1,
     ):
         self.signal = signal
         self.data_dir = data_dir
@@ -1960,6 +2193,8 @@ class BacktestEngine:
         final_btc: float,
     ) -> list[TradeResult]:
         ctx: dict = {"inventory_up": 0, "inventory_down": 0}
+        if "window_start_ms" in window_df.columns:
+            ctx["_window_start_ms"] = int(window_df["window_start_ms"].iloc[0])
         pending: Optional[tuple[int, Decision]] = None
         results: list[TradeResult] = []
         last_fill_ts: int = 0
@@ -2066,59 +2301,170 @@ class BacktestEngine:
         return TradeResult(fill=fill, outcome_up=outcome_up, final_btc=final_btc,
                            payout=payout, pnl=pnl, pnl_pct=pnl_pct)
 
+    def _run_slug_list(
+        self,
+        df: pd.DataFrame,
+        slugs: list[str],
+        verbose: bool = True,
+    ) -> tuple[list[TradeResult], list[float]]:
+        """Run the engine over an ordered list of window slugs.
+
+        One trade per window (max_trades_per_window enforced).
+        Bankroll compounds between windows but NOT within a window.
+        Returns (results, bankroll_history).
+        """
+        results: list[TradeResult] = []
+        bankroll_hist = [self.bankroll]
+
+        for slug in slugs:
+            window_df = df[df["market_slug"] == slug]
+            resolved = self._resolve_window(window_df)
+            if resolved is None:
+                if verbose:
+                    print(f"  SKIP {slug} (incomplete)")
+                continue
+
+            outcome, final_btc = resolved
+            if hasattr(self.signal, "bankroll"):
+                self.signal.bankroll = self.bankroll
+
+            pre_bankroll = self.bankroll
+            window_results = self._run_window(window_df, outcome, final_btc)
+
+            if window_results:
+                results.extend(window_results)
+                if verbose:
+                    for r in window_results:
+                        rem_m = int(r.fill.time_remaining_s) // 60
+                        rem_s = int(r.fill.time_remaining_s) % 60
+                        print(
+                            f"  {slug}: {r.fill.side} "
+                            f"@ {r.fill.entry_price:.4f} "
+                            f"x {r.fill.shares:.1f}sh "
+                            f"[{rem_m}:{rem_s:02d} left] "
+                            f"-> {'UP' if r.outcome_up else 'DOWN'} "
+                            f"pnl=${r.pnl:+.2f} ({r.pnl_pct:+.1%})"
+                        )
+                    window_pnl = self.bankroll - pre_bankroll
+                    print(f"    window net: ${window_pnl:+.2f}  "
+                          f"bank=${self.bankroll:.2f}")
+            elif verbose:
+                print(f"  {slug}: FLAT")
+
+            bankroll_hist.append(self.bankroll)
+
+        return results, bankroll_hist
+
     def run(self) -> tuple[list[TradeResult], dict, pd.DataFrame]:
         df = self.load_data()
         if df.empty:
             print("  No data found.")
             metrics = self._compute_metrics([], [self.bankroll])
             return [], metrics, pd.DataFrame()
-        slugs = df["market_slug"].unique()
-        results: list[TradeResult] = []
+        slugs = list(df["market_slug"].unique())
         self.bankroll = self.initial_bankroll
-        bankroll_hist = [self.bankroll]
-
-        for slug in slugs:
-            window_df = df[df["market_slug"] == slug]
-            resolved = self._resolve_window(window_df)
-
-            if resolved is None:
-                print(f"  SKIP {slug} (incomplete)")
-                continue
-
-            outcome, final_btc = resolved
-
-            if hasattr(self.signal, "bankroll"):
-                self.signal.bankroll = self.bankroll
-
-            # bankroll is updated inside _run_window per fill
-            pre_bankroll = self.bankroll
-            window_results = self._run_window(window_df, outcome, final_btc)
-
-            if window_results:
-                results.extend(window_results)
-                for r in window_results:
-                    rem_m = int(r.fill.time_remaining_s) // 60
-                    rem_s = int(r.fill.time_remaining_s) % 60
-                    print(
-                        f"  {slug}: {r.fill.side} "
-                        f"@ {r.fill.entry_price:.4f} "
-                        f"x {r.fill.shares:.1f}sh "
-                        f"[{rem_m}:{rem_s:02d} left] "
-                        f"-> {'UP' if r.outcome_up else 'DOWN'} "
-                        f"pnl=${r.pnl:+.2f} ({r.pnl_pct:+.1%})"
-                    )
-                window_pnl = self.bankroll - pre_bankroll
-                print(f"    window net: ${window_pnl:+.2f} "
-                      f"({len(window_results)} trade{'s' if len(window_results) != 1 else ''}) "
-                      f"bank=${self.bankroll:.2f}")
-            else:
-                print(f"  {slug}: FLAT (no trades)")
-
-            bankroll_hist.append(self.bankroll)
-
+        results, bankroll_hist = self._run_slug_list(df, slugs, verbose=True)
         trades_df = self._build_trades_df(results)
         metrics = self._compute_metrics(results, bankroll_hist)
         return results, metrics, trades_df
+
+    def run_walk_forward(
+        self,
+        train_frac: float = 0.7,
+        verbose_test: bool = True,
+    ) -> tuple[dict, dict, pd.DataFrame]:
+        """Walk-forward backtest: train on first train_frac windows, test on rest.
+
+        Calibration table is built from TRAIN windows only, then frozen.
+        The DiffusionSignal's ctx resets between windows (no bleedover).
+        Returns (train_metrics, test_metrics, test_trades_df).
+        """
+        df = self.load_data()
+        if df.empty:
+            print("  No data found.")
+            empty = self._compute_metrics([], [self.initial_bankroll])
+            return empty, empty, pd.DataFrame()
+
+        # Order windows chronologically
+        slugs_ordered = (
+            df.groupby("market_slug")["ts_ms"]
+            .min()
+            .sort_values()
+            .index.tolist()
+        )
+
+        split = max(1, int(len(slugs_ordered) * train_frac))
+        train_slugs = slugs_ordered[:split]
+        test_slugs = slugs_ordered[split:]
+
+        cutoff_ts = (
+            df[df["market_slug"] == test_slugs[0]]["ts_ms"].min()
+            if test_slugs else None
+        )
+
+        import datetime
+        if cutoff_ts:
+            cutoff_dt = datetime.datetime.fromtimestamp(
+                cutoff_ts / 1000
+            ).strftime("%Y-%m-%d %H:%M")
+        else:
+            cutoff_dt = "N/A"
+
+        print(f"  Walk-forward split: {len(train_slugs)} train / "
+              f"{len(test_slugs)} test windows")
+        print(f"  Test period starts: {cutoff_dt}")
+
+        # ── TRAIN PASS: collect observations, build calibration ────────���──
+        print(f"\n{'='*62}")
+        print(f"  TRAIN PASS ({len(train_slugs)} windows) — building calibration")
+        print(f"{'='*62}")
+        self.bankroll = self.initial_bankroll
+        if hasattr(self.signal, "calibration_table"):
+            self.signal.calibration_table = None  # no cal during train pass
+        train_results, train_bk_hist = self._run_slug_list(
+            df, train_slugs, verbose=False
+        )
+        train_metrics = self._compute_metrics(train_results, train_bk_hist)
+        print(f"  Train: {train_metrics['n_trades']} trades  "
+              f"win={train_metrics['win_rate']:.1%}  "
+              f"pnl=${train_metrics['total_pnl']:+,.0f}")
+
+        # Build calibration from train outcomes
+        obs: list[tuple[float, float, int]] = []
+        for r in train_results:
+            z_str = r.fill.decision_reason
+            # extract z from "p=X sig=X z=Z tau=Ts ..."
+            try:
+                z_part = [p for p in z_str.split() if p.startswith("z=")][0]
+                z_val = float(z_part.split("=")[1].rstrip("(cap)"))
+            except (IndexError, ValueError):
+                continue
+            obs.append((
+                max(-1.0, min(1.0, z_val)),
+                r.fill.time_remaining_s,
+                r.outcome_up,
+            ))
+        if obs and hasattr(self.signal, "calibration_table"):
+            cal = _build_table_from_obs(obs)
+            self.signal.calibration_table = cal
+            print(f"  Calibration table built: {len(cal.table)} cells, "
+                  f"{sum(cal.counts.values())} observations")
+
+        # ── TEST PASS: evaluate on held-out windows ───────────────────────
+        print(f"\n{'='*62}")
+        print(f"  TEST PASS ({len(test_slugs)} windows) — out-of-sample")
+        print(f"{'='*62}")
+        self.bankroll = self.initial_bankroll
+        if hasattr(self.signal, "bankroll"):
+            self.signal.bankroll = self.initial_bankroll
+        test_results, test_bk_hist = self._run_slug_list(
+            df, test_slugs, verbose=verbose_test
+        )
+        test_metrics = self._compute_metrics(test_results, test_bk_hist)
+        test_metrics["n_windows"] = len(test_slugs)
+        train_metrics["n_windows"] = len(train_slugs)
+        test_trades_df = self._build_trades_df(test_results)
+        return train_metrics, test_metrics, test_trades_df
 
     def _build_trades_df(self, results: list[TradeResult]) -> pd.DataFrame:
         if not results:
@@ -2301,8 +2647,68 @@ def print_summary(metrics: dict, trades_df: pd.DataFrame):
     print(f"{'='*62}")
 
 
+def print_walk_forward_summary(
+    signal_name: str,
+    train_m: dict,
+    test_m: dict,
+    test_trades_df: pd.DataFrame,
+):
+    """Print side-by-side train vs test comparison."""
+    print_summary(test_m, test_trades_df)
+
+    print(f"\n{'='*62}")
+    print(f"  WALK-FORWARD COMPARISON: {signal_name}")
+    print(f"{'='*62}")
+    print(f"  {'Metric':<22}  {'TRAIN (in-sample)':>18}  {'TEST (out-of-sample)':>20}")
+    print(f"  {'-'*62}")
+
+    def fmt_row(label, train_val, test_val):
+        print(f"  {label:<22}  {train_val:>18}  {test_val:>20}")
+
+    fmt_row("Windows", str(train_m.get("n_windows", train_m.get("n_trades", 0))),
+            str(test_m.get("n_windows", test_m.get("n_trades", 0))))
+    fmt_row("Trades fired",
+            f"{train_m.get('n_trades', 0)}",
+            f"{test_m.get('n_trades', 0)}")
+    fmt_row("Win rate",
+            f"{train_m.get('win_rate', 0):.1%}",
+            f"{test_m.get('win_rate', 0):.1%}")
+    fmt_row("Total PnL",
+            f"${train_m.get('total_pnl', 0):+,.0f}",
+            f"${test_m.get('total_pnl', 0):+,.0f}")
+    fmt_row("Bankroll end",
+            f"${train_m.get('final_bankroll', 0):,.0f}",
+            f"${test_m.get('final_bankroll', 0):,.0f}")
+    fmt_row("Sharpe (ann.)",
+            f"{train_m.get('sharpe', 0):.2f}",
+            f"{test_m.get('sharpe', 0):.2f}")
+    fmt_row("Max drawdown",
+            f"{train_m.get('max_dd_pct', 0):.1%}",
+            f"{test_m.get('max_dd_pct', 0):.1%}")
+    print(f"{'='*62}")
+
+    # Signal quality verdict
+    test_wr = test_m.get("win_rate", 0)
+    test_pnl = test_m.get("total_pnl", 0)
+    test_n = test_m.get("n_trades", 0)
+    if test_n < 10:
+        verdict = "⚠ TOO FEW TEST TRADES — results not meaningful"
+    elif test_wr >= 0.55 and test_pnl > 0:
+        verdict = "✓ EDGE DETECTED — win rate and PnL positive out-of-sample"
+    elif test_wr >= 0.50 and test_pnl > 0:
+        verdict = "~ MARGINAL EDGE — positive but needs more data"
+    elif test_wr >= 0.55:
+        verdict = "~ MARGINAL EDGE — win rate positive but PnL negative (high loss size)"
+    else:
+        verdict = "✗ NO EDGE — win rate below 50% out-of-sample"
+    print(f"\n  Verdict: {verdict}")
+    print()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Polymarket Up/Down Backtest")
+    parser = argparse.ArgumentParser(
+        description="Polymarket Up/Down Backtest — walk-forward, one entry per window"
+    )
     parser.add_argument("--market", default=DEFAULT_MARKET,
                         choices=list(MARKET_CONFIGS),
                         help="Market to backtest (default: btc)")
@@ -2311,50 +2717,44 @@ def main():
                         choices=["diffusion", "always_up", "always_down", "random", "all"])
     parser.add_argument("--latency", type=int, default=0, help="ms")
     parser.add_argument("--slippage", type=float, default=0.0)
-    parser.add_argument("--sensitivity", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--maker", action="store_true",
                         help="Use maker (limit order) mode: 0%% fee, dual-side evaluation")
-    parser.add_argument("--max-trades-per-window", type=int, default=None,
-                        help="Override max trades per window")
-    parser.add_argument("--calibrated", action="store_true",
-                        help="Use empirically calibrated probabilities instead of Phi(z)")
+    parser.add_argument("--train-frac", type=float, default=0.7,
+                        help="Fraction of windows used for training/calibration (default 0.7). "
+                             "Backtest results reflect only the held-out test period. "
+                             "Use 1.0 to skip split and run all windows (in-sample).")
     parser.add_argument("--min-entry-price", type=float, default=0.10,
                         help="Minimum bid/entry price to accept (default 0.10)")
     parser.add_argument("--cal-prior-strength", type=float, default=100.0,
                         help="Bayesian prior strength n0 for GBM/calibration fusion (default 100)")
-    parser.add_argument("--inventory-skew", type=float, default=0.02,
-                        help="Edge penalty per same-side position (default 0.02)")
     parser.add_argument("--maker-withdraw", type=float, default=60.0,
                         help="Stop new orders when tau < N seconds (default 60)")
+    parser.add_argument("--oracle-cancel-threshold", type=float, default=0.0,
+                        help="Hard-cancel when Binance-Chainlink gap exceeds this fraction.")
+    parser.add_argument("--cross-asset-dir", type=str, default=None,
+                        help="Secondary asset data subdir for cross-asset disagreement veto "
+                             "(e.g. 'eth_15m').")
+    parser.add_argument("--cross-asset-min-z", type=float, default=0.3,
+                        help="Minimum |z| threshold for cross-asset veto (default 0.3)")
+    parser.add_argument("--min-z", type=float, default=0.0,
+                        help="Minimum |z-score| to enter a trade (default 0.0 = disabled, "
+                             "recommended 0.7 based on walk-forward analysis)")
     args = parser.parse_args()
 
     config = get_config(args.market)
     data_dir = DATA_DIR / config.data_subdir
 
-    if args.sensitivity:
-        print(f"Running sensitivity analysis ({config.display_name})...\n")
-        sens_df = run_sensitivity(initial_bankroll=args.bankroll, data_dir=data_dir)
-        print(f"\n{'='*62}")
-        print("  SENSITIVITY GRID (DiffusionSignal)")
-        print(f"{'='*62}")
-        cols = ["latency_ms", "slippage", "n_trades", "total_pnl",
-                "win_rate", "sharpe", "sharpe_deflated", "final_bankroll"]
-        print(sens_df[cols].to_string(index=False))
-        return
-
-    # Per-market signal overrides (ETH needs tighter filters due to mean reversion)
+    # Per-market signal overrides
     eth_overrides = {}
-    eth_engine_kw = {}
     if args.market == "eth":
         eth_overrides = dict(
-            edge_threshold=0.15,        # higher bar (BTC default 0.10)
-            reversion_discount=0.10,    # ETH 15m mean-reverts, keep discount
-            momentum_lookback_s=15,     # shorter lookback (ETH oscillates more)
-            momentum_majority=0.7,      # 70% majority instead of 100% (BTC default)
-            spread_edge_penalty=0.2,    # reduced from 1.0 (avoids double-counting)
+            edge_threshold=0.15,
+            reversion_discount=0.10,
+            momentum_lookback_s=15,
+            momentum_majority=0.7,
+            spread_edge_penalty=0.2,
         )
-        eth_engine_kw = dict(max_trades_per_window=1)
 
     # Maker mode overrides
     maker_overrides = {}
@@ -2364,31 +2764,22 @@ def main():
             max_bet_fraction=0.02,
             edge_threshold=0.08,
             momentum_majority=0.0,
-            spread_edge_penalty=0.0,  # bid pricing handles spread naturally
+            spread_edge_penalty=0.0,
             window_duration=config.window_duration_s,
         )
-        if "max_trades_per_window" not in eth_engine_kw:
-            eth_engine_kw["max_trades_per_window"] = 1
 
-    if args.max_trades_per_window is not None:
-        eth_engine_kw["max_trades_per_window"] = args.max_trades_per_window
-
-    # Calibration: build empirical lookup table and adjust thresholds
-    cal_table = None
-    calibrated_overrides = {}
-    if args.calibrated:
-        print(f"  Building calibration table from {data_dir} ...")
-        cal_table = build_calibration_table(data_dir)
-        n_cells = len(cal_table.table)
-        n_obs = sum(cal_table.counts.values())
-        print(f"  Calibration table: {n_cells} cells, {n_obs} observations")
-        # Calibrated edges are smaller/honest — still require meaningful edge
-        if args.maker:
-            calibrated_overrides = dict(edge_threshold=0.04, early_edge_mult=0.4)
+    # Cross-asset disagreement lookup
+    cross_asset_lookup = None
+    if args.cross_asset_dir:
+        secondary_dir = DATA_DIR / args.cross_asset_dir
+        if secondary_dir.exists():
+            print(f"  Building cross-asset z lookup from {secondary_dir} ...")
+            cross_asset_lookup = build_cross_asset_lookup(secondary_dir)
+            print(f"  Cross-asset lookup: {len(cross_asset_lookup)} windows indexed")
         else:
-            calibrated_overrides = dict(edge_threshold=0.04, early_edge_mult=0.4)
+            print(f"  WARNING: cross-asset dir not found: {secondary_dir}")
 
-    # VAMP mode: BTC uses cost-based, ETH uses filter-based
+    # VAMP mode
     vamp_kw = {}
     base_market = args.market.replace("_5m", "")
     if base_market == "btc":
@@ -2396,36 +2787,30 @@ def main():
     elif base_market == "eth":
         vamp_kw = dict(vamp_mode="filter", vamp_filter_threshold=0.07)
 
-    # 5m market overrides: scale timing for 300s windows
+    # 5m timing overrides
     is_5m = "_5m" in args.market
-    maker_warmup = 100.0
-    maker_withdraw = args.maker_withdraw
-    five_m_kw = {}
+    maker_warmup = 30.0 if is_5m else 100.0
+    maker_withdraw = 30.0 if is_5m else args.maker_withdraw
     if is_5m:
-        if base_market == "btc":
-            maker_warmup = 30.0
-            maker_withdraw = 30.0
-        elif base_market == "eth":
-            maker_warmup = 30.0
-            maker_withdraw = 20.0
-            five_m_kw["edge_threshold"] = 0.04
-            five_m_kw["early_edge_mult"] = 0.4
-            # reversion_discount=0.0 (default) — calibration hurts ETH 5m
-            eth_engine_kw["max_trades_per_window"] = 2  # fewer trades = higher Sharpe
         print(f"  5m overrides: warmup={maker_warmup:.0f}s, withdraw={maker_withdraw:.0f}s")
 
     signal_map = {
         "diffusion": lambda: DiffusionSignal(
             bankroll=args.bankroll, slippage=args.slippage,
-            calibration_table=cal_table,
+            calibration_table=None,  # walk-forward will inject after train pass
             min_entry_price=args.min_entry_price,
             cal_prior_strength=args.cal_prior_strength,
-            inventory_skew=args.inventory_skew,
             maker_warmup_s=maker_warmup,
             maker_withdraw_s=maker_withdraw,
             max_sigma=config.max_sigma,
             min_sigma=config.min_sigma,
-            **{**eth_overrides, **maker_overrides, **calibrated_overrides, **vamp_kw, **five_m_kw}),
+            oracle_cancel_threshold=args.oracle_cancel_threshold,
+            cross_asset_z_lookup=cross_asset_lookup,
+            cross_asset_min_z=args.cross_asset_min_z,
+            min_entry_z=args.min_z,
+            tail_mode=config.tail_mode,
+            tail_nu_default=config.tail_nu_default,
+            **{**eth_overrides, **maker_overrides, **vamp_kw}),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),
         "random": lambda: RandomCoinFlip(bankroll=args.bankroll, seed=args.seed),
@@ -2435,8 +2820,9 @@ def main():
         if args.signal == "all" else [args.signal]
 
     mode_str = "MAKER" if args.maker else "FOK"
-    if args.calibrated:
-        mode_str += "+CAL"
+    train_frac = args.train_frac
+    use_split = train_frac < 1.0
+
     for name in names:
         signal = signal_map[name]()
         engine = BacktestEngine(
@@ -2445,13 +2831,25 @@ def main():
             latency_ms=args.latency,
             slippage=args.slippage,
             initial_bankroll=args.bankroll,
-            **eth_engine_kw,
         )
         print(f"\n{'='*62}")
         print(f"  Running: {signal.name} ({config.display_name}) [{mode_str}]")
+        if use_split:
+            print(f"  Mode: walk-forward (train={train_frac:.0%} / test={1-train_frac:.0%}), "
+                  f"1 trade per window")
+        else:
+            print(f"  Mode: full in-sample, 1 trade per window")
         print(f"{'='*62}")
-        _, metrics, trades_df = engine.run()
-        print_summary(metrics, trades_df)
+
+        if use_split:
+            train_m, test_m, test_trades_df = engine.run_walk_forward(
+                train_frac=train_frac,
+                verbose_test=True,
+            )
+            print_walk_forward_summary(signal.name, train_m, test_m, test_trades_df)
+        else:
+            _, metrics, trades_df = engine.run()
+            print_summary(metrics, trades_df)
 
 
 if __name__ == "__main__":

@@ -528,7 +528,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
             else:
                 if (dec.action != "FLAT" and dec.size_usd > 0
-                        and effective_positions < self.max_positions):
+                        and effective_positions < self.max_positions
+                        and self.window_trade_count < self.max_trades_per_window):
                     total_committed = sum(o["cost_est"] for o in self.open_orders)
                     max_committed = self.initial_bankroll * (self.max_exposure_pct / 100.0)
                     if total_committed + dec.size_usd > max_committed:

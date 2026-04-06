@@ -97,9 +97,13 @@ def _signal_kwargs(mkey: str, settings: dict) -> tuple[dict, dict]:
     signal_kw["obi_weight"] = 0.03
     signal_kw["tail_mode"] = config.tail_mode
     signal_kw["tail_nu_default"] = config.tail_nu_default
+    signal_kw["kou_lambda"] = config.kou_lambda
+    signal_kw["kou_p_up"] = config.kou_p_up
+    signal_kw["kou_eta1"] = config.kou_eta1
+    signal_kw["kou_eta2"] = config.kou_eta2
     signal_kw["slippage"] = float(settings["slippage"])
     signal_kw["inventory_skew"] = 0.02
-    signal_kw["maker_warmup_s"] = 30.0 if is_5m else 100.0
+    signal_kw["maker_warmup_s"] = 30.0 if is_5m else 200.0
     signal_kw["maker_withdraw_s"] = 20.0 if is_5m else 60.0
     signal_kw["as_mode"] = False
     signal_kw["gamma_inv"] = 0.15

@@ -425,16 +425,16 @@ async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
 def _sync_bankroll(all_trackers: list[LiveTradeTracker]):
     """After a resolution, propagate the current bankroll to all trackers.
 
-    Uses the minimum bankroll across trackers (conservative — accounts for
-    capital committed by other timeframes). Also syncs the signal's bankroll.
+    Uses the maximum bankroll across trackers — the one that just resolved
+    has the most accurate balance (includes payout). The other tracker's
+    balance is stale (still has the pre-resolution deduction).
     """
     if len(all_trackers) <= 1:
         return
-    # Use the minimum bankroll (most conservative — reflects committed capital)
-    min_bankroll = min(t.bankroll for t in all_trackers)
+    max_bankroll = max(t.bankroll for t in all_trackers)
     for t in all_trackers:
-        t.bankroll = min_bankroll
-        t.signal.bankroll = min_bankroll
+        t.bankroll = max_bankroll
+        t.signal.bankroll = max_bankroll
 
 
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
@@ -869,33 +869,34 @@ async def run(
 
     redeem_task = None
     try:
-        # Scan trade logs for any unredeemed wins (catches historical misses)
-        for tracker, _, _ in trackers_and_configs:
-            try:
-                tracker.scan_unredeemed_wins()
-            except Exception as exc:
-                print(f"  [STARTUP] Scan error: {exc}")
-
-        # Process any queued redemptions from previous session + scan
-        # Dedup by queue file path (BTC 15m + 5m share the same queue)
-        seen_startup_queues: set[str] = set()
-        for tracker, _, _ in trackers_and_configs:
-            qpath = str(tracker.redemption_queue._file)
-            if qpath in seen_startup_queues:
-                continue
-            seen_startup_queues.add(qpath)
-            if len(tracker.redemption_queue) > 0:
-                print(f"  [STARTUP] Processing {len(tracker.redemption_queue)} "
-                      f"queued redemption(s)...")
+        if not dry_run:
+            # Scan trade logs for any unredeemed wins (catches historical misses)
+            for tracker, _, _ in trackers_and_configs:
                 try:
-                    await asyncio.to_thread(tracker.process_redemption_queue)
+                    tracker.scan_unredeemed_wins()
                 except Exception as exc:
-                    print(f"  [STARTUP] Queue processing error: {exc}")
+                    print(f"  [STARTUP] Scan error: {exc}")
 
-        # Start periodic redemption processor (retries every 90s, independent of trading)
-        redeem_task = asyncio.create_task(
-            _periodic_redeem_loop(all_trackers, interval_s=90.0)
-        )
+            # Process any queued redemptions from previous session + scan
+            # Dedup by queue file path (BTC 15m + 5m share the same queue)
+            seen_startup_queues: set[str] = set()
+            for tracker, _, _ in trackers_and_configs:
+                qpath = str(tracker.redemption_queue._file)
+                if qpath in seen_startup_queues:
+                    continue
+                seen_startup_queues.add(qpath)
+                if len(tracker.redemption_queue) > 0:
+                    print(f"  [STARTUP] Processing {len(tracker.redemption_queue)} "
+                          f"queued redemption(s)...")
+                    try:
+                        await asyncio.to_thread(tracker.process_redemption_queue)
+                    except Exception as exc:
+                        print(f"  [STARTUP] Queue processing error: {exc}")
+
+            # Start periodic redemption processor (retries every 90s, independent of trading)
+            redeem_task = asyncio.create_task(
+                _periodic_redeem_loop(all_trackers, interval_s=90.0)
+            )
 
         # Run all timeframe loops concurrently
         window_loops = []
@@ -945,6 +946,7 @@ def _build_tracker(
     if base_market == "btc":
         signal_kw = dict(
             max_z=3.0 if not is_5m else 1.0,
+            edge_threshold=0.06,
             reversion_discount=0.0,
         )
     elif base_market == "eth":
@@ -1019,8 +1021,15 @@ def _build_tracker(
     signal_kw["oracle_lag_threshold"] = args.oracle_lag_threshold
     signal_kw["oracle_lag_mult"] = args.oracle_lag_mult
     signal_kw["obi_weight"] = args.obi_weight
-    signal_kw["tail_mode"] = args.tail_mode
-    signal_kw["tail_nu_default"] = args.tail_nu
+    # Tail mode + Kou params: prefer CLI override, fall back to market config
+    signal_kw["tail_mode"] = args.tail_mode or config.tail_mode
+    signal_kw["tail_nu_default"] = args.tail_nu if args.tail_nu is not None else config.tail_nu_default
+    signal_kw["kou_lambda"] = config.kou_lambda
+    signal_kw["kou_p_up"] = config.kou_p_up
+    signal_kw["kou_eta1"] = config.kou_eta1
+    signal_kw["kou_eta2"] = config.kou_eta2
+    signal_kw["min_entry_z"] = args.min_z
+    signal_kw["min_entry_price"] = args.min_entry_price
 
     # A-S quoting params
     signal_kw["as_mode"] = args.as_mode
@@ -1107,7 +1116,7 @@ def _build_tracker(
         exit_min_hold = 10.0
         exit_min_remaining = 20.0
 
-    max_trades = args.max_trades_per_window if args.max_trades_per_window is not None else 6
+    max_trades = args.max_trades_per_window if args.max_trades_per_window is not None else 1
 
     # Shared trades log and state file (named after base asset, not timeframe)
     trades_log = Path(f"live_trades_{base_market}.jsonl")
@@ -1214,8 +1223,8 @@ def main():
     )
     parser.add_argument("--max-exposure-pct", type=float, default=20.0,
                         help="Max %% of initial bankroll committed to open orders (default: 20)")
-    parser.add_argument("--maker-warmup", type=float, default=100.0,
-                        help="Seconds to wait after window opens before trading (default: 100)")
+    parser.add_argument("--maker-warmup", type=float, default=200.0,
+                        help="Seconds to wait after window opens before trading (default: 200)")
     parser.add_argument("--calibrated", action="store_true",
                         help="Use empirically calibrated probabilities")
     parser.add_argument("--early-exit", action="store_true",
@@ -1270,11 +1279,15 @@ def main():
                         help="Kelly fraction for sizing (0.25 = quarter-Kelly, default: 0.25)")
     parser.add_argument("--max-bet-fraction", type=float, default=0.05,
                         help="Max fraction of bankroll per trade (default: 0.05)")
-    parser.add_argument("--tail-mode", choices=["student_t", "normal"],
-                        default="student_t",
-                        help="CDF for z→probability (default: student_t)")
-    parser.add_argument("--tail-nu", type=float, default=3.0,
-                        help="Student-t nu floor / default (default: 3.0 = data-driven)")
+    parser.add_argument("--tail-mode", choices=["student_t", "normal", "kou"],
+                        default=None,
+                        help="CDF for z→probability (default: from market config)")
+    parser.add_argument("--tail-nu", type=float, default=None,
+                        help="Student-t nu floor / default (default: from market config)")
+    parser.add_argument("--min-z", type=float, default=0.0,
+                        help="Minimum |z-score| to enter a trade (default: 0.0)")
+    parser.add_argument("--min-entry-price", type=float, default=0.10,
+                        help="Minimum contract entry price (default: 0.10)")
     # Avellaneda-Stoikov unified quoting
     parser.add_argument("--as-mode", action="store_true", default=False,
                         help="Enable A-S reservation price quoting")

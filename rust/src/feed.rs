@@ -728,8 +728,8 @@ async fn binance_json_feed_task(
     mid: Arc<AtomicU64>,
     last_update_ts: Arc<AtomicU64>,
 ) {
-    use futures_util::StreamExt;
-    use tokio_tungstenite::connect_async;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     let url = format!(
         "wss://data-stream.binance.vision/ws/{}@bookTicker",
@@ -752,11 +752,9 @@ async fn binance_json_feed_task(
             }
         };
 
-        let (_write, mut read) = ws.split();
+        let (mut write, mut read) = ws.split();
 
-        // No client heartbeat needed: bookTicker sends hundreds of updates/second
-        // so the 30s read timeout is sufficient to detect dead connections.
-        // Sending application-level PING confuses the CDN and causes resets.
+        // Binance sends a Ping every ~3 min; must Pong within 10 min or it closes.
         let read_timeout = std::time::Duration::from_secs(30);
         loop {
             let msg = match tokio::time::timeout(read_timeout, read.next()).await {
@@ -767,29 +765,33 @@ async fn binance_json_feed_task(
                     break;
                 }
             };
-            let text = match msg {
-                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
-                Ok(_) => continue,
+            match msg {
+                Ok(Message::Text(t)) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t) {
+                        let best_bid = parsed
+                            .get("b")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok());
+                        let best_ask = parsed
+                            .get("a")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok());
+
+                        if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+                            let mid_val = (bid + ask) / 2.0;
+                            store_f64(&mid, mid_val);
+                            store_f64(&last_update_ts, now_s());
+                        }
+                    }
+                }
+                Ok(Message::Ping(data)) => {
+                    let _ = write.send(Message::Pong(data)).await;
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => {}
                 Err(e) => {
                     eprintln!("[BinanceFeed] read error: {e}");
                     break;
-                }
-            };
-
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                let best_bid = parsed
-                    .get("b")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok());
-                let best_ask = parsed
-                    .get("a")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok());
-
-                if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-                    let mid_val = (bid + ask) / 2.0;
-                    store_f64(&mid, mid_val);
-                    store_f64(&last_update_ts, now_s());
                 }
             }
         }

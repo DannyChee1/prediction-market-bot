@@ -57,6 +57,32 @@ def norm_cdf(x: float) -> float:
     return 0.5 * math.erfc(-x / math.sqrt(2.0))
 
 
+# ── Time-of-day / day-of-week volatility priors ──────────────────────────────
+# Multipliers relative to global mean sigma, computed from 1844 BTC windows.
+# Used as Bayesian prior when raw vol is zero (quiet periods / weekends).
+# Blended from our 1844-window parquet data + 1000-hour Binance API klines.
+_HOURLY_VOL_MULT: dict[int, float] = {
+    0: 0.99, 1: 1.42, 2: 1.01, 3: 0.78, 4: 0.83, 5: 0.82,
+    6: 0.80, 7: 0.79, 8: 0.80, 9: 0.79, 10: 0.67, 11: 0.71,
+    12: 0.86, 13: 1.17, 14: 1.56, 15: 1.69, 16: 1.35, 17: 1.27,
+    18: 1.09, 19: 1.01, 20: 0.89, 21: 0.94, 22: 0.96, 23: 0.85,
+}
+_DOW_VOL_MULT: dict[int, float] = {
+    0: 1.36, 1: 1.19, 2: 1.41, 3: 1.21, 4: 0.90, 5: 0.46, 6: 0.59,
+}
+# Global mean sigma (per 1-second non-zero return) across all BTC data.
+_GLOBAL_MEAN_SIGMA: float = 8.9e-05
+
+
+def _time_prior_sigma(ts_ms: int) -> float:
+    """Return a time-of-day / day-of-week sigma prior for the given timestamp."""
+    import datetime as _dt
+    utc = _dt.datetime.fromtimestamp(ts_ms / 1000, tz=_dt.timezone.utc)
+    h_mult = _HOURLY_VOL_MULT.get(utc.hour, 1.0)
+    d_mult = _DOW_VOL_MULT.get(utc.weekday(), 1.0)
+    return _GLOBAL_MEAN_SIGMA * h_mult * d_mult
+
+
 def _betacf(a: float, b: float, x: float) -> float:
     """Continued-fraction evaluation for regularized incomplete beta."""
     _MAX_ITER = 64
@@ -124,6 +150,65 @@ def fast_t_cdf(x: float, nu: float) -> float:
         return 1.0 - 0.5 * ib
     else:
         return 0.5 * ib
+
+
+# ── Kou jump-diffusion CDF ────────────────────────────────────────────────
+
+def _poisson_pmf(k: int, lam: float) -> float:
+    """Poisson probability mass function P(N=k) for rate lam."""
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1))
+
+
+def kou_cdf(x: float, sigma: float, lam: float, p_up: float,
+            eta1: float, eta2: float, tau: float) -> float:
+    """CDF of log-return under Kou double-exponential jump-diffusion.
+
+    P(X_tau < x) where X_tau = (drift)*tau + sigma*W_tau + sum_jumps.
+
+    For our digital option: P(UP) = 1 - kou_cdf(-delta, ...) where
+    delta = log(S_t / S_0).
+
+    Uses CLT approximation when expected jumps (lam*tau) > 5, exact
+    Poisson-weighted Gaussian convolution otherwise.
+    """
+    q_down = 1.0 - p_up
+    # Jump moments
+    ej  = p_up / eta1 - q_down / eta2            # E[Y_i]
+    ej2 = 2.0 * p_up / (eta1**2) + 2.0 * q_down / (eta2**2)  # E[Y_i^2]
+
+    # Drift correction (risk-neutral): mu = -sigma^2/2 - lam*(E[e^Y]-1)
+    # For small jumps: E[e^Y]-1 ≈ ej + ej2/2
+    zeta = p_up * eta1 / (eta1 - 1.0) + q_down * eta2 / (eta2 + 1.0) - 1.0 \
+        if eta1 > 1.0 else ej + ej2 / 2.0
+    mu = -0.5 * sigma**2 - lam * zeta
+
+    lam_tau = lam * tau
+
+    if lam_tau > 5.0 or lam <= 0:
+        # CLT: total process is approximately Gaussian
+        total_mean = mu * tau + lam_tau * ej
+        total_var  = sigma**2 * tau + lam_tau * ej2
+        if total_var <= 0:
+            return norm_cdf(x)
+        return norm_cdf((x - total_mean) / math.sqrt(total_var))
+
+    # Exact: Poisson-weighted sum with n jumps ≤ N_max
+    n_max = min(20, int(lam_tau + 4 * math.sqrt(max(lam_tau, 1))) + 1)
+    cdf = 0.0
+    for n in range(n_max + 1):
+        pw = _poisson_pmf(n, lam_tau)
+        if pw < 1e-12:
+            continue
+        # With n jumps: X ~ N(mu*tau + n*ej, sigma^2*tau + n*ej2)
+        m_n = mu * tau + n * ej
+        v_n = sigma**2 * tau + n * ej2
+        if v_n <= 0:
+            cdf += pw * (1.0 if x >= m_n else 0.0)
+        else:
+            cdf += pw * norm_cdf((x - m_n) / math.sqrt(v_n))
+    return cdf
 
 
 # ── Calibration table ──────────────────────────────────────────────────────
@@ -826,9 +911,16 @@ class DiffusionSignal(Signal):
         # At chainlink_blend_s remaining → 100% Binance;
         # at 0 remaining → 100% Chainlink (matches resolution source).
         chainlink_blend_s: float = 120.0,
-        # Fat-tail CDF: "student_t" uses kurtosis-estimated nu, "normal" = Gaussian
+        # Fat-tail CDF: "normal", "student_t", "kou", "market_adaptive"
         tail_mode: str = "normal",
         tail_nu_default: float = 20.0,
+        # Kou jump-diffusion parameters (only used when tail_mode="kou")
+        kou_lambda: float = 0.007,   # jump intensity per observation
+        kou_p_up: float = 0.51,      # probability of upward jump
+        kou_eta1: float = 1100.0,    # rate of upward jumps (1/mean_size)
+        kou_eta2: float = 1100.0,    # rate of downward jumps
+        # Market-adaptive parameters (only used when tail_mode="market_adaptive")
+        market_blend_alpha: float = 0.30,  # weight on GBM vs market
         # Avellaneda-Stoikov unified quoting mode
         as_mode: bool = False,
         gamma_inv: float = 0.15,       # risk aversion for inventory penalty
@@ -909,6 +1001,11 @@ class DiffusionSignal(Signal):
         self.chainlink_blend_s = chainlink_blend_s
         self.tail_mode = tail_mode
         self.tail_nu_default = tail_nu_default
+        self.kou_lambda = kou_lambda
+        self.kou_p_up = kou_p_up
+        self.kou_eta1 = kou_eta1
+        self.kou_eta2 = kou_eta2
+        self.market_blend_alpha = market_blend_alpha
         self.as_mode = as_mode
         self.gamma_inv = gamma_inv
         self.gamma_spread = gamma_spread
@@ -1028,6 +1125,21 @@ class DiffusionSignal(Signal):
                                  has std ≈ sigma/sqrt(2N), so r ≈ 1/sqrt(180))
         """
         if raw_sigma == 0.0:
+            # No measurable vol in lookback. Use best available prior:
+            # 1. Kalman state from recent ticks (most accurate)
+            # 2. Time-of-day / day-of-week historical prior (covers cold start)
+            x = ctx.get("_kalman_x")
+            if x is not None and x > 0:
+                return max(min(x, self.max_sigma) if self.max_sigma else x,
+                           self.min_sigma)
+            # Cold start: use time-based prior so we don't go FLAT
+            # on the very first window (especially weekends).
+            ts_hist = ctx.get("ts_history", [])
+            ts_ms = ctx.get("_last_ts_ms", 0) or (ts_hist[-1] if ts_hist else 0)
+            if ts_ms > 0:
+                prior = _time_prior_sigma(ts_ms)
+                return max(min(prior, self.max_sigma) if self.max_sigma else prior,
+                           self.min_sigma)
             return 0.0
 
         if not self.use_kalman_sigma:
@@ -1251,9 +1363,43 @@ class DiffusionSignal(Signal):
         return abs(binance_mid - chainlink_price) / chainlink_price
 
     def _model_cdf(self, z: float, ctx: dict) -> float:
-        """CDF dispatch: Student-t (fat-tail) or normal (Gaussian)."""
+        """CDF dispatch: normal, student_t, kou, or market_adaptive."""
         if self.tail_mode == "normal":
             return norm_cdf(z)
+        if self.tail_mode == "kou":
+            # Our sigma_per_s already includes jump variance (it's total sigma).
+            # Kou's drift correction is the only new information.
+            # zeta = p*eta1/(eta1-1) + q*eta2/(eta2+1) - 1
+            eta1, eta2 = self.kou_eta1, self.kou_eta2
+            p_up, q_dn = self.kou_p_up, 1.0 - self.kou_p_up
+            zeta = (p_up * eta1 / max(eta1 - 1, 0.01)
+                    + q_dn * eta2 / (eta2 + 1) - 1.0)
+            sigma = ctx.get("_sigma_per_s", 1e-5)
+            tau = ctx.get("_tau", 300.0)
+            drift_z = -self.kou_lambda * zeta * math.sqrt(tau) / max(sigma, 1e-8)
+            return norm_cdf(z + drift_z)
+        if self.tail_mode == "market_adaptive":
+            p_gbm = norm_cdf(z)
+            market_mid = ctx.get("_market_mid", 0.5)
+            choppiness = ctx.get("_choppiness", 1.0)
+            elapsed_frac = ctx.get("_elapsed_frac", 0.5)
+
+            # 1. Blend GBM with market price
+            alpha = self.market_blend_alpha
+            p_blend = alpha * p_gbm + (1.0 - alpha) * market_mid
+
+            # 2. Choppiness discount: pull toward 0.5 when choppy
+            # choppiness = actual_crossovers / expected_crossovers
+            # >1 means choppier than GBM predicts → less confident
+            chop_factor = min(1.0, 1.0 / max(choppiness, 0.3))
+            p_chop = chop_factor * p_blend + (1.0 - chop_factor) * 0.5
+
+            # 3. Time-confidence: S-curve, low at 0-25%, rises through 50%+
+            # Logistic: f(t) = 1 / (1 + exp(-k*(t - t0)))
+            t_conf = 1.0 / (1.0 + math.exp(-8.0 * (elapsed_frac - 0.35)))
+            p_final = t_conf * p_chop + (1.0 - t_conf) * 0.5
+            return p_final
+        # student_t fallback
         nu = ctx.get("_tail_nu", self.tail_nu_default)
         return fast_t_cdf(z, nu)
 
@@ -1353,8 +1499,6 @@ class DiffusionSignal(Signal):
 
         # Realized vol (short window for model)
         raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
-        if raw_sigma == 0.0:
-            return Decision("FLAT", 0.0, 0.0, "zero vol")
 
         # Vol regime filter: compare recent vol to longer baseline
         if len(hist) >= self.vol_regime_lookback_s:
@@ -1366,6 +1510,8 @@ class DiffusionSignal(Signal):
 
         # EMA smoothing + asset cap
         sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
+        if sigma_per_s == 0.0:
+            return Decision("FLAT", 0.0, 0.0, "zero vol")
 
         # Vol kill switch
         if self.vol_kill_sigma is not None and sigma_per_s > self.vol_kill_sigma:
@@ -1394,6 +1540,24 @@ class DiffusionSignal(Signal):
         z = max(-self.max_z, min(self.max_z, z_raw))
         ctx["_z_raw"] = z_raw
         ctx["_z"] = z
+        # Populate context for kou / market_adaptive CDF
+        ctx["_sigma_per_s"] = sigma_per_s
+        ctx["_tau"] = tau
+        dur_s = ctx.get("_window_duration_s", tau + 1.0)
+        if "_window_duration_s" not in ctx:
+            ctx["_window_duration_s"] = snapshot.time_remaining_s  # first call ≈ full duration
+        ctx["_elapsed_frac"] = 1.0 - tau / dur_s if dur_s > 0 else 0.5
+        ctx["_market_mid"] = getattr(snapshot, "mid_up", 0.5) or 0.5
+        # choppiness: track zero-crossings of delta
+        _prev_sign = ctx.get("_prev_delta_sign", 0)
+        _cur_sign = 1 if delta > 0 else (-1 if delta < 0 else 0)
+        if _prev_sign != 0 and _cur_sign != 0 and _cur_sign != _prev_sign:
+            ctx["_crossovers"] = ctx.get("_crossovers", 0) + 1
+        ctx["_prev_delta_sign"] = _cur_sign
+        # expected crossovers under GBM ≈ sqrt(2 * elapsed / pi) * sigma_factor
+        elapsed_s = dur_s - tau
+        expected_xo = max(1.0, math.sqrt(2.0 * max(elapsed_s, 1.0) / math.pi))
+        ctx["_choppiness"] = ctx.get("_crossovers", 0) / expected_xo
 
         # Minimum z gate: filter low-conviction setups
         if self.min_entry_z > 0 and abs(z) < self.min_entry_z:
@@ -1704,10 +1868,6 @@ class DiffusionSignal(Signal):
 
         # Vol
         raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
-        if raw_sigma == 0.0:
-            reason = "zero vol"
-            return (Decision("FLAT", 0.0, 0.0, reason),
-                    Decision("FLAT", 0.0, 0.0, reason))
 
         # Vol regime filter
         if len(hist) >= self.vol_regime_lookback_s:
@@ -1720,6 +1880,10 @@ class DiffusionSignal(Signal):
 
         # EMA smoothing + asset cap
         sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
+        if sigma_per_s == 0.0:
+            reason = "zero vol"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
 
         # Volatility kill switch: hard pause when EMA sigma exceeds
         # an absolute ceiling.  Distinct from the relative regime filter
@@ -1801,6 +1965,22 @@ class DiffusionSignal(Signal):
         z = max(-self.max_z, min(self.max_z, z_raw))
         ctx["_z_raw"] = z_raw
         ctx["_z"] = z
+        # Populate context for kou / market_adaptive CDF
+        ctx["_sigma_per_s"] = sigma_per_s
+        ctx["_tau"] = tau
+        dur_s = ctx.get("_window_duration_s", tau + 1.0)
+        if "_window_duration_s" not in ctx:
+            ctx["_window_duration_s"] = snapshot.time_remaining_s
+        ctx["_elapsed_frac"] = 1.0 - tau / dur_s if dur_s > 0 else 0.5
+        ctx["_market_mid"] = getattr(snapshot, "mid_up", 0.5) or 0.5
+        _prev_sign = ctx.get("_prev_delta_sign", 0)
+        _cur_sign = 1 if delta > 0 else (-1 if delta < 0 else 0)
+        if _prev_sign != 0 and _cur_sign != 0 and _cur_sign != _prev_sign:
+            ctx["_crossovers"] = ctx.get("_crossovers", 0) + 1
+        ctx["_prev_delta_sign"] = _cur_sign
+        elapsed_s = dur_s - tau
+        expected_xo = max(1.0, math.sqrt(2.0 * max(elapsed_s, 1.0) / math.pi))
+        ctx["_choppiness"] = ctx.get("_crossovers", 0) / expected_xo
 
         # Minimum z gate: filter low-conviction setups
         if self.min_entry_z > 0 and abs(z) < self.min_entry_z:
@@ -2204,10 +2384,16 @@ class BacktestEngine:
         if maker_mode:
             cooldown_ms = 5_000
 
+        has_binance = "binance_mid" in window_df.columns
+
         for _, row in window_df.iterrows():
             snap = Snapshot.from_row(row)
             if snap is None:
                 continue
+
+            # Inject Binance mid into ctx for sigma estimation (when available)
+            if has_binance and pd.notna(row.get("binance_mid")) and row["binance_mid"] > 0:
+                ctx["_binance_mid"] = float(row["binance_mid"])
 
             # Execute pending order after latency
             if pending is not None:
@@ -2810,6 +2996,10 @@ def main():
             min_entry_z=args.min_z,
             tail_mode=config.tail_mode,
             tail_nu_default=config.tail_nu_default,
+            kou_lambda=config.kou_lambda,
+            kou_p_up=config.kou_p_up,
+            kou_eta1=config.kou_eta1,
+            kou_eta2=config.kou_eta2,
             **{**eth_overrides, **maker_overrides, **vamp_kw}),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

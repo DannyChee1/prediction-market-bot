@@ -16,8 +16,12 @@ class MarketConfig:
     max_sigma: float = 8e-05           # per-second sigma ceiling
     min_sigma: float = 1e-6            # per-second sigma floor
     binance_symbol: str = ""           # e.g. "btcusdt" for Binance bookTicker
-    tail_mode: str = "normal"          # "normal" or "student_t"
+    tail_mode: str = "normal"          # "normal", "student_t", or "kou"
     tail_nu_default: float = 20.0      # Student-t degrees of freedom (ignored for normal)
+    kou_lambda: float = 0.007          # Kou jump intensity per observation
+    kou_p_up: float = 0.51             # Kou upward jump probability
+    kou_eta1: float = 1100.0           # Kou upward jump rate (1/mean_size)
+    kou_eta2: float = 1100.0           # Kou downward jump rate
 
 
 MARKET_CONFIGS: dict[str, MarketConfig] = {
@@ -30,6 +34,8 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=15,
         min_sigma=3e-05,
         binance_symbol="btcusdt",
+        tail_mode="kou",
+        tail_nu_default=20.0,
     ),
     "eth": MarketConfig(
         slug_prefix="eth-updown-15m",
@@ -52,8 +58,12 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=5,
         min_sigma=7e-05,
         binance_symbol="btcusdt",
-        tail_mode="student_t",
+        tail_mode="kou",
         tail_nu_default=20.0,
+        kou_lambda=0.005,
+        kou_p_up=0.526,
+        kou_eta1=1254.1,
+        kou_eta2=1200.5,
     ),
     "eth_5m": MarketConfig(
         slug_prefix="eth-updown-5m",

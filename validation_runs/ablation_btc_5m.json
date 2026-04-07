@@ -1,0 +1,30 @@
+{
+  "baseline (yz, no regime)": {
+    "test_n_trades": 300,
+    "test_win_rate": 0.58,
+    "test_total_pnl": -2847.44,
+    "test_sharpe": -0.34,
+    "test_max_dd_pct": 0.6073
+  },
+  "+ewma": {
+    "test_n_trades": 285,
+    "test_win_rate": 0.5684,
+    "test_total_pnl": -3207.44,
+    "test_sharpe": -0.35,
+    "test_max_dd_pct": 0.582
+  },
+  "+regime": {
+    "test_n_trades": 300,
+    "test_win_rate": 0.58,
+    "test_total_pnl": -2917.97,
+    "test_sharpe": -0.35,
+    "test_max_dd_pct": 0.6101
+  },
+  "+ewma +regime": {
+    "test_n_trades": 285,
+    "test_win_rate": 0.5684,
+    "test_total_pnl": -3207.44,
+    "test_sharpe": -0.35,
+    "test_max_dd_pct": 0.582
+  }
+}

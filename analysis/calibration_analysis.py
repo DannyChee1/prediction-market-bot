@@ -33,16 +33,17 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 # ── CDF dispatch (mirrors _model_cdf but standalone) ──────────────────────
 
 def model_cdf(z: float, cfg, sigma_per_s: float = 1e-5, tau: float = 300.0) -> float:
-    """Pure GBM probability — no calibration table involved."""
+    """Pure GBM probability — no calibration table involved.
+
+    Mirrors `DiffusionSignal._model_cdf`. After fixing the Kou risk-neutral
+    drift bug, the "kou" path is just `norm_cdf(z)` — sigma_per_s is treated
+    as a total realized vol estimate that already absorbs jump variance, so
+    no extra correction is needed for physical-measure binary prediction.
+    """
     if cfg.tail_mode == "normal":
         return norm_cdf(z)
     if cfg.tail_mode == "kou":
-        eta1, eta2 = cfg.kou_eta1, cfg.kou_eta2
-        p_up, q_dn = cfg.kou_p_up, 1.0 - cfg.kou_p_up
-        zeta = (p_up * eta1 / max(eta1 - 1, 0.01)
-                + q_dn * eta2 / (eta2 + 1) - 1.0)
-        drift_z = -cfg.kou_lambda * zeta * math.sqrt(tau) / max(sigma_per_s, 1e-8)
-        return norm_cdf(z + drift_z)
+        return norm_cdf(z)
     if cfg.tail_mode == "student_t":
         return fast_t_cdf(z, cfg.tail_nu_default)
     return norm_cdf(z)

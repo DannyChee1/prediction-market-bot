@@ -1,0 +1,19 @@
+{
+  "n_trades": 316,
+  "n_boot": 2000,
+  "point_kelly": 0.0,
+  "p_win": 0.5854430379746836,
+  "avg_win_pct": 0.6865437837837838,
+  "avg_loss_pct": 1.0,
+  "kelly_p05": 0.0,
+  "kelly_p25": 0.0,
+  "kelly_p50": 0.0,
+  "kelly_p75": 0.02872426641571259,
+  "kelly_p95": 0.09616327392153508,
+  "kelly_mean": 0.019448285586127736,
+  "p_win_p05": 0.5379746835443038,
+  "p_win_p95": 0.6329113924050633,
+  "frac_kelly_zero": 0.6085,
+  "live_kelly_fraction": 0.25,
+  "live_effective_kelly": 0.0
+}

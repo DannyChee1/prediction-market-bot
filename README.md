@@ -38,7 +38,7 @@ uv run python recorder.py --market btc
 | `tests/` | Unit tests. |
 | `validation_runs/` | Trade parquets, metrics, ergodicity plots, RESULTS docs. |
 | `tasks/findings/` | Dated markdown findings from each investigation. |
-| `rust/` | Experimental Rust WebSocket client. |
+| `rust/` | Compiled into `polybot_core` Python extension (`.so` in `.venv`). Live path — all WebSocket feeds (CLOB book, Chainlink RTDS, Binance book ticker, user orders) run in Rust. Python is orchestration only. |
 
 ## Signal Pipeline
 

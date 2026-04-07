@@ -1,0 +1,32 @@
+{
+  "n_trades": 113,
+  "annualisation_factor": 96,
+  "sharpe_raw": 0.7234229103114156,
+  "sweep": [
+    {
+      "n_trials": 1,
+      "sharpe_deflated": 0.7234229103114156,
+      "haircut": 0.0
+    },
+    {
+      "n_trials": 10,
+      "sharpe_deflated": -1.254544979257794,
+      "haircut": 1.9779678895692097
+    },
+    {
+      "n_trials": 100,
+      "sharpe_deflated": -2.073846105055849,
+      "haircut": 2.797269015367265
+    },
+    {
+      "n_trials": 1000,
+      "sharpe_deflated": -2.7025179701622415,
+      "haircut": 3.4259408804736573
+    },
+    {
+      "n_trials": 10000,
+      "sharpe_deflated": -3.232512868827004,
+      "haircut": 3.9559357791384198
+    }
+  ]
+}

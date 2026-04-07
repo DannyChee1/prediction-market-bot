@@ -1,0 +1,49 @@
+{
+  "train": {
+    "signal": "diffusion",
+    "latency_ms": 0,
+    "slippage": 0.0,
+    "initial_bankroll": 10000.0,
+    "final_bankroll": 4880.181023885909,
+    "n_trades": 399,
+    "total_pnl": -5119.82,
+    "total_fees": 1019.11,
+    "win_rate": 0.5739,
+    "avg_pnl": -12.83,
+    "avg_win": 213.54,
+    "avg_loss": -317.77,
+    "max_drawdown": 6066.89,
+    "max_dd_pct": 0.6067,
+    "sharpe": -0.45,
+    "sharpe_deflated": -0.45,
+    "n_trials": 1,
+    "n_windows": 3314
+  },
+  "test": {
+    "signal": "diffusion",
+    "latency_ms": 0,
+    "slippage": 0.0,
+    "initial_bankroll": 10000.0,
+    "final_bankroll": 13706.190263748791,
+    "n_trades": 113,
+    "total_pnl": 3706.19,
+    "total_fees": 478.29,
+    "win_rate": 0.6372,
+    "avg_pnl": 32.8,
+    "avg_win": 354.48,
+    "avg_loss": -532.1,
+    "max_drawdown": 3353.22,
+    "max_dd_pct": 0.2896,
+    "sharpe": 0.73,
+    "sharpe_deflated": 0.73,
+    "n_trials": 1,
+    "n_windows": 1421
+  },
+  "args": {
+    "market": "btc",
+    "tag": "postfix",
+    "bankroll": 10000.0,
+    "train_frac": 0.7,
+    "seed": 42
+  }
+}

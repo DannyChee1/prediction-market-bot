@@ -1,0 +1,13 @@
+{
+  "n_trades": 113,
+  "n_perm": 1000,
+  "periods_per_year": 35040,
+  "sharpe_actual": 13.820975295349278,
+  "sharpe_perm_mean": 13.820975295349282,
+  "sharpe_perm_std": 3.2857422903478376e-15,
+  "sharpe_perm_p05": 13.820975295349275,
+  "sharpe_perm_p50": 13.82097529534928,
+  "sharpe_perm_p95": 13.820975295349283,
+  "p_value_one_sided": 0.9430569430569431,
+  "interpretation": "actual Sharpe is consistent with i.i.d. reordering \u2014 no sequence structure detected"
+}

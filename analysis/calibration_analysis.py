@@ -19,13 +19,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from backtest import (
     _compute_vol_deduped, norm_cdf, fast_t_cdf,
     MIN_FINAL_REMAINING_S, MAX_START_GAP_S,
 )
 from market_config import MARKET_CONFIGS
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent.parent / "data"
 
 # ── CDF dispatch (mirrors _model_cdf but standalone) ──────────────────────
 
@@ -445,7 +448,8 @@ def main():
                   f"{r['ece']:>8.4f} {r['up_rate']:>7.1%}")
 
     # Generate plots
-    out_dir = Path(__file__).parent
+    out_dir = Path(__file__).parent / "outputs"
+    out_dir.mkdir(exist_ok=True)
     plot_all_markets(all_results, str(out_dir / "calibration_reliability.png"))
     plot_tau_breakdown(all_results, all_tau_results, str(out_dir / "calibration_by_tau.png"))
     plot_prediction_distribution(all_results, str(out_dir / "calibration_distributions.png"))

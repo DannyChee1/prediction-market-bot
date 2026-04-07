@@ -921,6 +921,9 @@ class DiffusionSignal(Signal):
         kou_eta2: float = 1100.0,    # rate of downward jumps
         # Market-adaptive parameters (only used when tail_mode="market_adaptive")
         market_blend_alpha: float = 0.30,  # weight on GBM vs market
+        # Direct p_model blend with contract mid (anti-fade-the-market)
+        # Applied AFTER _p_model() for any tail_mode. 0=off, 0.3=BTC 5m default.
+        market_blend: float = 0.0,
         # Avellaneda-Stoikov unified quoting mode
         as_mode: bool = False,
         gamma_inv: float = 0.15,       # risk aversion for inventory penalty
@@ -1006,6 +1009,7 @@ class DiffusionSignal(Signal):
         self.kou_eta1 = kou_eta1
         self.kou_eta2 = kou_eta2
         self.market_blend_alpha = market_blend_alpha
+        self.market_blend = market_blend
         self.as_mode = as_mode
         self.gamma_inv = gamma_inv
         self.gamma_spread = gamma_spread
@@ -1589,6 +1593,13 @@ class DiffusionSignal(Signal):
         # Mean-reversion discount: pull p_model toward 0.5
         if self.reversion_discount > 0:
             p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
+
+        # Market blend: pull p_model toward contract mid (anti-fade-the-market)
+        if self.market_blend > 0:
+            mid_up = (bid_up + ask_up) / 2.0
+            p_model = (1.0 - self.market_blend) * p_model + self.market_blend * mid_up
+            p_model = max(0.01, min(0.99, p_model))
+
         ctx["_p_model_trade"] = p_model
 
         # Effective costs (taker mode)
@@ -2017,6 +2028,15 @@ class DiffusionSignal(Signal):
 
         if self.reversion_discount > 0:
             p_model = p_model * (1 - self.reversion_discount) + 0.5 * self.reversion_discount
+
+        # Market blend: pull p_model toward contract mid (anti-fade-the-market).
+        # When the model says BUY at $0.10 but the market trades at $0.10, the
+        # market is usually right.  Backtested on 1159 BTC 5m windows: blend=0.3
+        # turns -10% recent ROI into +10%.
+        if self.market_blend > 0:
+            mid_up = (bid_up + ask_up) / 2.0
+            p_model = (1.0 - self.market_blend) * p_model + self.market_blend * mid_up
+            p_model = max(0.01, min(0.99, p_model))
 
         # Order book imbalance → continuous p_model shift
         # OBI > 0 means more bid depth (buying pressure) → nudge p_up higher

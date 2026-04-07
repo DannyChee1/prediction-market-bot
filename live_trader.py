@@ -422,19 +422,22 @@ async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
 
 # ── Bankroll sync ────────────────────────────────────────────────────────────
 
-def _sync_bankroll(all_trackers: list[LiveTradeTracker]):
-    """After a resolution, propagate the current bankroll to all trackers.
+def _sync_bankroll(all_trackers: list[LiveTradeTracker],
+                   resolved_tracker: LiveTradeTracker,
+                   window_pnl: float):
+    """After a resolution, propagate the PnL delta to all other trackers.
 
-    Uses the maximum bankroll across trackers — the one that just resolved
-    has the most accurate balance (includes payout). The other tracker's
-    balance is stale (still has the pre-resolution deduction).
+    Each tracker independently deducts costs from its own bankroll copy.
+    Taking max() would wipe out pending cost deductions in other trackers,
+    inflating the bankroll. Instead, we propagate only the PnL delta so
+    each tracker's own pending deductions are preserved.
     """
     if len(all_trackers) <= 1:
         return
-    max_bankroll = max(t.bankroll for t in all_trackers)
     for t in all_trackers:
-        t.bankroll = max_bankroll
-        t.signal.bankroll = max_bankroll
+        if t is not resolved_tracker:
+            t.bankroll += window_pnl
+            t.signal.bankroll = t.bankroll
 
 
 # ── Window Lifecycle ─────────────────────────────────────────────────────────
@@ -681,13 +684,14 @@ async def _resolve_background(
     Queue processing is handled by _periodic_redeem_loop — NOT here.
     This keeps resolution fast so the next window isn't blocked.
     """
+    window_pnl = 0.0
     try:
-        await asyncio.to_thread(
+        window_pnl = await asyncio.to_thread(
             tracker.resolve_window, slug, final_price, start_price, condition_id,
-        )
+        ) or 0.0
     except Exception as exc:
         print(f"  [RESOLVE] ERROR: {type(exc).__name__}: {exc}")
-    _sync_bankroll(all_trackers)
+    _sync_bankroll(all_trackers, resolved_tracker=tracker, window_pnl=window_pnl)
     tracker.save_state()
     # Fire-and-forget: kick off queue processing without blocking.
     # The periodic loop also processes the queue, so this is just for speed.
@@ -946,7 +950,6 @@ def _build_tracker(
     if base_market == "btc":
         signal_kw = dict(
             max_z=3.0 if not is_5m else 1.0,
-            edge_threshold=0.06,
             reversion_discount=0.0,
         )
     elif base_market == "eth":
@@ -980,7 +983,7 @@ def _build_tracker(
     signal_kw["maker_mode"] = True
     signal_kw["max_bet_fraction"] = args.max_bet_fraction
     signal_kw["kelly_fraction"] = args.kelly_fraction
-    signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", 0.12)
+    signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", config.edge_threshold)
     signal_kw["momentum_majority"] = 0.0
     signal_kw["spread_edge_penalty"] = signal_kw.get("spread_edge_penalty", 0.0)
     cooldown_ms = 30_000
@@ -1028,8 +1031,11 @@ def _build_tracker(
     signal_kw["kou_p_up"] = config.kou_p_up
     signal_kw["kou_eta1"] = config.kou_eta1
     signal_kw["kou_eta2"] = config.kou_eta2
-    signal_kw["min_entry_z"] = args.min_z
-    signal_kw["min_entry_price"] = args.min_entry_price
+    signal_kw["market_blend"] = config.market_blend
+    # Per-market entry filters: CLI overrides config if explicitly set
+    signal_kw["min_entry_z"] = args.min_z if args.min_z > 0 else config.min_entry_z
+    signal_kw["min_entry_price"] = args.min_entry_price if args.min_entry_price != 0.10 else config.min_entry_price
+    signal_kw["edge_threshold"] = config.edge_threshold
 
     # A-S quoting params
     signal_kw["as_mode"] = args.as_mode
@@ -1313,11 +1319,15 @@ def main():
     parser.add_argument("--no-binance", action="store_true",
                         help="Disable Binance feed (use when another process already connects "
                              "to the same symbol, e.g. dashboard + recorder running together)")
+    parser.add_argument("--no-5m", action="store_true",
+                        help="Disable 5m timeframe (only trade 15m)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     # Resolve market -> list of (config_key, config) pairs
     paired = get_paired_configs(args.market)
+    if args.no_5m:
+        paired = [(k, c) for k, c in paired if "_5m" not in k]
     base_config = paired[0][1]  # use first config for shared settings
     base_market = args.market.replace("_5m", "")
 

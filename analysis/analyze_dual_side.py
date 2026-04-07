@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse, math, random, sys, numpy as np, pandas as pd
 from pathlib import Path
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from backtest import DATA_DIR, DiffusionSignal, Snapshot, build_calibration_table
 from market_config import get_config
 from tick_backtest import run_window, WindowResult

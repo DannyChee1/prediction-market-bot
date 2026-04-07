@@ -17,9 +17,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from backtest import _compute_vol_deduped, norm_cdf, MIN_FINAL_REMAINING_S, MAX_START_GAP_S
 
-DATA_DIR = Path(__file__).parent / "data" / "btc_5m"
+DATA_DIR = Path(__file__).parent.parent / "data" / "btc_5m"
 
 # ── Preload all windows into memory ────────────────────────────────────────
 
@@ -373,8 +376,10 @@ def main():
 
     plt.suptitle("BTC 5m Kou Parameter Optimization", fontsize=13, fontweight="bold")
     plt.tight_layout()
-    plt.savefig("kou_5m_optimization.png", dpi=150, bbox_inches="tight")
-    print("\nSaved: kou_5m_optimization.png")
+    out_path = Path(__file__).parent / "outputs" / "kou_5m_optimization.png"
+    out_path.parent.mkdir(exist_ok=True)
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    print(f"\nSaved: {out_path}")
 
 
 if __name__ == "__main__":

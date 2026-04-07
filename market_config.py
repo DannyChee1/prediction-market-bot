@@ -22,6 +22,10 @@ class MarketConfig:
     kou_p_up: float = 0.51             # Kou upward jump probability
     kou_eta1: float = 1100.0           # Kou upward jump rate (1/mean_size)
     kou_eta2: float = 1100.0           # Kou downward jump rate
+    min_entry_z: float = 0.5           # Minimum |z| to enter
+    min_entry_price: float = 0.25      # Minimum contract price to enter
+    edge_threshold: float = 0.06       # Minimum edge to enter
+    market_blend: float = 0.0          # Blend p_model with contract mid (0=off)
 
 
 MARKET_CONFIGS: dict[str, MarketConfig] = {
@@ -60,10 +64,14 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         binance_symbol="btcusdt",
         tail_mode="kou",
         tail_nu_default=20.0,
-        kou_lambda=0.005,
+        kou_lambda=0.007,
         kou_p_up=0.526,
         kou_eta1=1254.1,
         kou_eta2=1200.5,
+        min_entry_z=0.0,            # blend filters disagreement (was 0.7)
+        min_entry_price=0.20,       # avoid deep OTM tail (was 0.10)
+        edge_threshold=0.06,
+        market_blend=0.3,           # pull p_model toward market mid
     ),
     "eth_5m": MarketConfig(
         slug_prefix="eth-updown-5m",

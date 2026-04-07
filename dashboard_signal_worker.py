@@ -101,6 +101,7 @@ def _signal_kwargs(mkey: str, settings: dict) -> tuple[dict, dict]:
     signal_kw["kou_p_up"] = config.kou_p_up
     signal_kw["kou_eta1"] = config.kou_eta1
     signal_kw["kou_eta2"] = config.kou_eta2
+    signal_kw["market_blend"] = config.market_blend
     signal_kw["slippage"] = float(settings["slippage"])
     signal_kw["inventory_skew"] = 0.02
     signal_kw["maker_warmup_s"] = 30.0 if is_5m else 200.0
@@ -114,8 +115,8 @@ def _signal_kwargs(mkey: str, settings: dict) -> tuple[dict, dict]:
     signal_kw["lag_spread"] = 0.08
     signal_kw["edge_step"] = 0.01
     signal_kw["contract_vol_lookback_s"] = 60
-    signal_kw["min_entry_z"] = float(settings.get("min_entry_z", 0.0))
-    signal_kw["min_entry_price"] = float(settings.get("min_entry_price", 0.10))
+    signal_kw["min_entry_z"] = float(settings.get("min_entry_z", 0.0)) or config.min_entry_z
+    signal_kw["min_entry_price"] = float(settings.get("min_entry_price", 0.0)) or config.min_entry_price
 
     if base_market == "btc":
         signal_kw["vamp_mode"] = "filter"

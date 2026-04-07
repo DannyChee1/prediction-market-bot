@@ -718,7 +718,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
         if not self.pending_fills:
             print("  [RESOLVE] No pending fills — skipping resolution")
-            return
+            return 0.0
 
         fill_summary = ", ".join(
             f"{f['side']} {f['shares']:.1f}sh ${f['cost_usd']:.2f}"
@@ -746,7 +746,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 for fill in self.pending_fills:
                     self.bankroll += fill["cost_usd"]
                 self.pending_fills = []
-                return
+                return 0.0
 
         self.windows_traded += 1
         window_pnl = 0.0
@@ -805,32 +805,34 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             })
 
         # Enqueue winning CTF positions for on-chain redemption
-        has_winning = any(
-            (f["side"] == "UP" and outcome_up == 1) or
-            (f["side"] == "DOWN" and outcome_up == 0)
-            for f in self.pending_fills
-        )
-        print(f"  [RESOLVE] has_winning={has_winning}, condition_id={'yes' if cond_id else 'MISSING'}")
-        if has_winning and cond_id:
-            self._log({
-                "type": "redemption_enqueued",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "condition_id": cond_id,
-                "market_slug": slug,
-            })
-            self.redemption_queue.enqueue(cond_id, slug)
-            print(f"  [REDEEM] Enqueued for redemption "
-                  f"(conditionId: {cond_id[:10]}..., "
-                  f"queue size: {len(self.redemption_queue)})")
-        elif has_winning and not cond_id:
-            self._log({
-                "type": "redemption_skipped",
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "reason": "no_condition_id",
-                "market_slug": slug,
-            })
-            print("  WARNING: Won but no conditionId — cannot auto-redeem. "
-                  "Claim manually on Polymarket.")
+        # Skip in dry-run: no real positions to redeem.
+        if not self.dry_run:
+            has_winning = any(
+                (f["side"] == "UP" and outcome_up == 1) or
+                (f["side"] == "DOWN" and outcome_up == 0)
+                for f in self.pending_fills
+            )
+            print(f"  [RESOLVE] has_winning={has_winning}, condition_id={'yes' if cond_id else 'MISSING'}")
+            if has_winning and cond_id:
+                self._log({
+                    "type": "redemption_enqueued",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "condition_id": cond_id,
+                    "market_slug": slug,
+                })
+                self.redemption_queue.enqueue(cond_id, slug)
+                print(f"  [REDEEM] Enqueued for redemption "
+                      f"(conditionId: {cond_id[:10]}..., "
+                      f"queue size: {len(self.redemption_queue)})")
+            elif has_winning and not cond_id:
+                self._log({
+                    "type": "redemption_skipped",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "reason": "no_condition_id",
+                    "market_slug": slug,
+                })
+                print("  WARNING: Won but no conditionId — cannot auto-redeem. "
+                      "Claim manually on Polymarket.")
 
         if self.bankroll > self.peak_bankroll:
             self.peak_bankroll = self.bankroll
@@ -849,6 +851,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         )
 
         self.pending_fills = []
+        return window_pnl
 
     # ── Redemption Queue Processing ──────────────────────────────────────────
 

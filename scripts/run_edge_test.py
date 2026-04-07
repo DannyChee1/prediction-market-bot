@@ -29,6 +29,9 @@ from pathlib import Path
 
 import numpy as np
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 from backtest import BacktestEngine, DiffusionSignal
 from market_config import get_config
 

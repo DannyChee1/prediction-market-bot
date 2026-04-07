@@ -26,6 +26,7 @@ class MarketConfig:
     min_entry_price: float = 0.25      # Minimum contract price to enter
     edge_threshold: float = 0.06       # Minimum edge to enter
     market_blend: float = 0.0          # Blend p_model with contract mid (0=off)
+    max_book_age_ms: float | None = None  # Skip trade if book WS older than this
 
 
 MARKET_CONFIGS: dict[str, MarketConfig] = {
@@ -72,6 +73,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         min_entry_price=0.20,       # avoid deep OTM tail (was 0.10)
         edge_threshold=0.06,
         market_blend=0.3,           # pull p_model toward market mid
+        max_book_age_ms=1000.0,     # skip trades during book WS disconnects
     ),
     "eth_5m": MarketConfig(
         slug_prefix="eth-updown-5m",

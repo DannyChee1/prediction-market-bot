@@ -1032,6 +1032,7 @@ def _build_tracker(
     signal_kw["kou_eta1"] = config.kou_eta1
     signal_kw["kou_eta2"] = config.kou_eta2
     signal_kw["market_blend"] = config.market_blend
+    signal_kw["max_book_age_ms"] = config.max_book_age_ms
     # Per-market entry filters: CLI overrides config if explicitly set
     signal_kw["min_entry_z"] = args.min_z if args.min_z > 0 else config.min_entry_z
     signal_kw["min_entry_price"] = args.min_entry_price if args.min_entry_price != 0.10 else config.min_entry_price

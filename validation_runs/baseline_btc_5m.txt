@@ -1,0 +1,60 @@
+    Final BTC:    $66,838.98  |  In range: YES
+    Outcome:     UP  |  Payout: $517.59
+    PnL:         $+234.23 (+82.66%)
+    Reason:      p=0.6478 sig=7.00e-05 z=0.07 tau=174s edge=0.1129 thresh=0.0611 spread=0.010 kelly=0.2586 $504
+------------------------------------------------------------------------
+  btc-updown-5m-1775272200
+    Side:        UP  |  Time left: 4:51
+    Entry price: 0.506492  (fee/sh: 0.004999)
+    Shares:      1063.02  |  Cost: $538.41
+    BTC at fill:  $66,875.79  |  Start: $66,875.27
+    Expected:     $66,795.30 - $66,955.24 (1-sigma)
+    Final BTC:    $66,889.36  |  In range: YES
+    Outcome:     UP  |  Payout: $1063.02
+    PnL:         $+524.61 (+97.44%)
+    Reason:      p=0.6292 sig=7.00e-05 z=0.01 tau=292s edge=0.1342 thresh=0.0673 spread=0.010 kelly=0.2800 $516
+------------------------------------------------------------------------
+  btc-updown-5m-1775272800
+    Side:        UP  |  Time left: 3:10
+    Entry price: 0.608753  (fee/sh: 0.004781)
+    Shares:      779.64  |  Cost: $474.61
+    BTC at fill:  $66,852.27  |  Start: $66,843.22
+    Expected:     $66,778.59 - $66,907.85 (1-sigma)
+    Final BTC:    $66,841.06  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-474.61 (-100.00%)
+    Reason:      p=0.6630 sig=7.00e-05 z=0.14 tau=191s edge=0.0682 thresh=0.0621 spread=0.010 kelly=0.1883 $510
+------------------------------------------------------------------------
+
+==============================================================
+  BACKTEST SUMMARY: diffusion
+==============================================================
+  Bankroll:       $10,000 -> $10,361.09
+  Latency:        0ms  |  Slippage: 0.0
+  Trades:         217
+  Win rate:       53.5%
+  Total PnL:      $+361.09
+  Total fees:     $632.34
+  Avg PnL/trade:  $+1.66
+  Avg win:        $+271.95
+  Avg loss:       $-308.77
+  Max drawdown:   $4694.56 (42.1%)
+  Sharpe (ann.):  0.05
+==============================================================
+
+==============================================================
+  WALK-FORWARD COMPARISON: diffusion
+==============================================================
+  Metric                   TRAIN (in-sample)  TEST (out-of-sample)
+  --------------------------------------------------------------
+  Windows                               5124                  2197
+  Trades fired                           477                   217
+  Win rate                             57.9%                 53.5%
+  Total PnL                          $+2,447                 $+361
+  Bankroll end                       $12,447               $10,361
+  Sharpe (ann.)                         0.16                  0.05
+  Max drawdown                         61.7%                 42.1%
+==============================================================
+
+  Verdict: ~ MARGINAL EDGE — positive but needs more data
+

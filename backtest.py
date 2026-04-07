@@ -58,9 +58,19 @@ def norm_cdf(x: float) -> float:
 
 
 # ── Time-of-day / day-of-week volatility priors ──────────────────────────────
-# Multipliers relative to global mean sigma, computed from 1844 BTC windows.
-# Used as Bayesian prior when raw vol is zero (quiet periods / weekends).
-# Blended from our 1844-window parquet data + 1000-hour Binance API klines.
+# Default multipliers and global mean σ — these are the static fallback
+# values used when no per-market `hourly_priors.json` exists. Originally
+# computed from 1844 BTC windows + 1000-hour Binance API klines.
+#
+# Notebook #93 (non-stationarity) warns that these constants drift with
+# market regime. The data-driven path:
+#
+#     scripts/regen_hourly_priors.py --market btc_15m
+#
+# rebuilds them from the latest parquets and writes
+# data/<market>/hourly_priors.json. `_time_prior_sigma` automatically
+# loads the JSON if it exists for the market the timestamp belongs to.
+# Recommended cadence: weekly via cron (see scripts/regen_hourly_priors.py).
 _HOURLY_VOL_MULT: dict[int, float] = {
     0: 0.99, 1: 1.42, 2: 1.01, 3: 0.78, 4: 0.83, 5: 0.82,
     6: 0.80, 7: 0.79, 8: 0.80, 9: 0.79, 10: 0.67, 11: 0.71,
@@ -73,11 +83,57 @@ _DOW_VOL_MULT: dict[int, float] = {
 # Global mean sigma (per 1-second non-zero return) across all BTC data.
 _GLOBAL_MEAN_SIGMA: float = 8.9e-05
 
+# Per-market overrides loaded lazily from data/<subdir>/hourly_priors.json.
+# Keyed by data_subdir (e.g. "btc_15m"). Populated on first call to
+# `_load_priors_for_subdir` and cached for the process lifetime. The keys
+# are stringified dict keys because that's what JSON gives us back.
+_PRIORS_CACHE: dict[str, dict] = {}
 
-def _time_prior_sigma(ts_ms: int) -> float:
-    """Return a time-of-day / day-of-week sigma prior for the given timestamp."""
+
+def _load_priors_for_subdir(subdir: str) -> dict | None:
+    """Load hourly_priors.json for a market subdir, with caching."""
+    if subdir in _PRIORS_CACHE:
+        return _PRIORS_CACHE[subdir] or None
+    path = DATA_DIR / subdir / "hourly_priors.json"
+    if not path.exists():
+        _PRIORS_CACHE[subdir] = {}
+        return None
+    try:
+        import json as _json
+        with open(path) as f:
+            data = _json.load(f)
+        # JSON dict keys are strings — convert to ints
+        data["hourly_mult"] = {
+            int(k): float(v) for k, v in data.get("hourly_mult", {}).items()
+        }
+        data["dow_mult"] = {
+            int(k): float(v) for k, v in data.get("dow_mult", {}).items()
+        }
+        _PRIORS_CACHE[subdir] = data
+        return data
+    except Exception:
+        _PRIORS_CACHE[subdir] = {}
+        return None
+
+
+def _time_prior_sigma(ts_ms: int, data_subdir: str | None = None) -> float:
+    """Return a time-of-day / day-of-week sigma prior for the given timestamp.
+
+    If `data_subdir` is supplied AND a hourly_priors.json file exists for
+    it, the data-driven multipliers and global mean from that JSON are
+    used. Otherwise we fall back to the hardcoded constants above.
+    """
     import datetime as _dt
     utc = _dt.datetime.fromtimestamp(ts_ms / 1000, tz=_dt.timezone.utc)
+
+    if data_subdir:
+        priors = _load_priors_for_subdir(data_subdir)
+        if priors:
+            h_mult = priors.get("hourly_mult", {}).get(utc.hour, 1.0)
+            d_mult = priors.get("dow_mult", {}).get(utc.weekday(), 1.0)
+            return float(priors.get("global_mean_sigma", _GLOBAL_MEAN_SIGMA)
+                         * h_mult * d_mult)
+
     h_mult = _HOURLY_VOL_MULT.get(utc.hour, 1.0)
     d_mult = _DOW_VOL_MULT.get(utc.weekday(), 1.0)
     return _GLOBAL_MEAN_SIGMA * h_mult * d_mult
@@ -928,6 +984,63 @@ class DiffusionSignal(Signal):
         # Live data shows trades during book WS disconnects (book_age >1s) win
         # 25% vs 58% for fresh-book trades. None=off, 1000=BTC 5m default.
         max_book_age_ms: float | None = None,
+        # Additional stale-feature gates (live-only — backtest replays data
+        # so the freshness fields are never set, and these gates are no-ops).
+        # Each is a hard skip (not a threshold widen). Pattern matches the
+        # max_book_age_ms gate above. Notebook 24 ("Trading with Violated
+        # Model Assumptions") makes the case that *any* stale input
+        # invalidates the model entirely; widening the threshold trades a
+        # bigger position for a noisier signal, which is the wrong direction.
+        max_chainlink_age_ms: float | None = None,
+        max_binance_age_ms: float | None = None,
+        max_trade_tape_age_ms: float | None = None,
+        # σ estimator: "yz" (legacy default), "rv" (plain realized variance),
+        # or "ewma" (RiskMetrics λ=0.94 EWMA of squared returns).
+        # IMPORTANT: although EWMA has 26% lower 1-step forecast MSE than
+        # YZ on real BTC data (see scripts/validate_sigma_estimators.py),
+        # ablation shows that swapping in EWMA HURTS backtest PnL because
+        # downstream hyperparameters (edge_threshold, kelly_fraction,
+        # filtration_threshold) were tuned to the YZ-flavoured σ. EWMA is
+        # left as opt-in until those parameters are re-tuned. See
+        # validation_runs/ablation_btc_5m.json.
+        sigma_estimator: str = "yz",
+        # Optional HMM regime classifier (Quant Guild #51). When provided,
+        # it classifies each window into a latent regime once enough ticks
+        # have arrived to compute the feature vector, then scales
+        # `kelly_fraction` by the per-state multiplier baked into the
+        # classifier. None = no regime adjustment (legacy behavior).
+        regime_classifier=None,
+        regime_early_tau_s: float | None = None,
+        # Kalman-smoothed order-book imbalance gate. When True, the
+        # imbalance gate at decision time uses an AR(1) Kalman estimate
+        # instead of the raw L2 OBI snapshot. Logically better (less
+        # flicker), but ablation showed it lets in trades that the raw
+        # gate would have filtered, hurting precision. Off by default
+        # until the downstream filtration_threshold is re-tuned.
+        use_kalman_obi: bool = False,
+        # Restore train/inference parity for the `mid_momentum`
+        # filtration feature (the inference path used to return 0
+        # during the first ~60s of every window while training computed
+        # the actual delta). Off by default because the existing
+        # filtration_model.pkl was trained against the broken inference
+        # behavior — flipping this on without retraining the filtration
+        # model degrades calibration of the confidence threshold.
+        # When you retrain filtration_model.pkl with the parity-restored
+        # features, set this to True to deploy the consistent path.
+        mid_momentum_parity: bool = False,
+        # Hawkes-modulated jump intensity (Quant Guild #94). When non-None,
+        # the signal maintains a HawkesIntensity instance per market and
+        # publishes the current λ(t) to ctx as `_hawkes_intensity` so it
+        # can be consumed by the dashboard, the filtration model, or a
+        # future regime-aware sizing rule. Does NOT affect any current
+        # gating or sizing — it is purely a published feature. Pass a
+        # tuple (mu, alpha, beta, k_sigma) to enable. None = disabled.
+        hawkes_params: tuple[float, float, float, float] | None = None,
+        # Market data subdir (e.g. "btc_15m") used to look up the
+        # per-market hourly_priors.json file when computing the cold-start
+        # σ prior in `_smoothed_sigma`. None = fall back to the static
+        # constants in `_HOURLY_VOL_MULT` / `_GLOBAL_MEAN_SIGMA`.
+        data_subdir: str | None = None,
         # Avellaneda-Stoikov unified quoting mode
         as_mode: bool = False,
         gamma_inv: float = 0.15,       # risk aversion for inventory penalty
@@ -1015,6 +1128,26 @@ class DiffusionSignal(Signal):
         self.market_blend_alpha = market_blend_alpha
         self.market_blend = market_blend
         self.max_book_age_ms = max_book_age_ms
+        self.max_chainlink_age_ms = max_chainlink_age_ms
+        self.max_binance_age_ms = max_binance_age_ms
+        self.max_trade_tape_age_ms = max_trade_tape_age_ms
+        if sigma_estimator not in ("yz", "rv", "ewma"):
+            raise ValueError(
+                f"sigma_estimator must be 'yz', 'rv', or 'ewma', "
+                f"got {sigma_estimator!r}"
+            )
+        self.sigma_estimator = sigma_estimator
+        self.regime_classifier = regime_classifier
+        # If the caller didn't tell us when to compute regime features,
+        # default to "after window is half-elapsed" — guarantees enough
+        # history for the early-z feature.
+        if regime_early_tau_s is None:
+            regime_early_tau_s = window_duration / 2.0
+        self.regime_early_tau_s = float(regime_early_tau_s)
+        self.use_kalman_obi = bool(use_kalman_obi)
+        self.mid_momentum_parity = bool(mid_momentum_parity)
+        self.hawkes_params = hawkes_params  # (mu, alpha, beta, k_sigma) or None
+        self.data_subdir = data_subdir
         self.as_mode = as_mode
         self.gamma_inv = gamma_inv
         self.gamma_spread = gamma_spread
@@ -1041,15 +1174,38 @@ class DiffusionSignal(Signal):
         prices: list[float],
         timestamps: list[int] | None = None,
     ) -> float:
-        """Yang-Zhang realized vol from 5s OHLC micro-bars.
+        """Realized σ estimator dispatch.
 
-        Constructs OHLC bars from tick data (skipping duplicate prices),
-        then applies the Yang-Zhang estimator which is up to 14x more
-        statistically efficient than simple stdev of returns.
+        The estimator is selected by `self.sigma_estimator`:
+          * "yz"   — Yang-Zhang on 5s OHLC bars (legacy, backward compatible
+                     default — but loses 25-39% on 1-step forecast MSE per
+                     scripts/validate_sigma_estimators.py because YZ's
+                     var_oc term assumes overnight gaps that don't exist
+                     on a continuously-traded feed).
+          * "rv"   — plain stdev of normalised log returns
+          * "ewma" — RiskMetrics-style EWMA with λ=0.94. Default for BTC
+                     markets per A/B test.
 
-        Falls back to simple stdev when fewer than 3 OHLC bars are
-        available (e.g. during early warmup).
+        Falls back to YZ if anything unexpected happens, so this is
+        safe to roll out incrementally.
         """
+        if self.sigma_estimator == "yz":
+            return _compute_vol_deduped(prices, timestamps)
+        # Lazy import keeps backtest.py independent of scripts/ at import time
+        try:
+            from scripts.sigma_estimators import (
+                ewma_sigma_per_s,
+                realized_variance_per_s,
+            )
+        except ImportError:
+            return _compute_vol_deduped(prices, timestamps)
+        if timestamps is None:
+            timestamps = [i * 1000 for i in range(len(prices))]
+        if self.sigma_estimator == "ewma":
+            return ewma_sigma_per_s(prices, timestamps, lambda_=0.94)
+        if self.sigma_estimator == "rv":
+            return realized_variance_per_s(prices, timestamps)
+        # Unknown — fall back to YZ rather than crash
         return _compute_vol_deduped(prices, timestamps)
 
     def _record_book_state(self, snapshot: "Snapshot", ctx: dict) -> None:
@@ -1146,7 +1302,8 @@ class DiffusionSignal(Signal):
             ts_hist = ctx.get("ts_history", [])
             ts_ms = ctx.get("_last_ts_ms", 0) or (ts_hist[-1] if ts_hist else 0)
             if ts_ms > 0:
-                prior = _time_prior_sigma(ts_ms)
+                prior = _time_prior_sigma(ts_ms,
+                                          data_subdir=self.data_subdir)
                 return max(min(prior, self.max_sigma) if self.max_sigma else prior,
                            self.min_sigma)
             return 0.0
@@ -1193,6 +1350,134 @@ class DiffusionSignal(Signal):
             x_new = min(x_new, self.max_sigma)
         return max(x_new, self.min_sigma)
 
+    def _maybe_publish_hawkes(self, hist: list[float], ts_hist: list[int],
+                              sigma_per_s: float, ctx: dict) -> None:
+        """Maintain a per-window Hawkes intensity tracker and publish
+        the current λ(t) to ctx as `_hawkes_intensity`. No-op when
+        `self.hawkes_params is None`.
+
+        We rebuild the tracker on the first tick of each window
+        (detected by absence of the cached state), then incrementally
+        feed new ticks as they arrive. The "jump" definition is
+        |z| > k_sigma using the current realized sigma.
+        """
+        if self.hawkes_params is None or sigma_per_s <= 0 or len(hist) < 2:
+            return
+        try:
+            from scripts.hawkes import HawkesIntensity
+        except ImportError:
+            return
+        mu, alpha, beta, k_sigma = self.hawkes_params
+        h = ctx.get("_hawkes_state")
+        if h is None:
+            h = HawkesIntensity(mu=mu, alpha=alpha, beta=beta)
+            ctx["_hawkes_state"] = h
+            # Seed: scan the existing history for jumps
+            from scripts.hawkes import detect_jumps
+            jump_times = detect_jumps(hist, ts_hist, sigma_per_s, k_sigma)
+            for t in jump_times:
+                h.add_event(t)
+        else:
+            # Incremental: only check the most recent tick (i.e. compare
+            # the last two prices). This is a tiny per-tick cost and
+            # avoids re-scanning the whole history.
+            if len(hist) >= 2 and hist[-1] > 0 and hist[-2] > 0:
+                dt = (ts_hist[-1] - ts_hist[-2]) / 1000.0
+                if dt > 0:
+                    r = math.log(hist[-1] / hist[-2])
+                    z = r / (sigma_per_s * math.sqrt(dt))
+                    if abs(z) > k_sigma:
+                        h.add_event(ts_hist[-1] / 1000.0)
+        ctx["_hawkes_intensity"] = h.intensity_at(ts_hist[-1] / 1000.0)
+        ctx["_hawkes_n_events"] = h.n_events
+
+    def _maybe_compute_regime(self, ctx: dict, tau: float,
+                              hist: list[float],
+                              ts_hist: list[int]) -> float:
+        """Classify the current window's regime once enough data exists.
+
+        Returns the kelly multiplier to apply (1.0 if no classifier or
+        not enough data yet). Caches the regime label and multiplier in
+        ctx for the rest of the window so we don't redo the work on
+        every tick.
+
+        The classifier is only invoked when (a) there is no cached
+        result for this window, AND (b) the current tau is past the
+        early-tau threshold (we have enough ticks for stable features).
+        """
+        if self.regime_classifier is None:
+            return 1.0
+        cached = ctx.get("_regime_kelly_mult")
+        if cached is not None:
+            return float(cached)
+        # Wait until we are past the early-tau threshold before classifying.
+        # Note: tau decreases over the window, so "past" means tau < threshold.
+        if tau > self.regime_early_tau_s:
+            return 1.0
+        if not hist or not ts_hist or len(hist) < 30:
+            return 1.0
+        try:
+            from regime_classifier import compute_window_regime_features
+            features = compute_window_regime_features(
+                hist, ts_hist,
+                early_tau_target=self.regime_early_tau_s,
+            )
+            if features is None:
+                return 1.0
+            state_idx, label, kelly_mult = self.regime_classifier.classify_window(
+                features
+            )
+            ctx["_regime_state"] = state_idx
+            ctx["_regime_label"] = label
+            ctx["_regime_kelly_mult"] = float(kelly_mult)
+            return float(kelly_mult)
+        except Exception as exc:
+            # Never let a regime-classifier failure block trading. Log
+            # via ctx so the dashboard can surface it; fall through to 1.0.
+            ctx["_regime_error"] = f"{type(exc).__name__}: {exc}"
+            ctx["_regime_kelly_mult"] = 1.0
+            return 1.0
+
+    def _kalman_obi_update(
+        self,
+        state_key: str,
+        raw_obi: float,
+        ctx: dict,
+    ) -> float:
+        """One-dimensional AR(1) Kalman smoother on order-book imbalance.
+
+        State model:    x_t = β · x_{t-1} + w_t,   w ~ N(0, Q)
+        Observation:    y_t = x_t + v_t,           v ~ N(0, R)
+
+        Per the mean-reversion notebook (#95), this is the simplest
+        Kalman form that catches book-flicker noise without lagging
+        real regime shifts. β = 0.95 means the latent imbalance has
+        a 20-tick half-life (≈20 seconds), Q is small (state changes
+        slowly), R is larger (raw L2 OBI is noisy).
+
+        Two independent state slots are kept in ctx (one per side)
+        keyed by `state_key`. Returns the posterior mean.
+        """
+        beta = 0.95
+        Q = 0.001    # small state noise — true imbalance changes slowly
+        R = 0.05     # observation noise — raw OBI flickers a lot
+
+        state = ctx.get(state_key)
+        if state is None:
+            x = float(raw_obi)
+            P = 1.0
+        else:
+            x, P = state
+            # Predict
+            x = beta * x
+            P = beta * beta * P + Q
+            # Update
+            K = P / (P + R)
+            x = x + K * (float(raw_obi) - x)
+            P = (1.0 - K) * P
+        ctx[state_key] = (x, P)
+        return x
+
     def _check_filtration(
         self,
         z: float,
@@ -1228,10 +1513,30 @@ class DiffusionSignal(Signal):
         else:
             buy_pressure = 0.5
 
-        # Mid momentum
+        # Mid momentum: two paths.
+        #
+        # Legacy (default, mid_momentum_parity=False): returns 0 for any
+        # window with < 62 mids. The existing filtration_model.pkl was
+        # trained against this behavior, so flipping the parity flag on
+        # without retraining the model degrades calibration.
+        #
+        # Parity-restored (opt-in, mid_momentum_parity=True): mirrors the
+        # training-time computation in
+        # train_filtration.py:compute_mid_momentum:
+        #     mids = df["mid_up"].iloc[lo:idx+1].dropna()
+        #     return mids.iloc[-1] - mids.iloc[0]
+        # i.e. use the earliest available index up to 60 ticks back.
+        # Use this path AFTER you retrain the filtration model.
         mid_history = ctx.get("_mid_up_history", [])
-        mid_momentum = (float(mid_history[-1]) - float(mid_history[-61]))  \
-            if len(mid_history) >= 62 else 0.0
+        if self.mid_momentum_parity:
+            if len(mid_history) >= 2:
+                lookback_idx = max(0, len(mid_history) - 61)
+                mid_momentum = float(mid_history[-1]) - float(mid_history[lookback_idx])
+            else:
+                mid_momentum = 0.0
+        else:
+            mid_momentum = (float(mid_history[-1]) - float(mid_history[-61]))  \
+                if len(mid_history) >= 62 else 0.0
 
         ts_ms = ctx.get("_last_ts_ms", 0)
         dt = pd.Timestamp(ts_ms, unit="ms", tz="UTC") if ts_ms else None
@@ -1371,22 +1676,61 @@ class DiffusionSignal(Signal):
             return 0.0
         return abs(binance_mid - chainlink_price) / chainlink_price
 
+    def _check_stale_features(self, ctx: dict) -> str | None:
+        """Return a reason string if any input feed is stale, else None.
+
+        Live trader populates the *_age_ms fields in ctx every tick. The
+        backtest engine does not, so all gates are no-ops in backtest by
+        construction (`age is None` short-circuits to "fresh"). The same
+        is true of `max_book_age_ms` — see decide_both_sides for the
+        existing pattern this mirrors.
+
+        The thresholds are configured per-market in market_config.py and
+        passed through DiffusionSignal.__init__.
+        """
+        if self.max_chainlink_age_ms is not None:
+            age = ctx.get("_chainlink_age_ms")
+            if age is not None and age > self.max_chainlink_age_ms:
+                return (f"stale chainlink ({age:.0f}ms > "
+                        f"{self.max_chainlink_age_ms:.0f}ms)")
+        if self.max_binance_age_ms is not None:
+            age = ctx.get("_binance_age_ms")
+            if age is not None and age > self.max_binance_age_ms:
+                return (f"stale binance ({age:.0f}ms > "
+                        f"{self.max_binance_age_ms:.0f}ms)")
+        if self.max_trade_tape_age_ms is not None:
+            age = ctx.get("_trade_tape_age_ms")
+            if age is not None and age > self.max_trade_tape_age_ms:
+                return (f"stale trade tape ({age:.0f}ms > "
+                        f"{self.max_trade_tape_age_ms:.0f}ms)")
+        return None
+
     def _model_cdf(self, z: float, ctx: dict) -> float:
         """CDF dispatch: normal, student_t, kou, or market_adaptive."""
         if self.tail_mode == "normal":
             return norm_cdf(z)
         if self.tail_mode == "kou":
-            # Our sigma_per_s already includes jump variance (it's total sigma).
-            # Kou's drift correction is the only new information.
-            # zeta = p*eta1/(eta1-1) + q*eta2/(eta2+1) - 1
-            eta1, eta2 = self.kou_eta1, self.kou_eta2
-            p_up, q_dn = self.kou_p_up, 1.0 - self.kou_p_up
-            zeta = (p_up * eta1 / max(eta1 - 1, 0.01)
-                    + q_dn * eta2 / (eta2 + 1) - 1.0)
-            sigma = ctx.get("_sigma_per_s", 1e-5)
-            tau = ctx.get("_tau", 300.0)
-            drift_z = -self.kou_lambda * zeta * math.sqrt(tau) / max(sigma, 1e-8)
-            return norm_cdf(z + drift_z)
+            # Our sigma_per_s is estimated from realized log returns and
+            # already absorbs whatever jump variance was present in the
+            # lookback window — i.e. it is a *total* per-second vol
+            # estimate, not a continuous-component estimate. Under that
+            # interpretation the right physical-measure CDF for binary
+            # prediction is the plain Gaussian with mu=0:
+            #     P(S_T > S_0) ≈ Phi(delta / (sigma * sqrt(tau))) = Phi(z)
+            #
+            # Earlier versions added a `drift_z = -lambda*zeta*sqrt(tau)/sigma`
+            # term where zeta is the Kou *risk-neutral* martingale correction.
+            # That correction belongs in option pricing under Q-measure, not
+            # in physical-measure binary prediction. Worse, drift_z scales
+            # as 1/sigma, so when sigma hits min_sigma (e.g. weekends) it
+            # produced a -1.7% to -7% systematic downward bias on p_UP that
+            # asymmetrically favored BUY_DOWN trades. Removed.
+            #
+            # If you want jump variance to actually fatten the tails (rather
+            # than relying on realized vol to absorb it), wire `kou_cdf` from
+            # this module into the call below — but be aware that doing so
+            # double-counts whatever jump variance is already in sigma_per_s.
+            return norm_cdf(z)
         if self.tail_mode == "market_adaptive":
             p_gbm = norm_cdf(z)
             market_mid = ctx.get("_market_mid", 0.5)
@@ -1453,6 +1797,24 @@ class DiffusionSignal(Signal):
             return Decision("FLAT", 0.0, 0.0, "missing book")
         if ask_up <= 0 or ask_up >= 1 or ask_down <= 0 or ask_down >= 1:
             return Decision("FLAT", 0.0, 0.0, "invalid asks")
+
+        # Stale-feature gates (parity with decide_both_sides). The
+        # single-side path was previously missing the book-age gate
+        # entirely, so any `max_book_age_ms` setting in market_config
+        # was silently inactive in FOK mode. The four checks below now
+        # also fire in single-side mode, matching the dual-side path.
+        # All four are no-ops in backtest because BacktestEngine never
+        # populates the *_age_ms ctx fields.
+        if self.max_book_age_ms is not None:
+            book_age = ctx.get("_book_age_ms")
+            if book_age is not None and book_age > self.max_book_age_ms:
+                return Decision("FLAT", 0.0, 0.0,
+                                f"stale book ({book_age:.0f}ms > "
+                                f"{self.max_book_age_ms}ms)")
+        stale_reason = self._check_stale_features(ctx)
+        if stale_reason is not None:
+            return Decision("FLAT", 0.0, 0.0, stale_reason)
+
         self._record_book_state(snapshot, ctx)
 
         # Spread gate: wide spreads signal uncertain/illiquid pricing
@@ -1521,6 +1883,9 @@ class DiffusionSignal(Signal):
         sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
         if sigma_per_s == 0.0:
             return Decision("FLAT", 0.0, 0.0, "zero vol")
+
+        # Hawkes intensity (opt-in feature; published to ctx, no gating)
+        self._maybe_publish_hawkes(hist, ts_hist, sigma_per_s, ctx)
 
         # Vol kill switch
         if self.vol_kill_sigma is not None and sigma_per_s > self.vol_kill_sigma:
@@ -1650,19 +2015,32 @@ class DiffusionSignal(Signal):
                     return Decision("FLAT", 0.0, 0.0,
                         f"momentum fail: only {frac_ok:.0%} below start in last {mom_n}s")
 
-        # Order book imbalance: require buy pressure on the chosen side
+        # Order book imbalance: require buy pressure on the chosen side.
         # imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
+        # When `use_kalman_obi=True` (opt-in), the gate consumes a
+        # Kalman-smoothed OBI from notebook #95 instead of the raw L2
+        # snapshot. The raw value is always recorded in ctx for diagnostics.
         if side == "BUY_UP":
             bid_d = sum(sz for _, sz in snapshot.bid_levels_up)
             ask_d = sum(sz for _, sz in snapshot.ask_levels_up)
+            kalman_key = "_obi_kalman_up"
         else:
             bid_d = sum(sz for _, sz in snapshot.bid_levels_down)
             ask_d = sum(sz for _, sz in snapshot.ask_levels_down)
+            kalman_key = "_obi_kalman_down"
         total_d = bid_d + ask_d
-        imbalance = (bid_d - ask_d) / total_d if total_d > 0 else 0.0
-        if imbalance < 0:
+        imbalance_raw = (bid_d - ask_d) / total_d if total_d > 0 else 0.0
+        ctx["_obi_raw"] = imbalance_raw
+        if self.use_kalman_obi:
+            imbalance_gate = self._kalman_obi_update(
+                kalman_key, imbalance_raw, ctx
+            )
+            ctx["_obi_smooth"] = imbalance_gate
+        else:
+            imbalance_gate = imbalance_raw
+        if imbalance_gate < 0:
             return Decision("FLAT", 0.0, 0.0,
-                f"imbalance disagrees ({imbalance:+.3f} for {side})")
+                f"imbalance disagrees ({imbalance_gate:+.3f} for {side})")
 
         # Delta velocity: require price moving in the direction of the bet.
         # OLS slope over last 30s of BTC prices.
@@ -1684,9 +2062,11 @@ class DiffusionSignal(Signal):
         if eff_price >= 1.0:
             return Decision("FLAT", 0.0, 0.0, "eff price >= 1")
 
-        # Half-Kelly
+        # Half-Kelly with optional regime-conditional sizing
         kelly_f = max(0.0, (p_side - eff_price) / (1.0 - eff_price))
-        frac = min(self.kelly_fraction * kelly_f, self.max_bet_fraction)
+        regime_mult = self._maybe_compute_regime(ctx, tau, hist, ts_hist)
+        kelly_fraction_adj = self.kelly_fraction * regime_mult
+        frac = min(kelly_fraction_adj * kelly_f, self.max_bet_fraction)
         if frac <= 0:
             return Decision("FLAT", 0.0, 0.0, "kelly <= 0")
 
@@ -1842,6 +2222,14 @@ class DiffusionSignal(Signal):
                 reason = f"stale book ({book_age:.0f}ms > {self.max_book_age_ms}ms)"
                 return (Decision("FLAT", 0.0, 0.0, reason),
                         Decision("FLAT", 0.0, 0.0, reason))
+
+        # Other stale-feature gates (chainlink / binance / trade tape).
+        # Same pattern as the book-age gate above. Backtest never sets the
+        # *_age_ms fields, so this is a no-op in backtest.
+        stale_reason = self._check_stale_features(ctx)
+        if stale_reason is not None:
+            return (Decision("FLAT", 0.0, 0.0, stale_reason),
+                    Decision("FLAT", 0.0, 0.0, stale_reason))
 
         self._record_book_state(snapshot, ctx)
 
@@ -2928,6 +3316,122 @@ def print_walk_forward_summary(
     print()
 
 
+def build_diffusion_signal(
+    market: str,
+    *,
+    bankroll: float = 10_000.0,
+    slippage: float = 0.0,
+    min_entry_price: float = 0.10,
+    cal_prior_strength: float = 100.0,
+    maker_withdraw: float = 60.0,
+    oracle_cancel_threshold: float = 0.0,
+    cross_asset_lookup: dict | None = None,
+    cross_asset_min_z: float = 0.3,
+    min_z: float = 0.0,
+    maker: bool = False,
+    use_regime_classifier: bool = True,
+):
+    """Construct the production DiffusionSignal for a given market.
+
+    This is the SINGLE source of truth for how the diffusion signal is
+    parameterized. Both `main()` (the CLI) and `scripts/dump_trades.py`
+    (and any future runner) MUST go through this function so behavior
+    cannot drift between paths.
+
+    Behavior is identical to the inline construction that used to live
+    in `main()` — every per-market override and maker/eth/vamp branch
+    has been preserved verbatim.
+    """
+    config = get_config(market)
+
+    # Per-market signal overrides
+    eth_overrides = {}
+    if market == "eth":
+        eth_overrides = dict(
+            edge_threshold=0.15,
+            reversion_discount=0.10,
+            momentum_lookback_s=15,
+            momentum_majority=0.7,
+            spread_edge_penalty=0.2,
+        )
+
+    # Maker mode overrides
+    maker_overrides = {}
+    if maker:
+        maker_overrides = dict(
+            maker_mode=True,
+            max_bet_fraction=0.02,
+            edge_threshold=0.08,
+            momentum_majority=0.0,
+            spread_edge_penalty=0.0,
+            window_duration=config.window_duration_s,
+        )
+
+    # VAMP mode (per base asset)
+    vamp_kw = {}
+    base_market = market.replace("_5m", "")
+    if base_market == "btc":
+        vamp_kw = dict(vamp_mode="cost")
+    elif base_market == "eth":
+        vamp_kw = dict(vamp_mode="filter", vamp_filter_threshold=0.07)
+
+    # 5m timing overrides
+    is_5m = "_5m" in market
+    maker_warmup_s = 30.0 if is_5m else 100.0
+    maker_withdraw_s = 30.0 if is_5m else maker_withdraw
+
+    # Optional regime classifier (Quant Guild #51). Loads from
+    # `regime_classifier_<data_subdir>.pkl` if it exists (e.g.
+    # regime_classifier_btc_15m.pkl, regime_classifier_btc_5m.pkl).
+    # The data_subdir is the canonical identifier shared with the
+    # trainer. None-safe — no behavior change if no model is trained.
+    regime_classifier = None
+    regime_early_tau_s = None
+    if use_regime_classifier:
+        try:
+            from regime_classifier import RegimeClassifier
+            from pathlib import Path as _Path
+            pkl_path = (_Path(__file__).parent
+                        / f"regime_classifier_{config.data_subdir}.pkl")
+            if pkl_path.exists():
+                regime_classifier = RegimeClassifier.load(pkl_path)
+                # Use the same early-tau the trainer used
+                regime_early_tau_s = 200.0 if is_5m else 700.0
+        except (ImportError, FileNotFoundError):
+            regime_classifier = None
+
+    return DiffusionSignal(
+        bankroll=bankroll,
+        slippage=slippage,
+        calibration_table=None,  # walk-forward will inject after train pass
+        min_entry_price=min_entry_price,
+        cal_prior_strength=cal_prior_strength,
+        maker_warmup_s=maker_warmup_s,
+        maker_withdraw_s=maker_withdraw_s,
+        max_sigma=config.max_sigma,
+        min_sigma=config.min_sigma,
+        oracle_cancel_threshold=oracle_cancel_threshold,
+        cross_asset_z_lookup=cross_asset_lookup,
+        cross_asset_min_z=cross_asset_min_z,
+        min_entry_z=min_z,
+        tail_mode=config.tail_mode,
+        tail_nu_default=config.tail_nu_default,
+        kou_lambda=config.kou_lambda,
+        kou_p_up=config.kou_p_up,
+        kou_eta1=config.kou_eta1,
+        kou_eta2=config.kou_eta2,
+        max_book_age_ms=config.max_book_age_ms,
+        max_chainlink_age_ms=config.max_chainlink_age_ms,
+        max_binance_age_ms=config.max_binance_age_ms,
+        max_trade_tape_age_ms=config.max_trade_tape_age_ms,
+        sigma_estimator=config.sigma_estimator,
+        regime_classifier=regime_classifier,
+        regime_early_tau_s=regime_early_tau_s,
+        data_subdir=config.data_subdir,
+        **{**eth_overrides, **maker_overrides, **vamp_kw},
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Polymarket Up/Down Backtest — walk-forward, one entry per window"
@@ -2968,30 +3472,7 @@ def main():
     config = get_config(args.market)
     data_dir = DATA_DIR / config.data_subdir
 
-    # Per-market signal overrides
-    eth_overrides = {}
-    if args.market == "eth":
-        eth_overrides = dict(
-            edge_threshold=0.15,
-            reversion_discount=0.10,
-            momentum_lookback_s=15,
-            momentum_majority=0.7,
-            spread_edge_penalty=0.2,
-        )
-
-    # Maker mode overrides
-    maker_overrides = {}
-    if args.maker:
-        maker_overrides = dict(
-            maker_mode=True,
-            max_bet_fraction=0.02,
-            edge_threshold=0.08,
-            momentum_majority=0.0,
-            spread_edge_penalty=0.0,
-            window_duration=config.window_duration_s,
-        )
-
-    # Cross-asset disagreement lookup
+    # Cross-asset disagreement lookup (CLI-only feature)
     cross_asset_lookup = None
     if args.cross_asset_dir:
         secondary_dir = DATA_DIR / args.cross_asset_dir
@@ -3002,42 +3483,26 @@ def main():
         else:
             print(f"  WARNING: cross-asset dir not found: {secondary_dir}")
 
-    # VAMP mode
-    vamp_kw = {}
-    base_market = args.market.replace("_5m", "")
-    if base_market == "btc":
-        vamp_kw = dict(vamp_mode="cost")
-    elif base_market == "eth":
-        vamp_kw = dict(vamp_mode="filter", vamp_filter_threshold=0.07)
-
-    # 5m timing overrides
+    # 5m timing overrides — printed here for log clarity; the actual
+    # values are baked into build_diffusion_signal().
     is_5m = "_5m" in args.market
-    maker_warmup = 30.0 if is_5m else 100.0
-    maker_withdraw = 30.0 if is_5m else args.maker_withdraw
     if is_5m:
-        print(f"  5m overrides: warmup={maker_warmup:.0f}s, withdraw={maker_withdraw:.0f}s")
+        print(f"  5m overrides: warmup=30s, withdraw=30s")
 
     signal_map = {
-        "diffusion": lambda: DiffusionSignal(
-            bankroll=args.bankroll, slippage=args.slippage,
-            calibration_table=None,  # walk-forward will inject after train pass
+        "diffusion": lambda: build_diffusion_signal(
+            args.market,
+            bankroll=args.bankroll,
+            slippage=args.slippage,
             min_entry_price=args.min_entry_price,
             cal_prior_strength=args.cal_prior_strength,
-            maker_warmup_s=maker_warmup,
-            maker_withdraw_s=maker_withdraw,
-            max_sigma=config.max_sigma,
-            min_sigma=config.min_sigma,
+            maker_withdraw=args.maker_withdraw,
             oracle_cancel_threshold=args.oracle_cancel_threshold,
-            cross_asset_z_lookup=cross_asset_lookup,
+            cross_asset_lookup=cross_asset_lookup,
             cross_asset_min_z=args.cross_asset_min_z,
-            min_entry_z=args.min_z,
-            tail_mode=config.tail_mode,
-            tail_nu_default=config.tail_nu_default,
-            kou_lambda=config.kou_lambda,
-            kou_p_up=config.kou_p_up,
-            kou_eta1=config.kou_eta1,
-            kou_eta2=config.kou_eta2,
-            **{**eth_overrides, **maker_overrides, **vamp_kw}),
+            min_z=args.min_z,
+            maker=args.maker,
+        ),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),
         "random": lambda: RandomCoinFlip(bankroll=args.bankroll, seed=args.seed),

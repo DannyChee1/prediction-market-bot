@@ -1,0 +1,16 @@
+{
+  "n_trades": 316,
+  "n_perm": 2000,
+  "initial_bankroll": 10000.0,
+  "max_drawdown_actual": 0.4760726640620966,
+  "max_drawdown_perm_mean": 0.4669892984156296,
+  "max_drawdown_perm_p05": 0.3098890860621682,
+  "max_drawdown_perm_p50": 0.4440147795253172,
+  "max_drawdown_perm_p95": 0.7068512191091741,
+  "max_drawdown_p_value": 0.3983008495752124,
+  "lag1_autocorr_actual": -0.02850299439323887,
+  "lag1_autocorr_perm_p05": -0.0941402033436336,
+  "lag1_autocorr_perm_p95": 0.08888442122050898,
+  "lag1_autocorr_p_value_two_sided": 0.6151924037981009,
+  "runs_test_z": 0.6252621484747619
+}

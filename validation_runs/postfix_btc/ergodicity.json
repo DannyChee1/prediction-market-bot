@@ -1,0 +1,20 @@
+{
+  "n_paths": 2000,
+  "path_length": 500,
+  "initial_bankroll": 10000.0,
+  "ensemble_mean_terminal": 64653.04402290824,
+  "median_terminal": 39609.747814392635,
+  "ensemble_minus_median": 25043.296208515603,
+  "ensemble_over_median_ratio": 1.6322508369875521,
+  "time_avg_growth_per_trade": 0.0027752675738687313,
+  "pct_paths_below_initial": 0.078,
+  "pct_paths_below_50pct": 0.011,
+  "pct_paths_below_10pct_proxy_ruin": 0.0,
+  "pct_paths_above_2x": 0.758,
+  "pct_paths_above_10x": 0.182,
+  "terminal_p05": 8026.647900844968,
+  "terminal_p25": 20364.199364753094,
+  "terminal_p75": 79984.30592005947,
+  "terminal_p95": 195251.17291147643,
+  "sizing_scheme": "bootstrapped from actual per-trade pnl/bankroll_at_time (preserves Kelly-driven sizing)"
+}

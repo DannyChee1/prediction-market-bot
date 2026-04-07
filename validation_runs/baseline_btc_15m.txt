@@ -1,0 +1,1873 @@
+
+==============================================================
+  Running: diffusion (BTC 15m) [FOK]
+  Mode: walk-forward (train=70% / test=30%), 1 trade per window
+==============================================================
+  Walk-forward split: 2033 train / 872 test windows
+  Test period starts: 2026-03-10 00:17
+
+==============================================================
+  TRAIN PASS (2033 windows) — building calibration
+==============================================================
+  Train: 375 trades  win=60.8%  pnl=$-51
+  Calibration table built: 16 cells, 375 observations
+
+==============================================================
+  TEST PASS (872 windows) — out-of-sample
+==============================================================
+  SKIP btc-updown-15m-1773116100 (incomplete)
+  btc-updown-15m-1773117000: FLAT
+  SKIP btc-updown-15m-1773117900 (incomplete)
+  btc-updown-15m-1773118800: FLAT
+  SKIP btc-updown-15m-1773119700 (incomplete)
+  btc-updown-15m-1773120600: FLAT
+  btc-updown-15m-1773121500: FLAT
+  btc-updown-15m-1773122400: FLAT
+  SKIP btc-updown-15m-1773123300 (incomplete)
+  btc-updown-15m-1773124200: FLAT
+  SKIP btc-updown-15m-1773125100 (incomplete)
+  SKIP btc-updown-15m-1773126000 (incomplete)
+  btc-updown-15m-1773126900: FLAT
+  SKIP btc-updown-15m-1773127800 (incomplete)
+  SKIP btc-updown-15m-1773128700 (incomplete)
+  SKIP btc-updown-15m-1773129600 (incomplete)
+  SKIP btc-updown-15m-1773130500 (incomplete)
+  btc-updown-15m-1773131400: FLAT
+  btc-updown-15m-1773132300: FLAT
+  SKIP btc-updown-15m-1773133200 (incomplete)
+  SKIP btc-updown-15m-1773134100 (incomplete)
+  btc-updown-15m-1773135000: FLAT
+  SKIP btc-updown-15m-1773135900 (incomplete)
+  btc-updown-15m-1773136800: FLAT
+  btc-updown-15m-1773137700: FLAT
+  SKIP btc-updown-15m-1773138600 (incomplete)
+  btc-updown-15m-1773139500: FLAT
+  SKIP btc-updown-15m-1773140400 (incomplete)
+  SKIP btc-updown-15m-1773141300 (incomplete)
+  btc-updown-15m-1773142200: FLAT
+  SKIP btc-updown-15m-1773143100 (incomplete)
+  btc-updown-15m-1773144000: FLAT
+  SKIP btc-updown-15m-1773144900 (incomplete)
+  btc-updown-15m-1773145800: FLAT
+  SKIP btc-updown-15m-1773146700 (incomplete)
+  btc-updown-15m-1773147600: FLAT
+  SKIP btc-updown-15m-1773148500 (incomplete)
+  btc-updown-15m-1773149400: FLAT
+  SKIP btc-updown-15m-1773150300 (incomplete)
+  SKIP btc-updown-15m-1773151200 (incomplete)
+  SKIP btc-updown-15m-1773152100 (incomplete)
+  btc-updown-15m-1773153000: FLAT
+  btc-updown-15m-1773153900: FLAT
+  SKIP btc-updown-15m-1773154800 (incomplete)
+  SKIP btc-updown-15m-1773155700 (incomplete)
+  SKIP btc-updown-15m-1773156600 (incomplete)
+  SKIP btc-updown-15m-1773157500 (incomplete)
+  btc-updown-15m-1773158400: FLAT
+  btc-updown-15m-1773159300: FLAT
+  SKIP btc-updown-15m-1773160200 (incomplete)
+  btc-updown-15m-1773161100: FLAT
+  SKIP btc-updown-15m-1773162000 (incomplete)
+  SKIP btc-updown-15m-1773162900 (incomplete)
+  btc-updown-15m-1773163800: FLAT
+  btc-updown-15m-1773164700: FLAT
+  SKIP btc-updown-15m-1773165600 (incomplete)
+  SKIP btc-updown-15m-1773166500 (incomplete)
+  SKIP btc-updown-15m-1773167400 (incomplete)
+  SKIP btc-updown-15m-1773168300 (incomplete)
+  SKIP btc-updown-15m-1773169200 (incomplete)
+  SKIP btc-updown-15m-1773170100 (incomplete)
+  SKIP btc-updown-15m-1773171000 (incomplete)
+  SKIP btc-updown-15m-1773171900 (incomplete)
+  SKIP btc-updown-15m-1773172800 (incomplete)
+  btc-updown-15m-1773173700: FLAT
+  SKIP btc-updown-15m-1773174600 (incomplete)
+  SKIP btc-updown-15m-1773175500 (incomplete)
+  SKIP btc-updown-15m-1773176400 (incomplete)
+  SKIP btc-updown-15m-1773177300 (incomplete)
+  SKIP btc-updown-15m-1773178200 (incomplete)
+  SKIP btc-updown-15m-1773179100 (incomplete)
+  SKIP btc-updown-15m-1773180000 (incomplete)
+  SKIP btc-updown-15m-1773180900 (incomplete)
+  SKIP btc-updown-15m-1773181800 (incomplete)
+  btc-updown-15m-1773182700: FLAT
+  SKIP btc-updown-15m-1773183600 (incomplete)
+  SKIP btc-updown-15m-1773184500 (incomplete)
+  SKIP btc-updown-15m-1773185400 (incomplete)
+  SKIP btc-updown-15m-1773186300 (incomplete)
+  SKIP btc-updown-15m-1773187200 (incomplete)
+  SKIP btc-updown-15m-1773188100 (incomplete)
+  btc-updown-15m-1773189000: FLAT
+  btc-updown-15m-1773189900: FLAT
+  SKIP btc-updown-15m-1773190800 (incomplete)
+  SKIP btc-updown-15m-1773191700 (incomplete)
+  btc-updown-15m-1773192600: FLAT
+  btc-updown-15m-1773193500: FLAT
+  SKIP btc-updown-15m-1773194400 (incomplete)
+  SKIP btc-updown-15m-1773195300 (incomplete)
+  btc-updown-15m-1773196200: FLAT
+  SKIP btc-updown-15m-1773197100 (incomplete)
+  btc-updown-15m-1773198000: FLAT
+  btc-updown-15m-1773198900: FLAT
+  SKIP btc-updown-15m-1773199800 (incomplete)
+  SKIP btc-updown-15m-1773200700 (incomplete)
+  SKIP btc-updown-15m-1773201600 (incomplete)
+  btc-updown-15m-1773202500: FLAT
+  SKIP btc-updown-15m-1773203400 (incomplete)
+  btc-updown-15m-1773204300: FLAT
+  SKIP btc-updown-15m-1773205200 (incomplete)
+  SKIP btc-updown-15m-1773206100 (incomplete)
+  btc-updown-15m-1773207000: FLAT
+  SKIP btc-updown-15m-1773207900 (incomplete)
+  SKIP btc-updown-15m-1773208800 (incomplete)
+  btc-updown-15m-1773209700: FLAT
+  SKIP btc-updown-15m-1773210600 (incomplete)
+  btc-updown-15m-1773211500: FLAT
+  btc-updown-15m-1773212400: FLAT
+  btc-updown-15m-1773213300: FLAT
+  btc-updown-15m-1773214200: FLAT
+  btc-updown-15m-1773215100: FLAT
+  SKIP btc-updown-15m-1773216000 (incomplete)
+  btc-updown-15m-1773216900: FLAT
+  SKIP btc-updown-15m-1773217800 (incomplete)
+  SKIP btc-updown-15m-1773218700 (incomplete)
+  btc-updown-15m-1773219600: FLAT
+  SKIP btc-updown-15m-1773220500 (incomplete)
+  SKIP btc-updown-15m-1773221400 (incomplete)
+  SKIP btc-updown-15m-1773222300 (incomplete)
+  SKIP btc-updown-15m-1773223200 (incomplete)
+  SKIP btc-updown-15m-1773224100 (incomplete)
+  SKIP btc-updown-15m-1773225000 (incomplete)
+  btc-updown-15m-1773225900: FLAT
+  SKIP btc-updown-15m-1773226800 (incomplete)
+  btc-updown-15m-1773227700: FLAT
+  SKIP btc-updown-15m-1773228600 (incomplete)
+  SKIP btc-updown-15m-1773229500 (incomplete)
+  SKIP btc-updown-15m-1773230400 (incomplete)
+  btc-updown-15m-1773231300: FLAT
+  SKIP btc-updown-15m-1773232200 (incomplete)
+  SKIP btc-updown-15m-1773233100 (incomplete)
+  btc-updown-15m-1773234000: FLAT
+  SKIP btc-updown-15m-1773234900 (incomplete)
+  SKIP btc-updown-15m-1773235800 (incomplete)
+  SKIP btc-updown-15m-1773236700 (incomplete)
+  SKIP btc-updown-15m-1773237600 (incomplete)
+  SKIP btc-updown-15m-1773238500 (incomplete)
+  SKIP btc-updown-15m-1773239400 (incomplete)
+  SKIP btc-updown-15m-1773240300 (incomplete)
+  SKIP btc-updown-15m-1773241200 (incomplete)
+  SKIP btc-updown-15m-1773242100 (incomplete)
+  SKIP btc-updown-15m-1773243000 (incomplete)
+  SKIP btc-updown-15m-1773243900 (incomplete)
+  SKIP btc-updown-15m-1773244800 (incomplete)
+  SKIP btc-updown-15m-1773245700 (incomplete)
+  SKIP btc-updown-15m-1773246600 (incomplete)
+  SKIP btc-updown-15m-1773247500 (incomplete)
+  btc-updown-15m-1773248400: FLAT
+  SKIP btc-updown-15m-1773249300 (incomplete)
+  btc-updown-15m-1773250200: FLAT
+  SKIP btc-updown-15m-1773251100 (incomplete)
+  SKIP btc-updown-15m-1773252000 (incomplete)
+  SKIP btc-updown-15m-1773252900 (incomplete)
+  SKIP btc-updown-15m-1773253800 (incomplete)
+  btc-updown-15m-1773254700: FLAT
+  btc-updown-15m-1773255600: FLAT
+  SKIP btc-updown-15m-1773256500 (incomplete)
+  btc-updown-15m-1773257400: FLAT
+  SKIP btc-updown-15m-1773258300 (incomplete)
+  btc-updown-15m-1773259200: FLAT
+  SKIP btc-updown-15m-1773260100 (incomplete)
+  btc-updown-15m-1773261000: FLAT
+  SKIP btc-updown-15m-1773261900 (incomplete)
+  SKIP btc-updown-15m-1773262800 (incomplete)
+  SKIP btc-updown-15m-1773263700 (incomplete)
+  SKIP btc-updown-15m-1773264600 (incomplete)
+  btc-updown-15m-1773265500: FLAT
+  SKIP btc-updown-15m-1773266400 (incomplete)
+  btc-updown-15m-1773267300: FLAT
+  btc-updown-15m-1773268200: FLAT
+  SKIP btc-updown-15m-1773269100 (incomplete)
+  btc-updown-15m-1773270000: FLAT
+  btc-updown-15m-1773270900: FLAT
+  SKIP btc-updown-15m-1773271800 (incomplete)
+  btc-updown-15m-1773272700: FLAT
+  SKIP btc-updown-15m-1773273600 (incomplete)
+  SKIP btc-updown-15m-1773274500 (incomplete)
+  SKIP btc-updown-15m-1773275400 (incomplete)
+  btc-updown-15m-1773276300: FLAT
+  btc-updown-15m-1773277200: FLAT
+  SKIP btc-updown-15m-1773278100 (incomplete)
+  SKIP btc-updown-15m-1773279000 (incomplete)
+  btc-updown-15m-1773279900: FLAT
+  SKIP btc-updown-15m-1773280800 (incomplete)
+  btc-updown-15m-1773281700: FLAT
+  btc-updown-15m-1773282600: FLAT
+  btc-updown-15m-1773283500: FLAT
+  btc-updown-15m-1773284400: FLAT
+  SKIP btc-updown-15m-1773285300 (incomplete)
+  btc-updown-15m-1773286200: FLAT
+  btc-updown-15m-1773287100: FLAT
+  btc-updown-15m-1773288000: FLAT
+  SKIP btc-updown-15m-1773288900 (incomplete)
+  SKIP btc-updown-15m-1773289800 (incomplete)
+  SKIP btc-updown-15m-1773290700 (incomplete)
+  SKIP btc-updown-15m-1773291600 (incomplete)
+  btc-updown-15m-1773292500: FLAT
+  btc-updown-15m-1773293400: FLAT
+  SKIP btc-updown-15m-1773294300 (incomplete)
+  btc-updown-15m-1773295200: FLAT
+  SKIP btc-updown-15m-1773296100 (incomplete)
+  btc-updown-15m-1773297000: FLAT
+  SKIP btc-updown-15m-1773297900 (incomplete)
+  SKIP btc-updown-15m-1773298800 (incomplete)
+  btc-updown-15m-1773299700: FLAT
+  btc-updown-15m-1773300600: FLAT
+  btc-updown-15m-1773301500: FLAT
+  btc-updown-15m-1773302400: FLAT
+  SKIP btc-updown-15m-1773303300 (incomplete)
+  SKIP btc-updown-15m-1773304200 (incomplete)
+  btc-updown-15m-1773305100: FLAT
+  btc-updown-15m-1773306000: FLAT
+  btc-updown-15m-1773306900: FLAT
+  btc-updown-15m-1773307800: FLAT
+  btc-updown-15m-1773308700: FLAT
+  SKIP btc-updown-15m-1773309600 (incomplete)
+  btc-updown-15m-1773310500: FLAT
+  btc-updown-15m-1773311400: FLAT
+  SKIP btc-updown-15m-1773312300 (incomplete)
+  SKIP btc-updown-15m-1773313200 (incomplete)
+  SKIP btc-updown-15m-1773314100 (incomplete)
+  SKIP btc-updown-15m-1773315000 (incomplete)
+  btc-updown-15m-1773315900: FLAT
+  btc-updown-15m-1773316800: FLAT
+  SKIP btc-updown-15m-1773317700 (incomplete)
+  SKIP btc-updown-15m-1773318600 (incomplete)
+  SKIP btc-updown-15m-1773319500 (incomplete)
+  btc-updown-15m-1773320400: FLAT
+  btc-updown-15m-1773321300: FLAT
+  SKIP btc-updown-15m-1773322200 (incomplete)
+  SKIP btc-updown-15m-1773323100 (incomplete)
+  btc-updown-15m-1773324000: FLAT
+  SKIP btc-updown-15m-1773324900 (incomplete)
+  SKIP btc-updown-15m-1773325800 (incomplete)
+  SKIP btc-updown-15m-1773326700 (incomplete)
+  SKIP btc-updown-15m-1773327600 (incomplete)
+  SKIP btc-updown-15m-1773328500 (incomplete)
+  SKIP btc-updown-15m-1773329400 (incomplete)
+  SKIP btc-updown-15m-1773330300 (incomplete)
+  SKIP btc-updown-15m-1773331200 (incomplete)
+  SKIP btc-updown-15m-1773332100 (incomplete)
+  btc-updown-15m-1773333000: FLAT
+  SKIP btc-updown-15m-1773333900 (incomplete)
+  SKIP btc-updown-15m-1773334800 (incomplete)
+  SKIP btc-updown-15m-1773335700 (incomplete)
+  btc-updown-15m-1773336600: FLAT
+  SKIP btc-updown-15m-1773337500 (incomplete)
+  SKIP btc-updown-15m-1773338400 (incomplete)
+  btc-updown-15m-1773339300: FLAT
+  SKIP btc-updown-15m-1773340200 (incomplete)
+  SKIP btc-updown-15m-1773341100 (incomplete)
+  SKIP btc-updown-15m-1773342000 (incomplete)
+  btc-updown-15m-1773342900: FLAT
+  btc-updown-15m-1773343800: FLAT
+  SKIP btc-updown-15m-1773344700 (incomplete)
+  SKIP btc-updown-15m-1773345600 (incomplete)
+  SKIP btc-updown-15m-1773346500 (incomplete)
+  btc-updown-15m-1773347400: FLAT
+  btc-updown-15m-1773348300: FLAT
+  btc-updown-15m-1773349200: FLAT
+  btc-updown-15m-1773350100: FLAT
+  SKIP btc-updown-15m-1773351000 (incomplete)
+  SKIP btc-updown-15m-1773351900 (incomplete)
+  SKIP btc-updown-15m-1773352800 (incomplete)
+  SKIP btc-updown-15m-1773353700 (incomplete)
+  SKIP btc-updown-15m-1773354600 (incomplete)
+  SKIP btc-updown-15m-1773355500 (incomplete)
+  btc-updown-15m-1773356400: FLAT
+  SKIP btc-updown-15m-1773357300 (incomplete)
+  SKIP btc-updown-15m-1773358200 (incomplete)
+  SKIP btc-updown-15m-1773359100 (incomplete)
+  SKIP btc-updown-15m-1773360000 (incomplete)
+  SKIP btc-updown-15m-1773360900 (incomplete)
+  SKIP btc-updown-15m-1773361800 (incomplete)
+  SKIP btc-updown-15m-1773362700 (incomplete)
+  SKIP btc-updown-15m-1773363600 (incomplete)
+  SKIP btc-updown-15m-1773364500 (incomplete)
+  SKIP btc-updown-15m-1773365400 (incomplete)
+  SKIP btc-updown-15m-1773366300 (incomplete)
+  btc-updown-15m-1773367200: FLAT
+  SKIP btc-updown-15m-1773368100 (incomplete)
+  btc-updown-15m-1773369000: FLAT
+  SKIP btc-updown-15m-1773369900 (incomplete)
+  SKIP btc-updown-15m-1773370800 (incomplete)
+  SKIP btc-updown-15m-1773371700 (incomplete)
+  SKIP btc-updown-15m-1773372600 (incomplete)
+  btc-updown-15m-1773373500: FLAT
+  btc-updown-15m-1773374400: FLAT
+  btc-updown-15m-1773375300: FLAT
+  btc-updown-15m-1773376200: FLAT
+  SKIP btc-updown-15m-1773377100 (incomplete)
+  SKIP btc-updown-15m-1773378000 (incomplete)
+  btc-updown-15m-1773378900: FLAT
+  btc-updown-15m-1773379800: FLAT
+  SKIP btc-updown-15m-1773380700 (incomplete)
+  SKIP btc-updown-15m-1773381600 (incomplete)
+  SKIP btc-updown-15m-1773382500 (incomplete)
+  SKIP btc-updown-15m-1773383400 (incomplete)
+  btc-updown-15m-1773384300: FLAT
+  btc-updown-15m-1773385200: FLAT
+  btc-updown-15m-1773386100: FLAT
+  SKIP btc-updown-15m-1773387000 (incomplete)
+  SKIP btc-updown-15m-1773387900 (incomplete)
+  btc-updown-15m-1773388800: FLAT
+  btc-updown-15m-1773389700: FLAT
+  btc-updown-15m-1773390600: FLAT
+  btc-updown-15m-1773391500: FLAT
+  SKIP btc-updown-15m-1773392400 (incomplete)
+  SKIP btc-updown-15m-1773393300 (incomplete)
+  SKIP btc-updown-15m-1773394200 (incomplete)
+  btc-updown-15m-1773395100: FLAT
+  btc-updown-15m-1773396000: FLAT
+  SKIP btc-updown-15m-1773396900 (incomplete)
+  SKIP btc-updown-15m-1773397800 (incomplete)
+  SKIP btc-updown-15m-1773398700 (incomplete)
+  btc-updown-15m-1773399600: FLAT
+  btc-updown-15m-1773400500: FLAT
+  SKIP btc-updown-15m-1773401400 (incomplete)
+  btc-updown-15m-1773402300: FLAT
+  btc-updown-15m-1773403200: FLAT
+  SKIP btc-updown-15m-1773404100 (incomplete)
+  SKIP btc-updown-15m-1773405000 (incomplete)
+  btc-updown-15m-1773405900: FLAT
+  SKIP btc-updown-15m-1773406800 (incomplete)
+  SKIP btc-updown-15m-1773407700 (incomplete)
+  SKIP btc-updown-15m-1773408600 (incomplete)
+  SKIP btc-updown-15m-1773409500 (incomplete)
+  SKIP btc-updown-15m-1773410400 (incomplete)
+  SKIP btc-updown-15m-1773411300 (incomplete)
+  SKIP btc-updown-15m-1773412200 (incomplete)
+  SKIP btc-updown-15m-1773413100 (incomplete)
+  SKIP btc-updown-15m-1773414000 (incomplete)
+  SKIP btc-updown-15m-1773414900 (incomplete)
+  SKIP btc-updown-15m-1773415800 (incomplete)
+  SKIP btc-updown-15m-1773416700 (incomplete)
+  SKIP btc-updown-15m-1773417600 (incomplete)
+  btc-updown-15m-1773418500: FLAT
+  btc-updown-15m-1773419400: FLAT
+  SKIP btc-updown-15m-1773420300 (incomplete)
+  SKIP btc-updown-15m-1773421200 (incomplete)
+  btc-updown-15m-1773422100: FLAT
+  btc-updown-15m-1773423000: FLAT
+  SKIP btc-updown-15m-1773423900 (incomplete)
+  SKIP btc-updown-15m-1773424800 (incomplete)
+  btc-updown-15m-1773425700: FLAT
+  SKIP btc-updown-15m-1773426600 (incomplete)
+  btc-updown-15m-1773427500: FLAT
+  btc-updown-15m-1773428400: FLAT
+  btc-updown-15m-1773429300: FLAT
+  SKIP btc-updown-15m-1773430200 (incomplete)
+  SKIP btc-updown-15m-1773431100 (incomplete)
+  btc-updown-15m-1773432000: FLAT
+  SKIP btc-updown-15m-1773432900 (incomplete)
+  SKIP btc-updown-15m-1773433800 (incomplete)
+  SKIP btc-updown-15m-1773434700 (incomplete)
+  btc-updown-15m-1773435600: FLAT
+  btc-updown-15m-1773436500: FLAT
+  SKIP btc-updown-15m-1773437400 (incomplete)
+  SKIP btc-updown-15m-1773438300 (incomplete)
+  btc-updown-15m-1773439200: FLAT
+  btc-updown-15m-1773440100: FLAT
+  SKIP btc-updown-15m-1773441000 (incomplete)
+  SKIP btc-updown-15m-1773441900 (incomplete)
+  SKIP btc-updown-15m-1773442800 (incomplete)
+  btc-updown-15m-1773443700: FLAT
+  SKIP btc-updown-15m-1773444600 (incomplete)
+  SKIP btc-updown-15m-1773445500 (incomplete)
+  btc-updown-15m-1773446400: FLAT
+  SKIP btc-updown-15m-1773447300 (incomplete)
+  btc-updown-15m-1773448200: FLAT
+  btc-updown-15m-1773449100: FLAT
+  btc-updown-15m-1773450000: FLAT
+  SKIP btc-updown-15m-1773450900 (incomplete)
+  SKIP btc-updown-15m-1773451800 (incomplete)
+  btc-updown-15m-1773452700: FLAT
+  SKIP btc-updown-15m-1773453600 (incomplete)
+  SKIP btc-updown-15m-1773454500 (incomplete)
+  btc-updown-15m-1773455400: FLAT
+  btc-updown-15m-1773456300: FLAT
+  btc-updown-15m-1773457200: FLAT
+  SKIP btc-updown-15m-1773458100 (incomplete)
+  btc-updown-15m-1773459000: FLAT
+  btc-updown-15m-1773459900: FLAT
+  btc-updown-15m-1773460800: FLAT
+  SKIP btc-updown-15m-1773461700 (incomplete)
+  btc-updown-15m-1773462600: FLAT
+  btc-updown-15m-1773463500: FLAT
+  btc-updown-15m-1773464400: FLAT
+  btc-updown-15m-1773465300: FLAT
+  btc-updown-15m-1773466200: FLAT
+  btc-updown-15m-1773467100: FLAT
+  btc-updown-15m-1773468000: FLAT
+  btc-updown-15m-1773468900: FLAT
+  btc-updown-15m-1773469800: FLAT
+  btc-updown-15m-1773470700: FLAT
+  btc-updown-15m-1773471600: FLAT
+  btc-updown-15m-1773472500: FLAT
+  btc-updown-15m-1773473400: FLAT
+  SKIP btc-updown-15m-1773474300 (incomplete)
+  btc-updown-15m-1773475200: FLAT
+  btc-updown-15m-1773476100: FLAT
+  btc-updown-15m-1773477000: FLAT
+  btc-updown-15m-1773477900: FLAT
+  btc-updown-15m-1773478800: FLAT
+  SKIP btc-updown-15m-1773479700 (incomplete)
+  btc-updown-15m-1773480600: FLAT
+  btc-updown-15m-1773481500: FLAT
+  btc-updown-15m-1773482400: FLAT
+  btc-updown-15m-1773483300: FLAT
+  SKIP btc-updown-15m-1773484200 (incomplete)
+  btc-updown-15m-1773485100: FLAT
+  btc-updown-15m-1773486000: FLAT
+  SKIP btc-updown-15m-1773486900 (incomplete)
+  btc-updown-15m-1773487800: FLAT
+  SKIP btc-updown-15m-1773488700 (incomplete)
+  SKIP btc-updown-15m-1773489600 (incomplete)
+  SKIP btc-updown-15m-1773490500 (incomplete)
+  btc-updown-15m-1773491400: FLAT
+  btc-updown-15m-1773492300: FLAT
+  SKIP btc-updown-15m-1773493200 (incomplete)
+  btc-updown-15m-1773494100: FLAT
+  btc-updown-15m-1773495000: FLAT
+  SKIP btc-updown-15m-1773495900 (incomplete)
+  btc-updown-15m-1773496800: FLAT
+  btc-updown-15m-1773497700: FLAT
+  btc-updown-15m-1773498600: FLAT
+  btc-updown-15m-1773499500: FLAT
+  btc-updown-15m-1773500400: FLAT
+  SKIP btc-updown-15m-1773501300 (incomplete)
+  btc-updown-15m-1773502200: FLAT
+  btc-updown-15m-1773503100: FLAT
+  SKIP btc-updown-15m-1773504000 (incomplete)
+  btc-updown-15m-1773504900: FLAT
+  SKIP btc-updown-15m-1773505800 (incomplete)
+  btc-updown-15m-1773506700: FLAT
+  btc-updown-15m-1773507600: FLAT
+  SKIP btc-updown-15m-1773508500 (incomplete)
+  btc-updown-15m-1773509400: FLAT
+  btc-updown-15m-1773510300: FLAT
+  btc-updown-15m-1773511200: FLAT
+  btc-updown-15m-1773512100: FLAT
+  btc-updown-15m-1773513000: FLAT
+  btc-updown-15m-1773513900: FLAT
+  SKIP btc-updown-15m-1773514800 (incomplete)
+  btc-updown-15m-1773515700: FLAT
+  btc-updown-15m-1773516600: FLAT
+  btc-updown-15m-1773517500: FLAT
+  btc-updown-15m-1773518400: FLAT
+  btc-updown-15m-1773519300: FLAT
+  btc-updown-15m-1773520200: FLAT
+  btc-updown-15m-1773521100: FLAT
+  btc-updown-15m-1773522000: FLAT
+  btc-updown-15m-1773522900: FLAT
+  btc-updown-15m-1773523800: FLAT
+  btc-updown-15m-1773524700: FLAT
+  btc-updown-15m-1773525600: FLAT
+  btc-updown-15m-1773526500: FLAT
+  btc-updown-15m-1773527400: FLAT
+  btc-updown-15m-1773528300: FLAT
+  btc-updown-15m-1773529200: FLAT
+  btc-updown-15m-1773530100: FLAT
+  btc-updown-15m-1773531000: FLAT
+  SKIP btc-updown-15m-1773531900 (incomplete)
+  btc-updown-15m-1773532800: FLAT
+  SKIP btc-updown-15m-1773533700 (incomplete)
+  btc-updown-15m-1773534600: FLAT
+  btc-updown-15m-1773535500: FLAT
+  btc-updown-15m-1773536400: FLAT
+  SKIP btc-updown-15m-1773537300 (incomplete)
+  SKIP btc-updown-15m-1773538200 (incomplete)
+  btc-updown-15m-1773539100: FLAT
+  btc-updown-15m-1773540000: FLAT
+  btc-updown-15m-1773540900: FLAT
+  SKIP btc-updown-15m-1773541800 (incomplete)
+  SKIP btc-updown-15m-1773542700 (incomplete)
+  SKIP btc-updown-15m-1773543600 (incomplete)
+  btc-updown-15m-1773544500: FLAT
+  SKIP btc-updown-15m-1773545400 (incomplete)
+  btc-updown-15m-1773546300: FLAT
+  btc-updown-15m-1773547200: FLAT
+  btc-updown-15m-1773548100: FLAT
+  SKIP btc-updown-15m-1773549000 (incomplete)
+  btc-updown-15m-1773549900: FLAT
+  btc-updown-15m-1773550800: FLAT
+  btc-updown-15m-1773551700: FLAT
+  SKIP btc-updown-15m-1773552600 (incomplete)
+  btc-updown-15m-1773553500: FLAT
+  btc-updown-15m-1773554400: FLAT
+  SKIP btc-updown-15m-1773555300 (incomplete)
+  btc-updown-15m-1773556200: FLAT
+  btc-updown-15m-1773557100: FLAT
+  btc-updown-15m-1773558000: FLAT
+  btc-updown-15m-1773558900: FLAT
+  btc-updown-15m-1773559800: FLAT
+  SKIP btc-updown-15m-1773560700 (incomplete)
+  btc-updown-15m-1773561600: FLAT
+  SKIP btc-updown-15m-1773562500 (incomplete)
+  btc-updown-15m-1773563400: FLAT
+  btc-updown-15m-1773564300: FLAT
+  btc-updown-15m-1773565200: FLAT
+  SKIP btc-updown-15m-1773566100 (incomplete)
+  btc-updown-15m-1773567000: FLAT
+  btc-updown-15m-1773567900: FLAT
+  SKIP btc-updown-15m-1773568800 (incomplete)
+  btc-updown-15m-1773569700: FLAT
+  btc-updown-15m-1773570600: FLAT
+  btc-updown-15m-1773571500: FLAT
+  btc-updown-15m-1773572400: FLAT
+  SKIP btc-updown-15m-1773573300 (incomplete)
+  btc-updown-15m-1773574200: FLAT
+  btc-updown-15m-1773575100: FLAT
+  btc-updown-15m-1773576000: FLAT
+  SKIP btc-updown-15m-1773576900 (incomplete)
+  btc-updown-15m-1773577800: FLAT
+  btc-updown-15m-1773578700: FLAT
+  SKIP btc-updown-15m-1773579600 (incomplete)
+  SKIP btc-updown-15m-1773580500 (incomplete)
+  btc-updown-15m-1773581400: FLAT
+  btc-updown-15m-1773582300: FLAT
+  SKIP btc-updown-15m-1773583200 (incomplete)
+  btc-updown-15m-1773584100: FLAT
+  SKIP btc-updown-15m-1773585000 (incomplete)
+  btc-updown-15m-1773585900: FLAT
+  btc-updown-15m-1773586800: FLAT
+  SKIP btc-updown-15m-1773587700 (incomplete)
+  SKIP btc-updown-15m-1773588600 (incomplete)
+  SKIP btc-updown-15m-1773589500 (incomplete)
+  btc-updown-15m-1773590400: FLAT
+  btc-updown-15m-1773591300: FLAT
+  SKIP btc-updown-15m-1773592200 (incomplete)
+  SKIP btc-updown-15m-1773593100 (incomplete)
+  btc-updown-15m-1773594000: FLAT
+  btc-updown-15m-1773594900: FLAT
+  SKIP btc-updown-15m-1773595800 (incomplete)
+  btc-updown-15m-1773596700: FLAT
+  btc-updown-15m-1773597600: FLAT
+  SKIP btc-updown-15m-1773598500 (incomplete)
+  SKIP btc-updown-15m-1773599400 (incomplete)
+  btc-updown-15m-1773600300: FLAT
+  SKIP btc-updown-15m-1773601200 (incomplete)
+  btc-updown-15m-1773602100: FLAT
+  btc-updown-15m-1773603000: FLAT
+  btc-updown-15m-1773603900: FLAT
+  btc-updown-15m-1773604800: FLAT
+  btc-updown-15m-1773605700: FLAT
+  btc-updown-15m-1773606600: FLAT
+  btc-updown-15m-1773607500: FLAT
+  btc-updown-15m-1773608400: FLAT
+  btc-updown-15m-1773609300: FLAT
+  btc-updown-15m-1773610200: FLAT
+  SKIP btc-updown-15m-1773611100 (incomplete)
+  SKIP btc-updown-15m-1773612000 (incomplete)
+  btc-updown-15m-1773612900: FLAT
+  btc-updown-15m-1773614700: FLAT
+  SKIP btc-updown-15m-1773615600 (incomplete)
+  btc-updown-15m-1773616500: FLAT
+  btc-updown-15m-1773617400: FLAT
+  btc-updown-15m-1773618300: FLAT
+  SKIP btc-updown-15m-1773619200 (incomplete)
+  btc-updown-15m-1773620100: FLAT
+  SKIP btc-updown-15m-1775166300 (incomplete)
+  btc-updown-15m-1775167200: UP @ 0.4719 x 1065.2sh [14:44 left] -> DOWN pnl=$-502.66 (-100.0%)
+    window net: $-502.66  bank=$9497.34
+  btc-updown-15m-1775168100: DOWN @ 0.7377 x 266.7sh [3:27 left] -> UP pnl=$-196.77 (-100.0%)
+    window net: $-196.77  bank=$9300.57
+  btc-updown-15m-1775169000: UP @ 0.5172 x 903.0sh [14:11 left] -> UP pnl=$+435.91 (+93.3%)
+    window net: $+435.91  bank=$9736.49
+  btc-updown-15m-1775169900: UP @ 0.6471 x 767.1sh [4:47 left] -> UP pnl=$+270.67 (+54.5%)
+    window net: $+270.67  bank=$10007.16
+  btc-updown-15m-1775170800: DOWN @ 0.5384 x 500.3sh [14:42 left] -> DOWN pnl=$+230.92 (+85.7%)
+    window net: $+230.92  bank=$10238.08
+  btc-updown-15m-1775171700: FLAT
+  btc-updown-15m-1775172600: DOWN @ 0.5889 x 181.0sh [10:05 left] -> DOWN pnl=$+74.41 (+69.8%)
+    window net: $+74.41  bank=$10312.49
+  btc-updown-15m-1775173500: UP @ 0.7075 x 363.9sh [1:55 left] -> UP pnl=$+106.43 (+41.3%)
+    window net: $+106.43  bank=$10418.93
+  btc-updown-15m-1775174400: FLAT
+  btc-updown-15m-1775175300: DOWN @ 0.6738 x 795.9sh [14:26 left] -> DOWN pnl=$+259.64 (+48.4%)
+    window net: $+259.64  bank=$10678.57
+  btc-updown-15m-1775176200: DOWN @ 0.7187 x 769.0sh [3:09 left] -> DOWN pnl=$+216.34 (+39.1%)
+    window net: $+216.34  bank=$10894.91
+  btc-updown-15m-1775177100: DOWN @ 0.5707 x 981.6sh [14:40 left] -> DOWN pnl=$+421.38 (+75.2%)
+    window net: $+421.38  bank=$11316.29
+  btc-updown-15m-1775178000: DOWN @ 0.5709 x 1019.6sh [13:40 left] -> UP pnl=$-582.05 (-100.0%)
+    window net: $-582.05  bank=$10734.24
+  btc-updown-15m-1775178900: DOWN @ 0.7027 x 784.3sh [13:15 left] -> UP pnl=$-551.07 (-100.0%)
+    window net: $-551.07  bank=$10183.17
+  btc-updown-15m-1775179800: FLAT
+  btc-updown-15m-1775180700: DOWN @ 0.6568 x 789.9sh [13:57 left] -> UP pnl=$-518.82 (-100.0%)
+    window net: $-518.82  bank=$9664.35
+  btc-updown-15m-1775181600: DOWN @ 0.7332 x 667.4sh [13:40 left] -> DOWN pnl=$+178.09 (+36.4%)
+    window net: $+178.09  bank=$9842.44
+  btc-updown-15m-1775182500: DOWN @ 0.5931 x 72.0sh [0:49 left] -> DOWN pnl=$+29.29 (+68.6%)
+    window net: $+29.29  bank=$9871.73
+  btc-updown-15m-1775183400: DOWN @ 0.4968 x 1017.7sh [14:20 left] -> DOWN pnl=$+512.15 (+101.3%)
+    window net: $+512.15  bank=$10383.89
+  btc-updown-15m-1775184300: DOWN @ 0.5423 x 1008.1sh [14:38 left] -> UP pnl=$-546.71 (-100.0%)
+    window net: $-546.71  bank=$9837.18
+  btc-updown-15m-1775185200: DOWN @ 0.6780 x 740.2sh [11:02 left] -> UP pnl=$-501.85 (-100.0%)
+    window net: $-501.85  bank=$9335.33
+  btc-updown-15m-1775186100: DOWN @ 0.5530 x 872.5sh [13:46 left] -> DOWN pnl=$+389.99 (+80.8%)
+    window net: $+389.99  bank=$9725.32
+  btc-updown-15m-1775187000: FLAT
+  btc-updown-15m-1775187900: UP @ 0.3764 x 374.9sh [5:12 left] -> DOWN pnl=$-141.11 (-100.0%)
+    window net: $-141.11  bank=$9584.20
+  btc-updown-15m-1775188800: UP @ 0.4786 x 745.5sh [13:59 left] -> UP pnl=$+388.74 (+109.0%)
+    window net: $+388.74  bank=$9972.95
+  btc-updown-15m-1775189700: UP @ 0.6176 x 838.3sh [12:19 left] -> DOWN pnl=$-517.75 (-100.0%)
+    window net: $-517.75  bank=$9455.20
+  btc-updown-15m-1775190600: UP @ 0.6721 x 722.3sh [8:23 left] -> UP pnl=$+236.85 (+48.8%)
+    window net: $+236.85  bank=$9692.05
+  btc-updown-15m-1775191500: FLAT
+  btc-updown-15m-1775192400: UP @ 0.4872 x 993.4sh [12:47 left] -> DOWN pnl=$-483.96 (-100.0%)
+    window net: $-483.96  bank=$9208.10
+  btc-updown-15m-1775193300: FLAT
+  btc-updown-15m-1775194200: UP @ 0.6247 x 737.0sh [14:09 left] -> UP pnl=$+276.58 (+60.1%)
+    window net: $+276.58  bank=$9484.68
+  btc-updown-15m-1775195100: FLAT
+  btc-updown-15m-1775196000: DOWN @ 0.4994 x 958.1sh [13:24 left] -> UP pnl=$-478.49 (-100.0%)
+    window net: $-478.49  bank=$9006.19
+  btc-updown-15m-1775196900: UP @ 0.5921 x 783.3sh [5:22 left] -> DOWN pnl=$-463.75 (-100.0%)
+    window net: $-463.75  bank=$8542.45
+  btc-updown-15m-1775197800: DOWN @ 0.5499 x 798.4sh [14:44 left] -> UP pnl=$-439.00 (-100.0%)
+    window net: $-439.00  bank=$8103.44
+  btc-updown-15m-1775198700: UP @ 0.5150 x 786.7sh [14:24 left] -> UP pnl=$+381.57 (+94.2%)
+    window net: $+381.57  bank=$8485.02
+  btc-updown-15m-1775199600: UP @ 0.4490 x 975.5sh [13:01 left] -> UP pnl=$+537.51 (+122.7%)
+    window net: $+537.51  bank=$9022.53
+  btc-updown-15m-1775200500: UP @ 0.6772 x 689.2sh [9:52 left] -> UP pnl=$+222.46 (+47.7%)
+    window net: $+222.46  bank=$9244.99
+  btc-updown-15m-1775201400: UP @ 0.5150 x 897.6sh [11:33 left] -> UP pnl=$+435.33 (+94.2%)
+    window net: $+435.33  bank=$9680.31
+  btc-updown-15m-1775202300: DOWN @ 0.7034 x 707.3sh [13:04 left] -> DOWN pnl=$+209.77 (+42.2%)
+    window net: $+209.77  bank=$9890.08
+  btc-updown-15m-1775203200: UP @ 0.5623 x 817.3sh [13:21 left] -> UP pnl=$+357.73 (+77.8%)
+    window net: $+357.73  bank=$10247.81
+  btc-updown-15m-1775204100: UP @ 0.5050 x 1014.6sh [13:46 left] -> DOWN pnl=$-512.39 (-100.0%)
+    window net: $-512.39  bank=$9735.42
+  btc-updown-15m-1775205000: UP @ 0.6766 x 732.6sh [12:50 left] -> DOWN pnl=$-495.64 (-100.0%)
+    window net: $-495.64  bank=$9239.78
+  btc-updown-15m-1775205900: DOWN @ 0.5986 x 639.3sh [3:29 left] -> UP pnl=$-382.73 (-100.0%)
+    window net: $-382.73  bank=$8857.05
+  btc-updown-15m-1775206800: FLAT
+  btc-updown-15m-1775207700: FLAT
+  btc-updown-15m-1775208600: DOWN @ 0.5367 x 859.9sh [14:40 left] -> UP pnl=$-461.52 (-100.0%)
+    window net: $-461.52  bank=$8395.53
+  btc-updown-15m-1775209500: FLAT
+  btc-updown-15m-1775210400: UP @ 0.4554 x 965.2sh [14:52 left] -> DOWN pnl=$-439.54 (-100.0%)
+    window net: $-439.54  bank=$7955.99
+  btc-updown-15m-1775211300: UP @ 0.5136 x 689.8sh [7:50 left] -> DOWN pnl=$-354.25 (-100.0%)
+    window net: $-354.25  bank=$7601.74
+  btc-updown-15m-1775212200: DOWN @ 0.7283 x 525.0sh [12:19 left] -> UP pnl=$-382.32 (-100.0%)
+    window net: $-382.32  bank=$7219.42
+  btc-updown-15m-1775213100: FLAT
+  btc-updown-15m-1775214000: UP @ 0.4552 x 811.3sh [14:14 left] -> DOWN pnl=$-369.28 (-100.0%)
+    window net: $-369.28  bank=$6850.14
+  btc-updown-15m-1775214900: FLAT
+  btc-updown-15m-1775215800: UP @ 0.4698 x 690.7sh [14:43 left] -> UP pnl=$+366.21 (+112.8%)
+    window net: $+366.21  bank=$7216.35
+  btc-updown-15m-1775216700: UP @ 0.5329 x 667.4sh [10:54 left] -> UP pnl=$+311.71 (+87.6%)
+    window net: $+311.71  bank=$7528.06
+  btc-updown-15m-1775217600: UP @ 0.4697 x 843.8sh [13:40 left] -> DOWN pnl=$-396.35 (-100.0%)
+    window net: $-396.35  bank=$7131.70
+  btc-updown-15m-1775218500: UP @ 0.7410 x 492.5sh [2:23 left] -> UP pnl=$+127.57 (+35.0%)
+    window net: $+127.57  bank=$7259.28
+  btc-updown-15m-1775219400: UP @ 0.6673 x 563.1sh [14:47 left] -> DOWN pnl=$-375.72 (-100.0%)
+    window net: $-375.72  bank=$6883.56
+  btc-updown-15m-1775220300: DOWN @ 0.5965 x 578.6sh [12:08 left] -> DOWN pnl=$+233.47 (+67.6%)
+    window net: $+233.47  bank=$7117.02
+  btc-updown-15m-1775221200: DOWN @ 0.5587 x 641.2sh [14:17 left] -> DOWN pnl=$+282.96 (+79.0%)
+    window net: $+282.96  bank=$7399.98
+  btc-updown-15m-1775222100: DOWN @ 0.5089 x 732.7sh [14:50 left] -> UP pnl=$-372.89 (-100.0%)
+    window net: $-372.89  bank=$7027.09
+  btc-updown-15m-1775223000: DOWN @ 0.5274 x 682.2sh [14:41 left] -> DOWN pnl=$+322.46 (+89.6%)
+    window net: $+322.46  bank=$7349.55
+  btc-updown-15m-1775223900: DOWN @ 0.6974 x 537.0sh [11:34 left] -> UP pnl=$-374.50 (-100.0%)
+    window net: $-374.50  bank=$6975.05
+  btc-updown-15m-1775224800: DOWN @ 0.6726 x 524.8sh [12:44 left] -> UP pnl=$-352.99 (-100.0%)
+    window net: $-352.99  bank=$6622.06
+  btc-updown-15m-1775225700: DOWN @ 0.6872 x 483.8sh [13:34 left] -> UP pnl=$-332.46 (-100.0%)
+    window net: $-332.46  bank=$6289.60
+  btc-updown-15m-1775226600: DOWN @ 0.6949 x 459.5sh [5:32 left] -> DOWN pnl=$+140.19 (+43.9%)
+    window net: $+140.19  bank=$6429.79
+  btc-updown-15m-1775227500: UP @ 0.5150 x 624.3sh [14:48 left] -> UP pnl=$+302.76 (+94.2%)
+    window net: $+302.76  bank=$6732.55
+  btc-updown-15m-1775228400: UP @ 0.5432 x 629.2sh [10:27 left] -> UP pnl=$+287.44 (+84.1%)
+    window net: $+287.44  bank=$7019.99
+  btc-updown-15m-1775229300: DOWN @ 0.7129 x 498.4sh [13:13 left] -> DOWN pnl=$+143.10 (+40.3%)
+    window net: $+143.10  bank=$7163.09
+  btc-updown-15m-1775230200: DOWN @ 0.7463 x 488.0sh [11:30 left] -> DOWN pnl=$+123.78 (+34.0%)
+    window net: $+123.78  bank=$7286.87
+  btc-updown-15m-1775231100: DOWN @ 0.5785 x 644.9sh [13:17 left] -> DOWN pnl=$+271.84 (+72.9%)
+    window net: $+271.84  bank=$7558.71
+  btc-updown-15m-1775232000: FLAT
+  btc-updown-15m-1775232900: FLAT
+  btc-updown-15m-1775233800: FLAT
+  btc-updown-15m-1775234700: DOWN @ 0.4925 x 795.7sh [11:40 left] -> UP pnl=$-391.87 (-100.0%)
+    window net: $-391.87  bank=$7166.84
+  btc-updown-15m-1775235600: FLAT
+  btc-updown-15m-1775236500: FLAT
+  btc-updown-15m-1775237400: DOWN @ 0.5957 x 601.0sh [5:12 left] -> UP pnl=$-358.01 (-100.0%)
+    window net: $-358.01  bank=$6808.84
+  btc-updown-15m-1775238300: FLAT
+  btc-updown-15m-1775239200: FLAT
+  btc-updown-15m-1775240100: FLAT
+  btc-updown-15m-1775241000: UP @ 0.5312 x 610.9sh [6:59 left] -> DOWN pnl=$-324.54 (-100.0%)
+    window net: $-324.54  bank=$6484.30
+  btc-updown-15m-1775241900: FLAT
+  btc-updown-15m-1775242800: DOWN @ 0.7317 x 454.0sh [3:25 left] -> DOWN pnl=$+121.79 (+36.7%)
+    window net: $+121.79  bank=$6606.09
+  btc-updown-15m-1775243700: FLAT
+  btc-updown-15m-1775244600: FLAT
+  btc-updown-15m-1775245500: FLAT
+  btc-updown-15m-1775246400: DOWN @ 0.5258 x 641.4sh [5:02 left] -> UP pnl=$-337.24 (-100.0%)
+    window net: $-337.24  bank=$6268.85
+  btc-updown-15m-1775247300: UP @ 0.4731 x 689.0sh [12:41 left] -> DOWN pnl=$-325.95 (-100.0%)
+    window net: $-325.95  bank=$5942.90
+  btc-updown-15m-1775248200: UP @ 0.4327 x 699.4sh [10:07 left] -> UP pnl=$+396.74 (+131.1%)
+    window net: $+396.74  bank=$6339.64
+  btc-updown-15m-1775249100: FLAT
+  btc-updown-15m-1775250000: FLAT
+  btc-updown-15m-1775250900: UP @ 0.4143 x 783.1sh [10:02 left] -> DOWN pnl=$-324.43 (-100.0%)
+    window net: $-324.43  bank=$6015.21
+  btc-updown-15m-1775251800: UP @ 0.6709 x 318.0sh [5:03 left] -> UP pnl=$+104.67 (+49.1%)
+    window net: $+104.67  bank=$6119.89
+  btc-updown-15m-1775252700: UP @ 0.5037 x 522.3sh [3:41 left] -> UP pnl=$+259.23 (+98.5%)
+    window net: $+259.23  bank=$6379.11
+  btc-updown-15m-1775253600: FLAT
+  btc-updown-15m-1775254500: FLAT
+  btc-updown-15m-1775255400: UP @ 0.4844 x 671.5sh [13:44 left] -> UP pnl=$+346.22 (+106.4%)
+    window net: $+346.22  bank=$6725.33
+  btc-updown-15m-1775256300: FLAT
+  btc-updown-15m-1775257200: UP @ 0.5027 x 645.8sh [6:53 left] -> DOWN pnl=$-324.65 (-100.0%)
+    window net: $-324.65  bank=$6400.69
+  btc-updown-15m-1775258100: DOWN @ 0.5338 x 177.2sh [10:03 left] -> DOWN pnl=$+82.59 (+87.3%)
+    window net: $+82.59  bank=$6483.27
+  btc-updown-15m-1775259000: UP @ 0.5440 x 617.5sh [10:02 left] -> UP pnl=$+281.54 (+83.8%)
+    window net: $+281.54  bank=$6764.81
+  btc-updown-15m-1775259900: FLAT
+  btc-updown-15m-1775260800: FLAT
+  btc-updown-15m-1775261700: DOWN @ 0.5780 x 609.5sh [7:58 left] -> UP pnl=$-352.28 (-100.0%)
+    window net: $-352.28  bank=$6412.54
+  btc-updown-15m-1775262600: FLAT
+  btc-updown-15m-1775263500: FLAT
+  btc-updown-15m-1775264400: FLAT
+  btc-updown-15m-1775265300: DOWN @ 0.3023 x 305.9sh [5:03 left] -> DOWN pnl=$+213.44 (+230.8%)
+    window net: $+213.44  bank=$6625.98
+  btc-updown-15m-1775266200: DOWN @ 0.3969 x 771.4sh [14:39 left] -> DOWN pnl=$+465.18 (+151.9%)
+    window net: $+465.18  bank=$7091.16
+  btc-updown-15m-1775267100: FLAT
+  btc-updown-15m-1775268000: FLAT
+  btc-updown-15m-1775268900: FLAT
+  btc-updown-15m-1775269800: UP @ 0.2446 x 45.6sh [0:02 left] -> DOWN pnl=$-11.17 (-100.0%)
+    window net: $-11.17  bank=$7079.99
+  btc-updown-15m-1775270700: FLAT
+  btc-updown-15m-1775271600: FLAT
+  btc-updown-15m-1775272500: FLAT
+  SKIP btc-updown-15m-1775273400 (incomplete)
+  SKIP btc-updown-15m-1775357100 (incomplete)
+  SKIP btc-updown-15m-1775358000 (incomplete)
+  SKIP btc-updown-15m-1775358900 (incomplete)
+  SKIP btc-updown-15m-1775359800 (incomplete)
+  SKIP btc-updown-15m-1775360700 (incomplete)
+  SKIP btc-updown-15m-1775361600 (incomplete)
+  SKIP btc-updown-15m-1775362500 (incomplete)
+  SKIP btc-updown-15m-1775363400 (incomplete)
+  SKIP btc-updown-15m-1775364300 (incomplete)
+  SKIP btc-updown-15m-1775365200 (incomplete)
+  SKIP btc-updown-15m-1775366100 (incomplete)
+  SKIP btc-updown-15m-1775367000 (incomplete)
+  SKIP btc-updown-15m-1775367900 (incomplete)
+  SKIP btc-updown-15m-1775368800 (incomplete)
+  SKIP btc-updown-15m-1775369700 (incomplete)
+  SKIP btc-updown-15m-1775370600 (incomplete)
+  SKIP btc-updown-15m-1775371500 (incomplete)
+  SKIP btc-updown-15m-1775372400 (incomplete)
+  SKIP btc-updown-15m-1775373300 (incomplete)
+  SKIP btc-updown-15m-1775374200 (incomplete)
+  SKIP btc-updown-15m-1775375100 (incomplete)
+  SKIP btc-updown-15m-1775376000 (incomplete)
+  SKIP btc-updown-15m-1775376900 (incomplete)
+  SKIP btc-updown-15m-1775377800 (incomplete)
+  SKIP btc-updown-15m-1775378700 (incomplete)
+  SKIP btc-updown-15m-1775379600 (incomplete)
+  SKIP btc-updown-15m-1775380500 (incomplete)
+  SKIP btc-updown-15m-1775381400 (incomplete)
+  SKIP btc-updown-15m-1775382300 (incomplete)
+  SKIP btc-updown-15m-1775383200 (incomplete)
+  SKIP btc-updown-15m-1775384100 (incomplete)
+  SKIP btc-updown-15m-1775385000 (incomplete)
+  SKIP btc-updown-15m-1775385900 (incomplete)
+  SKIP btc-updown-15m-1775386800 (incomplete)
+  SKIP btc-updown-15m-1775387700 (incomplete)
+  SKIP btc-updown-15m-1775388600 (incomplete)
+  SKIP btc-updown-15m-1775389500 (incomplete)
+  SKIP btc-updown-15m-1775390400 (incomplete)
+  SKIP btc-updown-15m-1775391300 (incomplete)
+  SKIP btc-updown-15m-1775392200 (incomplete)
+  SKIP btc-updown-15m-1775393100 (incomplete)
+  SKIP btc-updown-15m-1775394000 (incomplete)
+  SKIP btc-updown-15m-1775394900 (incomplete)
+  SKIP btc-updown-15m-1775395800 (incomplete)
+  SKIP btc-updown-15m-1775396700 (incomplete)
+  SKIP btc-updown-15m-1775397600 (incomplete)
+  SKIP btc-updown-15m-1775398500 (incomplete)
+  SKIP btc-updown-15m-1775399400 (incomplete)
+  SKIP btc-updown-15m-1775400300 (incomplete)
+  SKIP btc-updown-15m-1775401200 (incomplete)
+  SKIP btc-updown-15m-1775402100 (incomplete)
+  SKIP btc-updown-15m-1775403000 (incomplete)
+  SKIP btc-updown-15m-1775403900 (incomplete)
+  SKIP btc-updown-15m-1775404800 (incomplete)
+  SKIP btc-updown-15m-1775405700 (incomplete)
+  SKIP btc-updown-15m-1775406600 (incomplete)
+  SKIP btc-updown-15m-1775407500 (incomplete)
+  SKIP btc-updown-15m-1775408400 (incomplete)
+  SKIP btc-updown-15m-1775409300 (incomplete)
+  SKIP btc-updown-15m-1775410200 (incomplete)
+  SKIP btc-updown-15m-1775411100 (incomplete)
+  SKIP btc-updown-15m-1775412000 (incomplete)
+  SKIP btc-updown-15m-1775412900 (incomplete)
+  SKIP btc-updown-15m-1775413800 (incomplete)
+  SKIP btc-updown-15m-1775414700 (incomplete)
+  SKIP btc-updown-15m-1775415600 (incomplete)
+  SKIP btc-updown-15m-1775416500 (incomplete)
+  SKIP btc-updown-15m-1775417400 (incomplete)
+  SKIP btc-updown-15m-1775418300 (incomplete)
+  SKIP btc-updown-15m-1775419200 (incomplete)
+  SKIP btc-updown-15m-1775420100 (incomplete)
+  btc-updown-15m-1775421000: UP @ 0.4377 x 814.0sh [14:21 left] -> UP pnl=$+457.68 (+128.5%)
+    window net: $+457.68  bank=$7537.68
+  SKIP btc-updown-15m-1775421900 (incomplete)
+  SKIP btc-updown-15m-1775422800 (incomplete)
+  SKIP btc-updown-15m-1775423700 (incomplete)
+  SKIP btc-updown-15m-1775424600 (incomplete)
+  SKIP btc-updown-15m-1775425500 (incomplete)
+  SKIP btc-updown-15m-1775426400 (incomplete)
+  SKIP btc-updown-15m-1775427300 (incomplete)
+  SKIP btc-updown-15m-1775428200 (incomplete)
+  SKIP btc-updown-15m-1775429100 (incomplete)
+  SKIP btc-updown-15m-1775430000 (incomplete)
+  SKIP btc-updown-15m-1775430900 (incomplete)
+  SKIP btc-updown-15m-1775431800 (incomplete)
+  SKIP btc-updown-15m-1775432700 (incomplete)
+  SKIP btc-updown-15m-1775433600 (incomplete)
+  SKIP btc-updown-15m-1775434500 (incomplete)
+  SKIP btc-updown-15m-1775435400 (incomplete)
+  SKIP btc-updown-15m-1775436300 (incomplete)
+  SKIP btc-updown-15m-1775437200 (incomplete)
+  SKIP btc-updown-15m-1775438100 (incomplete)
+  SKIP btc-updown-15m-1775439000 (incomplete)
+  SKIP btc-updown-15m-1775439900 (incomplete)
+  SKIP btc-updown-15m-1775440800 (incomplete)
+  SKIP btc-updown-15m-1775441700 (incomplete)
+  SKIP btc-updown-15m-1775442600 (incomplete)
+  SKIP btc-updown-15m-1775445300 (incomplete)
+  SKIP btc-updown-15m-1775446200 (incomplete)
+  SKIP btc-updown-15m-1775447100 (incomplete)
+  SKIP btc-updown-15m-1775448000 (incomplete)
+  SKIP btc-updown-15m-1775448900 (incomplete)
+  SKIP btc-updown-15m-1775449800 (incomplete)
+  SKIP btc-updown-15m-1775450700 (incomplete)
+  SKIP btc-updown-15m-1775451600 (incomplete)
+  SKIP btc-updown-15m-1775452500 (incomplete)
+  SKIP btc-updown-15m-1775453400 (incomplete)
+  SKIP btc-updown-15m-1775454300 (incomplete)
+  SKIP btc-updown-15m-1775455200 (incomplete)
+  SKIP btc-updown-15m-1775456100 (incomplete)
+  SKIP btc-updown-15m-1775457000 (incomplete)
+  SKIP btc-updown-15m-1775457900 (incomplete)
+  SKIP btc-updown-15m-1775458800 (incomplete)
+  SKIP btc-updown-15m-1775459700 (incomplete)
+  SKIP btc-updown-15m-1775460600 (incomplete)
+  SKIP btc-updown-15m-1775461500 (incomplete)
+  SKIP btc-updown-15m-1775462400 (incomplete)
+  SKIP btc-updown-15m-1775463300 (incomplete)
+  SKIP btc-updown-15m-1775464200 (incomplete)
+  SKIP btc-updown-15m-1775465100 (incomplete)
+  SKIP btc-updown-15m-1775466000 (incomplete)
+  SKIP btc-updown-15m-1775466900 (incomplete)
+  SKIP btc-updown-15m-1775467800 (incomplete)
+  SKIP btc-updown-15m-1775468700 (incomplete)
+  SKIP btc-updown-15m-1775469600 (incomplete)
+  SKIP btc-updown-15m-1775470500 (incomplete)
+  SKIP btc-updown-15m-1775471400 (incomplete)
+  SKIP btc-updown-15m-1775472300 (incomplete)
+  SKIP btc-updown-15m-1775473200 (incomplete)
+  SKIP btc-updown-15m-1775474100 (incomplete)
+  SKIP btc-updown-15m-1775475000 (incomplete)
+  SKIP btc-updown-15m-1775475900 (incomplete)
+  SKIP btc-updown-15m-1775476800 (incomplete)
+  SKIP btc-updown-15m-1775477700 (incomplete)
+  SKIP btc-updown-15m-1775478600 (incomplete)
+  SKIP btc-updown-15m-1775479500 (incomplete)
+  SKIP btc-updown-15m-1775480400 (incomplete)
+  SKIP btc-updown-15m-1775481300 (incomplete)
+  SKIP btc-updown-15m-1775482200 (incomplete)
+  SKIP btc-updown-15m-1775483100 (incomplete)
+  SKIP btc-updown-15m-1775484000 (incomplete)
+  SKIP btc-updown-15m-1775484900 (incomplete)
+  SKIP btc-updown-15m-1775485800 (incomplete)
+  SKIP btc-updown-15m-1775486700 (incomplete)
+  SKIP btc-updown-15m-1775487600 (incomplete)
+  SKIP btc-updown-15m-1775488500 (incomplete)
+  SKIP btc-updown-15m-1775489400 (incomplete)
+  SKIP btc-updown-15m-1775490300 (incomplete)
+  SKIP btc-updown-15m-1775491200 (incomplete)
+  SKIP btc-updown-15m-1775492100 (incomplete)
+  SKIP btc-updown-15m-1775493000 (incomplete)
+  SKIP btc-updown-15m-1775493900 (incomplete)
+  SKIP btc-updown-15m-1775494800 (incomplete)
+  SKIP btc-updown-15m-1775495700 (incomplete)
+  SKIP btc-updown-15m-1775496600 (incomplete)
+  SKIP btc-updown-15m-1775497500 (incomplete)
+  SKIP btc-updown-15m-1775498400 (incomplete)
+  SKIP btc-updown-15m-1775499300 (incomplete)
+  SKIP btc-updown-15m-1775500200 (incomplete)
+  SKIP btc-updown-15m-1775501100 (incomplete)
+  SKIP btc-updown-15m-1775502000 (incomplete)
+  SKIP btc-updown-15m-1775502900 (incomplete)
+  SKIP btc-updown-15m-1775503800 (incomplete)
+  SKIP btc-updown-15m-1775504700 (incomplete)
+  SKIP btc-updown-15m-1775505600 (incomplete)
+  SKIP btc-updown-15m-1775506500 (incomplete)
+  SKIP btc-updown-15m-1775507400 (incomplete)
+  SKIP btc-updown-15m-1775508300 (incomplete)
+  SKIP btc-updown-15m-1775509200 (incomplete)
+  SKIP btc-updown-15m-1775510100 (incomplete)
+  SKIP btc-updown-15m-1775511000 (incomplete)
+  SKIP btc-updown-15m-1775511900 (incomplete)
+  SKIP btc-updown-15m-1775512800 (incomplete)
+  SKIP btc-updown-15m-1775513700 (incomplete)
+  SKIP btc-updown-15m-1775514600 (incomplete)
+  SKIP btc-updown-15m-1775516400 (incomplete)
+  SKIP btc-updown-15m-1775517300 (incomplete)
+  SKIP btc-updown-15m-1775518200 (incomplete)
+  SKIP btc-updown-15m-1775519100 (incomplete)
+  SKIP btc-updown-15m-1775520000 (incomplete)
+  SKIP btc-updown-15m-1775520900 (incomplete)
+  SKIP btc-updown-15m-1775521800 (incomplete)
+  SKIP btc-updown-15m-1775522700 (incomplete)
+  SKIP btc-updown-15m-1775523600 (incomplete)
+  SKIP btc-updown-15m-1775536200 (incomplete)
+  SKIP btc-updown-15m-1775537100 (incomplete)
+  SKIP btc-updown-15m-1775538000 (incomplete)
+  SKIP btc-updown-15m-1775538900 (incomplete)
+  SKIP btc-updown-15m-1775539800 (incomplete)
+  SKIP btc-updown-15m-1775540700 (incomplete)
+  SKIP btc-updown-15m-1775541600 (incomplete)
+  SKIP btc-updown-15m-1775542500 (incomplete)
+  SKIP btc-updown-15m-1775543400 (incomplete)
+
+  Per-trade detail:
+------------------------------------------------------------------------
+  btc-updown-15m-1775167200
+    Side:        UP  |  Time left: 14:44
+    Entry price: 0.471870  (fee/sh: 0.004974)
+    Shares:      1065.25  |  Cost: $502.66
+    BTC at fill:  $66,936.67  |  Start: $66,933.96
+    Expected:     $66,816.24 - $67,051.68 (1-sigma)
+    Final BTC:    $66,896.90  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-502.66 (-100.00%)
+    Reason:      p=0.5877 sig=5.91e-05 z=0.11 tau=885s edge=0.1227 thresh=0.0876 spread=0.010 kelly=0.2435 $500
+------------------------------------------------------------------------
+  btc-updown-15m-1775168100
+    Side:        DOWN  |  Time left: 3:27
+    Entry price: 0.737699  (fee/sh: 0.003904)
+    Shares:      266.73  |  Cost: $196.77
+    BTC at fill:  $66,845.42  |  Start: $66,896.68
+    Expected:     $66,857.94 - $66,935.42 (1-sigma)
+    Final BTC:    $66,916.06  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-196.77 (-100.00%)
+    Reason:      p=0.1755 sig=4.03e-05 z=-1.00(cap) tau=207s edge=0.1004 thresh=0.0630 spread=0.010 kelly=0.3862 $475
+------------------------------------------------------------------------
+  btc-updown-15m-1775169000
+    Side:        UP  |  Time left: 14:11
+    Entry price: 0.517246  (fee/sh: 0.004996)
+    Shares:      902.97  |  Cost: $467.06
+    BTC at fill:  $66,926.97  |  Start: $66,903.18
+    Expected:     $66,844.58 - $66,961.78 (1-sigma)
+    Final BTC:    $66,973.71  |  In range: NO
+    Outcome:     UP  |  Payout: $902.97
+    PnL:         $+435.91 (+93.33%)
+    Reason:      p=0.6333 sig=3.00e-05 z=0.41 tau=852s edge=0.1083 thresh=0.0867 spread=0.010 kelly=0.2440 $465
+------------------------------------------------------------------------
+  btc-updown-15m-1775169900
+    Side:        UP  |  Time left: 4:47
+    Entry price: 0.647132  (fee/sh: 0.004592)
+    Shares:      767.06  |  Cost: $496.39
+    BTC at fill:  $67,001.86  |  Start: $66,977.52
+    Expected:     $66,943.45 - $67,011.59 (1-sigma)
+    Final BTC:    $66,982.79  |  In range: YES
+    Outcome:     UP  |  Payout: $767.06
+    PnL:         $+270.67 (+54.53%)
+    Reason:      p=0.7181 sig=3.00e-05 z=0.71 tau=287s edge=0.0735 thresh=0.0671 spread=0.010 kelly=0.2285 $487
+------------------------------------------------------------------------
+  btc-updown-15m-1775170800
+    Side:        DOWN  |  Time left: 14:42
+    Entry price: 0.538420  (fee/sh: 0.004973)
+    Shares:      500.29  |  Cost: $269.37
+    BTC at fill:  $66,948.92  |  Start: $66,982.79
+    Expected:     $66,913.23 - $67,052.35 (1-sigma)
+    Final BTC:    $66,946.78  |  In range: YES
+    Outcome:     DOWN  |  Payout: $500.29
+    PnL:         $+230.92 (+85.73%)
+    Reason:      p=0.3313 sig=3.50e-05 z=-0.49 tau=883s edge=0.1437 thresh=0.0875 spread=0.010 kelly=0.3170 $500
+------------------------------------------------------------------------
+  btc-updown-15m-1775172600
+    Side:        DOWN  |  Time left: 10:05
+    Entry price: 0.588882  (fee/sh: 0.004849)
+    Shares:      181.00  |  Cost: $106.59
+    BTC at fill:  $66,913.69  |  Start: $66,935.78
+    Expected:     $66,886.39 - $66,985.18 (1-sigma)
+    Final BTC:    $66,878.52  |  In range: NO
+    Outcome:     DOWN  |  Payout: $181.00
+    PnL:         $+74.41 (+69.81%)
+    Reason:      p=0.3401 sig=3.00e-05 z=-0.45 tau=605s edge=0.0850 thresh=0.0794 spread=0.020 kelly=0.2359 $512
+------------------------------------------------------------------------
+  btc-updown-15m-1775173500
+    Side:        UP  |  Time left: 1:55
+    Entry price: 0.707500  (fee/sh: 0.004172)
+    Shares:      363.88  |  Cost: $257.45
+    BTC at fill:  $66,899.88  |  Start: $66,879.18
+    Expected:     $66,857.63 - $66,900.72 (1-sigma)
+    Final BTC:    $66,922.36  |  In range: NO
+    Outcome:     UP  |  Payout: $363.88
+    PnL:         $+106.43 (+41.34%)
+    Reason:      p=0.7919 sig=3.00e-05 z=0.96 tau=115s edge=0.0677 thresh=0.0572 spread=0.030 kelly=0.3194 $516
+------------------------------------------------------------------------
+  btc-updown-15m-1775175300
+    Side:        DOWN  |  Time left: 14:26
+    Entry price: 0.673768  (fee/sh: 0.004424)
+    Shares:      795.88  |  Cost: $536.24
+    BTC at fill:  $66,821.78  |  Start: $66,871.67
+    Expected:     $66,812.65 - $66,930.69 (1-sigma)
+    Final BTC:    $66,821.48  |  In range: YES
+    Outcome:     DOWN  |  Payout: $795.88
+    PnL:         $+259.64 (+48.42%)
+    Reason:      p=0.1946 sig=3.00e-05 z=-0.84 tau=867s edge=0.1408 thresh=0.0871 spread=0.010 kelly=0.4366 $521
+------------------------------------------------------------------------
+  btc-updown-15m-1775176200
+    Side:        DOWN  |  Time left: 3:09
+    Entry price: 0.718693  (fee/sh: 0.004077)
+    Shares:      769.04  |  Cost: $552.70
+    BTC at fill:  $66,789.79  |  Start: $66,823.01
+    Expected:     $66,795.44 - $66,850.57 (1-sigma)
+    Final BTC:    $66,803.25  |  In range: YES
+    Outcome:     DOWN  |  Payout: $769.04
+    PnL:         $+216.34 (+39.14%)
+    Reason:      p=0.1733 sig=3.00e-05 z=-1.00(cap) tau=189s edge=0.1224 thresh=0.0620 spread=0.010 kelly=0.4332 $534
+------------------------------------------------------------------------
+  btc-updown-15m-1775177100
+    Side:        DOWN  |  Time left: 14:40
+    Entry price: 0.570726  (fee/sh: 0.004910)
+    Shares:      981.61  |  Cost: $560.23
+    BTC at fill:  $66,778.48  |  Start: $66,806.64
+    Expected:     $66,747.19 - $66,866.09 (1-sigma)
+    Final BTC:    $66,775.86  |  In range: YES
+    Outcome:     DOWN  |  Payout: $981.61
+    PnL:         $+421.38 (+75.22%)
+    Reason:      p=0.3302 sig=3.00e-05 z=-0.47 tau=881s edge=0.1048 thresh=0.0875 spread=0.010 kelly=0.2580 $545
+------------------------------------------------------------------------
+  btc-updown-15m-1775178000
+    Side:        DOWN  |  Time left: 13:40
+    Entry price: 0.570877  (fee/sh: 0.004912)
+    Shares:      1019.58  |  Cost: $582.05
+    BTC at fill:  $66,758.14  |  Start: $66,782.42
+    Expected:     $66,725.05 - $66,839.80 (1-sigma)
+    Final BTC:    $66,819.28  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-582.05 (-100.00%)
+    Reason:      p=0.3413 sig=3.00e-05 z=-0.42 tau=821s edge=0.0937 thresh=0.0858 spread=0.010 kelly=0.2331 $566
+------------------------------------------------------------------------
+  btc-updown-15m-1775178900
+    Side:        DOWN  |  Time left: 13:15
+    Entry price: 0.702655  (fee/sh: 0.004211)
+    Shares:      784.26  |  Cost: $551.07
+    BTC at fill:  $66,776.27  |  Start: $66,822.97
+    Expected:     $66,766.46 - $66,879.48 (1-sigma)
+    Final BTC:    $66,860.64  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-551.07 (-100.00%)
+    Reason:      p=0.1991 sig=3.00e-05 z=-0.83 tau=796s edge=0.1065 thresh=0.0851 spread=0.010 kelly=0.3692 $537
+------------------------------------------------------------------------
+  btc-updown-15m-1775180700
+    Side:        DOWN  |  Time left: 13:57
+    Entry price: 0.656845  (fee/sh: 0.004533)
+    Shares:      789.87  |  Cost: $518.82
+    BTC at fill:  $66,518.84  |  Start: $66,567.39
+    Expected:     $66,509.63 - $66,625.15 (1-sigma)
+    Final BTC:    $66,612.34  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-518.82 (-100.00%)
+    Reason:      p=0.1959 sig=3.00e-05 z=-0.84 tau=838s edge=0.1495 thresh=0.0863 spread=0.010 kelly=0.4488 $509
+------------------------------------------------------------------------
+  btc-updown-15m-1775181600
+    Side:        DOWN  |  Time left: 13:40
+    Entry price: 0.733153  (fee/sh: 0.003949)
+    Shares:      667.40  |  Cost: $489.30
+    BTC at fill:  $66,542.30  |  Start: $66,620.12
+    Expected:     $66,540.09 - $66,700.14 (1-sigma)
+    Final BTC:    $66,498.42  |  In range: NO
+    Outcome:     DOWN  |  Payout: $667.40
+    PnL:         $+178.09 (+36.40%)
+    Reason:      p=0.1795 sig=4.20e-05 z=-0.97 tau=821s edge=0.0865 thresh=0.0858 spread=0.010 kelly=0.3497 $483
+------------------------------------------------------------------------
+  btc-updown-15m-1775182500
+    Side:        DOWN  |  Time left: 0:49
+    Entry price: 0.593136  (fee/sh: 0.004844)
+    Shares:      72.00  |  Cost: $42.71
+    BTC at fill:  $66,485.14  |  Start: $66,499.98
+    Expected:     $66,484.82 - $66,515.14 (1-sigma)
+    Final BTC:    $66,462.87  |  In range: NO
+    Outcome:     DOWN  |  Payout: $72.00
+    PnL:         $+29.29 (+68.60%)
+    Reason:      p=0.1821 sig=3.23e-05 z=-0.98 tau=50s edge=0.2290 thresh=0.0513 spread=0.001 kelly=0.5581 $492
+------------------------------------------------------------------------
+  btc-updown-15m-1775183400
+    Side:        DOWN  |  Time left: 14:20
+    Entry price: 0.496766  (fee/sh: 0.004997)
+    Shares:      1017.72  |  Cost: $505.57
+    BTC at fill:  $66,436.74  |  Start: $66,454.17
+    Expected:     $66,395.70 - $66,512.65 (1-sigma)
+    Final BTC:    $66,336.11  |  In range: NO
+    Outcome:     DOWN  |  Payout: $1017.72
+    PnL:         $+512.15 (+101.30%)
+    Reason:      p=0.3672 sig=3.00e-05 z=-0.30 tau=861s edge=0.1378 thresh=0.0869 spread=0.010 kelly=0.2869 $494
+------------------------------------------------------------------------
+  btc-updown-15m-1775184300
+    Side:        DOWN  |  Time left: 14:38
+    Entry price: 0.542290  (fee/sh: 0.004968)
+    Shares:      1008.15  |  Cost: $546.71
+    BTC at fill:  $66,314.78  |  Start: $66,340.80
+    Expected:     $66,281.82 - $66,399.78 (1-sigma)
+    Final BTC:    $66,523.83  |  In range: NO
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-546.71 (-100.00%)
+    Reason:      p=0.3367 sig=3.00e-05 z=-0.44 tau=879s edge=0.1383 thresh=0.0874 spread=0.010 kelly=0.3057 $519
+------------------------------------------------------------------------
+  btc-updown-15m-1775185200
+    Side:        DOWN  |  Time left: 11:02
+    Entry price: 0.677985  (fee/sh: 0.004396)
+    Shares:      740.21  |  Cost: $501.85
+    BTC at fill:  $66,486.45  |  Start: $66,525.20
+    Expected:     $66,473.85 - $66,576.54 (1-sigma)
+    Final BTC:    $66,644.74  |  In range: NO
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-501.85 (-100.00%)
+    Reason:      p=0.2152 sig=3.00e-05 z=-0.75 tau=663s edge=0.1104 thresh=0.0812 spread=0.010 kelly=0.3587 $492
+------------------------------------------------------------------------
+  btc-updown-15m-1775186100
+    Side:        DOWN  |  Time left: 13:46
+    Entry price: 0.553016  (fee/sh: 0.004952)
+    Shares:      872.49  |  Cost: $482.50
+    BTC at fill:  $66,621.74  |  Start: $66,642.21
+    Expected:     $66,584.75 - $66,699.68 (1-sigma)
+    Final BTC:    $66,623.95  |  In range: YES
+    Outcome:     DOWN  |  Payout: $872.49
+    PnL:         $+389.99 (+80.83%)
+    Reason:      p=0.3552 sig=3.00e-05 z=-0.36 tau=827s edge=0.0998 thresh=0.0860 spread=0.010 kelly=0.2361 $467
+------------------------------------------------------------------------
+  btc-updown-15m-1775187900
+    Side:        UP  |  Time left: 5:12
+    Entry price: 0.376386  (fee/sh: 0.004667)
+    Shares:      374.92  |  Cost: $141.11
+    BTC at fill:  $66,626.09  |  Start: $66,596.79
+    Expected:     $66,561.47 - $66,632.11 (1-sigma)
+    Final BTC:    $66,577.71  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-141.11 (-100.00%)
+    Reason:      p=0.7622 sig=3.00e-05 z=0.83 tau=312s edge=0.3977 thresh=0.0683 spread=0.010 kelly=0.6316 $486
+------------------------------------------------------------------------
+  btc-updown-15m-1775188800
+    Side:        UP  |  Time left: 13:59
+    Entry price: 0.478568  (fee/sh: 0.004984)
+    Shares:      745.53  |  Cost: $356.79
+    BTC at fill:  $66,588.61  |  Start: $66,583.91
+    Expected:     $66,526.02 - $66,641.79 (1-sigma)
+    Final BTC:    $66,631.05  |  In range: YES
+    Outcome:     UP  |  Payout: $745.53
+    PnL:         $+388.74 (+108.96%)
+    Reason:      p=0.5649 sig=3.00e-05 z=0.08 tau=840s edge=0.1099 thresh=0.0864 spread=0.010 kelly=0.2161 $479
+------------------------------------------------------------------------
+  btc-updown-15m-1775189700
+    Side:        UP  |  Time left: 12:19
+    Entry price: 0.617623  (fee/sh: 0.004742)
+    Shares:      838.29  |  Cost: $517.75
+    BTC at fill:  $66,685.34  |  Start: $66,628.62
+    Expected:     $66,574.21 - $66,683.03 (1-sigma)
+    Final BTC:    $66,540.89  |  In range: NO
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-517.75 (-100.00%)
+    Reason:      p=0.7855 sig=3.00e-05 z=1.00(cap) tau=740s edge=0.1807 thresh=0.0835 spread=0.010 kelly=0.4706 $499
+------------------------------------------------------------------------
+  btc-updown-15m-1775190600
+    Side:        UP  |  Time left: 8:23
+    Entry price: 0.672067  (fee/sh: 0.004436)
+    Shares:      722.27  |  Cost: $485.41
+    BTC at fill:  $66,574.57  |  Start: $66,540.74
+    Expected:     $66,495.93 - $66,585.56 (1-sigma)
+    Final BTC:    $66,575.13  |  In range: YES
+    Outcome:     UP  |  Payout: $722.27
+    PnL:         $+236.85 (+48.79%)
+    Reason:      p=0.7429 sig=3.00e-05 z=0.76 tau=503s edge=0.0783 thresh=0.0759 spread=0.010 kelly=0.2556 $473
+------------------------------------------------------------------------
+  btc-updown-15m-1775192400
+    Side:        UP  |  Time left: 12:47
+    Entry price: 0.487183  (fee/sh: 0.004991)
+    Shares:      993.38  |  Cost: $483.96
+    BTC at fill:  $66,607.77  |  Start: $66,603.10
+    Expected:     $66,547.74 - $66,658.47 (1-sigma)
+    Final BTC:    $66,592.25  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-483.96 (-100.00%)
+    Reason:      p=0.5670 sig=3.00e-05 z=0.08 tau=768s edge=0.0920 thresh=0.0843 spread=0.010 kelly=0.1906 $462
+------------------------------------------------------------------------
+  btc-updown-15m-1775194200
+    Side:        UP  |  Time left: 14:09
+    Entry price: 0.624712  (fee/sh: 0.004712)
+    Shares:      736.99  |  Cost: $460.40
+    BTC at fill:  $66,629.94  |  Start: $66,578.57
+    Expected:     $66,520.30 - $66,636.83 (1-sigma)
+    Final BTC:    $66,769.92  |  In range: NO
+    Outcome:     UP  |  Payout: $736.99
+    PnL:         $+276.58 (+60.07%)
+    Reason:      p=0.7613 sig=3.00e-05 z=0.88 tau=850s edge=0.1266 thresh=0.0866 spread=0.010 kelly=0.3639 $460
+------------------------------------------------------------------------
+  btc-updown-15m-1775196000
+    Side:        DOWN  |  Time left: 13:24
+    Entry price: 0.499435  (fee/sh: 0.004998)
+    Shares:      958.05  |  Cost: $478.49
+    BTC at fill:  $66,583.37  |  Start: $66,604.71
+    Expected:     $66,548.05 - $66,661.37 (1-sigma)
+    Final BTC:    $66,658.05  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-478.49 (-100.00%)
+    Reason:      p=0.3513 sig=3.00e-05 z=-0.38 tau=805s edge=0.1437 thresh=0.0854 spread=0.010 kelly=0.3044 $474
+------------------------------------------------------------------------
+  btc-updown-15m-1775196900
+    Side:        UP  |  Time left: 5:22
+    Entry price: 0.592059  (fee/sh: 0.004847)
+    Shares:      783.28  |  Cost: $463.75
+    BTC at fill:  $66,677.13  |  Start: $66,659.38
+    Expected:     $66,623.46 - $66,695.29 (1-sigma)
+    Final BTC:    $66,622.31  |  In range: NO
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-463.75 (-100.00%)
+    Reason:      p=0.6672 sig=3.00e-05 z=0.49 tau=322s edge=0.0823 thresh=0.0687 spread=0.010 kelly=0.2171 $450
+------------------------------------------------------------------------
+  btc-updown-15m-1775197800
+    Side:        DOWN  |  Time left: 14:44
+    Entry price: 0.549863  (fee/sh: 0.004958)
+    Shares:      798.39  |  Cost: $439.00
+    BTC at fill:  $66,603.15  |  Start: $66,624.16
+    Expected:     $66,557.00 - $66,691.32 (1-sigma)
+    Final BTC:    $66,733.57  |  In range: NO
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-439.00 (-100.00%)
+    Reason:      p=0.3669 sig=3.39e-05 z=-0.31 tau=885s edge=0.0881 thresh=0.0876 spread=0.010 kelly=0.2109 $427
+------------------------------------------------------------------------
+  btc-updown-15m-1775198700
+    Side:        UP  |  Time left: 14:24
+    Entry price: 0.514998  (fee/sh: 0.004998)
+    Shares:      786.75  |  Cost: $405.17
+    BTC at fill:  $66,754.19  |  Start: $66,731.99
+    Expected:     $66,673.10 - $66,790.87 (1-sigma)
+    Final BTC:    $66,792.83  |  In range: NO
+    Outcome:     UP  |  Payout: $786.75
+    PnL:         $+381.57 (+94.18%)
+    Reason:      p=0.6258 sig=3.00e-05 z=0.38 tau=865s edge=0.1008 thresh=0.0870 spread=0.010 kelly=0.2285 $405
+------------------------------------------------------------------------
+  btc-updown-15m-1775199600
+    Side:        UP  |  Time left: 13:01
+    Entry price: 0.448995  (fee/sh: 0.004933)
+    Shares:      975.51  |  Cost: $438.00
+    BTC at fill:  $66,796.70  |  Start: $66,791.63
+    Expected:     $66,735.60 - $66,847.65 (1-sigma)
+    Final BTC:    $66,819.52  |  In range: YES
+    Outcome:     UP  |  Payout: $975.51
+    PnL:         $+537.51 (+122.72%)
+    Reason:      p=0.5682 sig=3.00e-05 z=0.09 tau=782s edge=0.1233 thresh=0.0847 spread=0.010 kelly=0.2359 $424
+------------------------------------------------------------------------
+  btc-updown-15m-1775200500
+    Side:        UP  |  Time left: 9:52
+    Entry price: 0.677227  (fee/sh: 0.004401)
+    Shares:      689.22  |  Cost: $466.76
+    BTC at fill:  $66,858.72  |  Start: $66,819.25
+    Expected:     $66,770.43 - $66,868.07 (1-sigma)
+    Final BTC:    $66,937.33  |  In range: NO
+    Outcome:     UP  |  Payout: $689.22
+    PnL:         $+222.46 (+47.66%)
+    Reason:      p=0.7521 sig=3.00e-05 z=0.81 tau=592s edge=0.0876 thresh=0.0789 spread=0.010 kelly=0.2825 $451
+------------------------------------------------------------------------
+  btc-updown-15m-1775201400
+    Side:        UP  |  Time left: 11:33
+    Entry price: 0.514998  (fee/sh: 0.004998)
+    Shares:      897.58  |  Cost: $462.25
+    BTC at fill:  $66,979.82  |  Start: $66,940.38
+    Expected:     $66,883.94 - $66,996.82 (1-sigma)
+    Final BTC:    $67,078.11  |  In range: NO
+    Outcome:     UP  |  Payout: $897.58
+    PnL:         $+435.33 (+94.18%)
+    Reason:      p=0.7074 sig=3.20e-05 z=0.70 tau=694s edge=0.1824 thresh=0.0821 spread=0.010 kelly=0.3967 $462
+------------------------------------------------------------------------
+  btc-updown-15m-1775202300
+    Side:        DOWN  |  Time left: 13:04
+    Entry price: 0.703404  (fee/sh: 0.004204)
+    Shares:      707.26  |  Cost: $497.49
+    BTC at fill:  $67,031.73  |  Start: $67,079.95
+    Expected:     $67,023.62 - $67,136.28 (1-sigma)
+    Final BTC:    $67,039.77  |  In range: YES
+    Outcome:     DOWN  |  Payout: $707.26
+    PnL:         $+209.77 (+42.17%)
+    Reason:      p=0.1938 sig=3.00e-05 z=-0.86 tau=785s edge=0.1118 thresh=0.0848 spread=0.010 kelly=0.3859 $484
+------------------------------------------------------------------------
+  btc-updown-15m-1775203200
+    Side:        UP  |  Time left: 13:21
+    Entry price: 0.562280  (fee/sh: 0.004930)
+    Shares:      817.26  |  Cost: $459.53
+    BTC at fill:  $67,059.51  |  Start: $67,035.58
+    Expected:     $66,978.62 - $67,092.54 (1-sigma)
+    Final BTC:    $67,171.20  |  In range: NO
+    Outcome:     UP  |  Payout: $817.26
+    PnL:         $+357.73 (+77.85%)
+    Reason:      p=0.6378 sig=3.00e-05 z=0.42 tau=802s edge=0.0928 thresh=0.0853 spread=0.010 kelly=0.2212 $495
+------------------------------------------------------------------------
+  btc-updown-15m-1775204100
+    Side:        UP  |  Time left: 13:46
+    Entry price: 0.505000  (fee/sh: 0.005000)
+    Shares:      1014.64  |  Cost: $512.39
+    BTC at fill:  $67,195.63  |  Start: $67,169.56
+    Expected:     $67,111.60 - $67,227.52 (1-sigma)
+    Final BTC:    $67,053.92  |  In range: NO
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-512.39 (-100.00%)
+    Reason:      p=0.6447 sig=3.00e-05 z=0.45 tau=827s edge=0.1297 thresh=0.0860 spread=0.010 kelly=0.2823 $512
+------------------------------------------------------------------------
+  btc-updown-15m-1775205000
+    Side:        UP  |  Time left: 12:50
+    Entry price: 0.676598  (fee/sh: 0.004406)
+    Shares:      732.55  |  Cost: $495.64
+    BTC at fill:  $67,114.62  |  Start: $67,054.53
+    Expected:     $66,998.63 - $67,110.42 (1-sigma)
+    Final BTC:    $66,929.05  |  In range: NO
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-495.64 (-100.00%)
+    Reason:      p=0.7850 sig=3.00e-05 z=1.00(cap) tau=771s edge=0.1106 thresh=0.0844 spread=0.010 kelly=0.3593 $487
+------------------------------------------------------------------------
+  btc-updown-15m-1775205900
+    Side:        DOWN  |  Time left: 3:29
+    Entry price: 0.598632  (fee/sh: 0.004822)
+    Shares:      639.34  |  Cost: $382.73
+    BTC at fill:  $66,921.62  |  Start: $66,933.72
+    Expected:     $66,904.69 - $66,962.76 (1-sigma)
+    Final BTC:    $66,962.21  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-382.73 (-100.00%)
+    Reason:      p=0.3556 sig=3.00e-05 z=-0.42 tau=209s edge=0.0695 thresh=0.0631 spread=0.010 kelly=0.1826 $422
+------------------------------------------------------------------------
+  btc-updown-15m-1775208600
+    Side:        DOWN  |  Time left: 14:40
+    Entry price: 0.536711  (fee/sh: 0.004977)
+    Shares:      859.91  |  Cost: $461.52
+    BTC at fill:  $66,802.99  |  Start: $66,818.20
+    Expected:     $66,758.72 - $66,877.68 (1-sigma)
+    Final BTC:    $66,895.38  |  In range: NO
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-461.52 (-100.00%)
+    Reason:      p=0.3762 sig=3.00e-05 z=-0.26 tau=881s edge=0.0988 thresh=0.0875 spread=0.010 kelly=0.2243 $443
+------------------------------------------------------------------------
+  btc-updown-15m-1775210400
+    Side:        UP  |  Time left: 14:52
+    Entry price: 0.455380  (fee/sh: 0.004949)
+    Shares:      965.22  |  Cost: $439.54
+    BTC at fill:  $66,861.04  |  Start: $66,860.74
+    Expected:     $66,753.52 - $66,967.96 (1-sigma)
+    Final BTC:    $66,822.44  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-439.54 (-100.00%)
+    Reason:      p=0.5591 sig=5.37e-05 z=0.00 tau=893s edge=0.1142 thresh=0.0878 spread=0.010 kelly=0.2198 $420
+------------------------------------------------------------------------
+  btc-updown-15m-1775211300
+    Side:        UP  |  Time left: 7:50
+    Entry price: 0.513581  (fee/sh: 0.004998)
+    Shares:      689.76  |  Cost: $354.25
+    BTC at fill:  $66,829.45  |  Start: $66,822.34
+    Expected:     $66,778.86 - $66,865.82 (1-sigma)
+    Final BTC:    $66,759.17  |  In range: NO
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-354.25 (-100.00%)
+    Reason:      p=0.5917 sig=3.00e-05 z=0.16 tau=470s edge=0.0767 thresh=0.0747 spread=0.010 kelly=0.1751 $348
+------------------------------------------------------------------------
+  btc-updown-15m-1775212200
+    Side:        DOWN  |  Time left: 12:19
+    Entry price: 0.728281  (fee/sh: 0.003993)
+    Shares:      524.96  |  Cost: $382.32
+    BTC at fill:  $66,708.65  |  Start: $66,761.49
+    Expected:     $66,707.07 - $66,815.91 (1-sigma)
+    Final BTC:    $66,784.91  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-382.32 (-100.00%)
+    Reason:      p=0.1748 sig=3.00e-05 z=-0.97 tau=740s edge=0.0912 thresh=0.0835 spread=0.010 kelly=0.3667 $380
+------------------------------------------------------------------------
+  btc-updown-15m-1775214000
+    Side:        UP  |  Time left: 14:14
+    Entry price: 0.455166  (fee/sh: 0.004949)
+    Shares:      811.30  |  Cost: $369.28
+    BTC at fill:  $66,887.78  |  Start: $66,879.77
+    Expected:     $66,821.11 - $66,938.44 (1-sigma)
+    Final BTC:    $66,849.73  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-369.28 (-100.00%)
+    Reason:      p=0.5778 sig=3.00e-05 z=0.14 tau=855s edge=0.1229 thresh=0.0868 spread=0.010 kelly=0.2394 $361
+------------------------------------------------------------------------
+  btc-updown-15m-1775215800
+    Side:        UP  |  Time left: 14:43
+    Entry price: 0.469841  (fee/sh: 0.004975)
+    Shares:      690.75  |  Cost: $324.54
+    BTC at fill:  $66,940.68  |  Start: $66,935.86
+    Expected:     $66,868.90 - $67,002.82 (1-sigma)
+    Final BTC:    $66,999.62  |  In range: YES
+    Outcome:     UP  |  Payout: $690.75
+    PnL:         $+366.21 (+112.84%)
+    Reason:      p=0.5653 sig=3.36e-05 z=0.07 tau=884s edge=0.0903 thresh=0.0876 spread=0.010 kelly=0.1875 $321
+------------------------------------------------------------------------
+  btc-updown-15m-1775216700
+    Side:        UP  |  Time left: 10:54
+    Entry price: 0.532924  (fee/sh: 0.004981)
+    Shares:      667.36  |  Cost: $355.65
+    BTC at fill:  $67,010.01  |  Start: $66,999.59
+    Expected:     $66,948.16 - $67,051.03 (1-sigma)
+    Final BTC:    $67,016.03  |  In range: YES
+    Outcome:     UP  |  Payout: $667.36
+    PnL:         $+311.71 (+87.64%)
+    Reason:      p=0.5975 sig=3.00e-05 z=0.20 tau=655s edge=0.0825 thresh=0.0809 spread=0.010 kelly=0.1868 $337
+------------------------------------------------------------------------
+  btc-updown-15m-1775217600
+    Side:        UP  |  Time left: 13:40
+    Entry price: 0.469747  (fee/sh: 0.004974)
+    Shares:      843.76  |  Cost: $396.35
+    BTC at fill:  $67,019.03  |  Start: $67,016.66
+    Expected:     $66,959.07 - $67,074.25 (1-sigma)
+    Final BTC:    $67,007.21  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-396.35 (-100.00%)
+    Reason:      p=0.5557 sig=3.00e-05 z=0.04 tau=821s edge=0.1007 thresh=0.0858 spread=0.010 kelly=0.1995 $375
+------------------------------------------------------------------------
+  btc-updown-15m-1775218500
+    Side:        UP  |  Time left: 2:23
+    Entry price: 0.740969  (fee/sh: 0.003875)
+    Shares:      492.50  |  Cost: $364.93
+    BTC at fill:  $67,034.22  |  Start: $67,009.18
+    Expected:     $66,985.05 - $67,033.31 (1-sigma)
+    Final BTC:    $67,178.98  |  In range: NO
+    Outcome:     UP  |  Payout: $492.50
+    PnL:         $+127.57 (+34.96%)
+    Reason:      p=0.7975 sig=3.00e-05 z=1.00(cap) tau=144s edge=0.0635 thresh=0.0592 spread=0.010 kelly=0.2662 $357
+------------------------------------------------------------------------
+  btc-updown-15m-1775219400
+    Side:        UP  |  Time left: 14:47
+    Entry price: 0.667259  (fee/sh: 0.004469)
+    Shares:      563.08  |  Cost: $375.72
+    BTC at fill:  $67,291.06  |  Start: $67,116.35
+    Expected:     $66,955.95 - $67,276.75 (1-sigma)
+    Final BTC:    $66,860.93  |  In range: NO
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-375.72 (-100.00%)
+    Reason:      p=0.7980 sig=8.00e-05 z=1.00(cap) tau=888s edge=0.1434 thresh=0.0877 spread=0.010 kelly=0.4317 $363
+------------------------------------------------------------------------
+  btc-updown-15m-1775220300
+    Side:        DOWN  |  Time left: 12:08
+    Entry price: 0.596504  (fee/sh: 0.004832)
+    Shares:      578.61  |  Cost: $345.14
+    BTC at fill:  $66,835.68  |  Start: $66,868.39
+    Expected:     $66,814.26 - $66,922.51 (1-sigma)
+    Final BTC:    $66,726.71  |  In range: NO
+    Outcome:     DOWN  |  Payout: $578.61
+    PnL:         $+233.47 (+67.64%)
+    Reason:      p=0.3074 sig=3.00e-05 z=-0.60 tau=729s edge=0.0877 thresh=0.0832 spread=0.010 kelly=0.2412 $344
+------------------------------------------------------------------------
+  btc-updown-15m-1775221200
+    Side:        DOWN  |  Time left: 14:17
+    Entry price: 0.558727  (fee/sh: 0.004942)
+    Shares:      641.23  |  Cost: $358.27
+    BTC at fill:  $66,684.92  |  Start: $66,724.64
+    Expected:     $66,665.39 - $66,783.89 (1-sigma)
+    Final BTC:    $66,654.14  |  In range: NO
+    Outcome:     DOWN  |  Payout: $641.23
+    PnL:         $+282.96 (+78.98%)
+    Reason:      p=0.2941 sig=3.03e-05 z=-0.67 tau=858s edge=0.1410 thresh=0.0869 spread=0.010 kelly=0.3393 $356
+------------------------------------------------------------------------
+  btc-updown-15m-1775222100
+    Side:        DOWN  |  Time left: 14:50
+    Entry price: 0.508947  (fee/sh: 0.004999)
+    Shares:      732.67  |  Cost: $372.89
+    BTC at fill:  $66,647.46  |  Start: $66,670.08
+    Expected:     $66,610.41 - $66,729.76 (1-sigma)
+    Final BTC:    $66,685.02  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-372.89 (-100.00%)
+    Reason:      p=0.3494 sig=3.00e-05 z=-0.38 tau=891s edge=0.1356 thresh=0.0878 spread=0.010 kelly=0.2941 $370
+------------------------------------------------------------------------
+  btc-updown-15m-1775223000
+    Side:        DOWN  |  Time left: 14:41
+    Entry price: 0.527352  (fee/sh: 0.004989)
+    Shares:      682.24  |  Cost: $359.78
+    BTC at fill:  $66,665.27  |  Start: $66,683.58
+    Expected:     $66,624.20 - $66,742.97 (1-sigma)
+    Final BTC:    $66,601.64  |  In range: NO
+    Outcome:     DOWN  |  Payout: $682.24
+    PnL:         $+322.46 (+89.63%)
+    Reason:      p=0.3647 sig=3.00e-05 z=-0.31 tau=882s edge=0.1003 thresh=0.0875 spread=0.020 kelly=0.2481 $351
+------------------------------------------------------------------------
+  btc-updown-15m-1775223900
+    Side:        DOWN  |  Time left: 11:34
+    Entry price: 0.697436  (fee/sh: 0.004253)
+    Shares:      536.97  |  Cost: $374.50
+    BTC at fill:  $66,541.95  |  Start: $66,601.90
+    Expected:     $66,549.28 - $66,654.51 (1-sigma)
+    Final BTC:    $66,671.73  |  In range: NO
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-374.50 (-100.00%)
+    Reason:      p=0.1706 sig=3.00e-05 z=-1.00(cap) tau=695s edge=0.1350 thresh=0.0822 spread=0.010 kelly=0.4595 $367
+------------------------------------------------------------------------
+  btc-updown-15m-1775224800
+    Side:        DOWN  |  Time left: 12:44
+    Entry price: 0.672564  (fee/sh: 0.004434)
+    Shares:      524.84  |  Cost: $352.99
+    BTC at fill:  $66,630.42  |  Start: $66,672.12
+    Expected:     $66,616.85 - $66,727.39 (1-sigma)
+    Final BTC:    $66,784.44  |  In range: NO
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-352.99 (-100.00%)
+    Reason:      p=0.2135 sig=3.00e-05 z=-0.75 tau=765s edge=0.1120 thresh=0.0842 spread=0.010 kelly=0.3637 $349
+------------------------------------------------------------------------
+  btc-updown-15m-1775225700
+    Side:        DOWN  |  Time left: 13:34
+    Entry price: 0.687155  (fee/sh: 0.004331)
+    Shares:      483.82  |  Cost: $332.46
+    BTC at fill:  $66,739.20  |  Start: $66,785.34
+    Expected:     $66,728.19 - $66,842.49 (1-sigma)
+    Final BTC:    $66,909.03  |  In range: NO
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-332.46 (-100.00%)
+    Reason:      p=0.2024 sig=3.00e-05 z=-0.81 tau=815s edge=0.1032 thresh=0.0857 spread=0.010 kelly=0.3587 $331
+------------------------------------------------------------------------
+  btc-updown-15m-1775226600
+    Side:        DOWN  |  Time left: 5:32
+    Entry price: 0.694926  (fee/sh: 0.004272)
+    Shares:      459.53  |  Cost: $319.34
+    BTC at fill:  $66,880.01  |  Start: $66,909.66
+    Expected:     $66,871.49 - $66,947.82 (1-sigma)
+    Final BTC:    $66,811.00  |  In range: NO
+    Outcome:     DOWN  |  Payout: $459.53
+    PnL:         $+140.19 (+43.90%)
+    Reason:      p=0.2104 sig=3.13e-05 z=-0.78 tau=332s edge=0.0953 thresh=0.0692 spread=0.010 kelly=0.3336 $314
+------------------------------------------------------------------------
+  btc-updown-15m-1775227500
+    Side:        UP  |  Time left: 14:48
+    Entry price: 0.514998  (fee/sh: 0.004998)
+    Shares:      624.25  |  Cost: $321.49
+    BTC at fill:  $66,839.42  |  Start: $66,810.43
+    Expected:     $66,750.65 - $66,870.21 (1-sigma)
+    Final BTC:    $66,930.64  |  In range: NO
+    Outcome:     UP  |  Payout: $624.25
+    PnL:         $+302.76 (+94.18%)
+    Reason:      p=0.6522 sig=3.00e-05 z=0.49 tau=889s edge=0.1272 thresh=0.0877 spread=0.010 kelly=0.2830 $321
+------------------------------------------------------------------------
+  btc-updown-15m-1775228400
+    Side:        UP  |  Time left: 10:27
+    Entry price: 0.543191  (fee/sh: 0.004970)
+    Shares:      629.23  |  Cost: $341.79
+    BTC at fill:  $66,959.64  |  Start: $66,932.56
+    Expected:     $66,882.23 - $66,982.88 (1-sigma)
+    Final BTC:    $66,960.28  |  In range: YES
+    Outcome:     UP  |  Payout: $629.23
+    PnL:         $+287.44 (+84.10%)
+    Reason:      p=0.6702 sig=3.00e-05 z=0.54 tau=628s edge=0.1252 thresh=0.0801 spread=0.010 kelly=0.2908 $337
+------------------------------------------------------------------------
+  btc-updown-15m-1775229300
+    Side:        DOWN  |  Time left: 13:13
+    Entry price: 0.712907  (fee/sh: 0.004127)
+    Shares:      498.44  |  Cost: $355.34
+    BTC at fill:  $66,908.10  |  Start: $66,960.38
+    Expected:     $66,903.83 - $67,016.92 (1-sigma)
+    Final BTC:    $66,921.17  |  In range: YES
+    Outcome:     DOWN  |  Payout: $498.44
+    PnL:         $+143.10 (+40.27%)
+    Reason:      p=0.1817 sig=3.00e-05 z=-0.92 tau=793s edge=0.1041 thresh=0.0851 spread=0.010 kelly=0.3856 $351
+------------------------------------------------------------------------
+  btc-updown-15m-1775230200
+    Side:        DOWN  |  Time left: 11:30
+    Entry price: 0.746340  (fee/sh: 0.003823)
+    Shares:      487.99  |  Cost: $364.20
+    BTC at fill:  $66,870.83  |  Start: $66,922.79
+    Expected:     $66,870.07 - $66,975.50 (1-sigma)
+    Final BTC:    $66,849.39  |  In range: NO
+    Outcome:     DOWN  |  Payout: $487.99
+    PnL:         $+123.78 (+33.99%)
+    Reason:      p=0.1731 sig=3.00e-05 z=-0.98 tau=690s edge=0.0830 thresh=0.0820 spread=0.010 kelly=0.3496 $358
+------------------------------------------------------------------------
+  btc-updown-15m-1775231100
+    Side:        DOWN  |  Time left: 13:17
+    Entry price: 0.578502  (fee/sh: 0.004891)
+    Shares:      644.94  |  Cost: $373.10
+    BTC at fill:  $66,815.51  |  Start: $66,849.49
+    Expected:     $66,792.88 - $66,906.10 (1-sigma)
+    Final BTC:    $66,824.77  |  In range: YES
+    Outcome:     DOWN  |  Payout: $644.94
+    PnL:         $+271.84 (+72.86%)
+    Reason:      p=0.3072 sig=3.00e-05 z=-0.60 tau=798s edge=0.1079 thresh=0.0852 spread=0.020 kelly=0.2940 $364
+------------------------------------------------------------------------
+  btc-updown-15m-1775234700
+    Side:        DOWN  |  Time left: 11:40
+    Entry price: 0.492492  (fee/sh: 0.004996)
+    Shares:      795.68  |  Cost: $391.87
+    BTC at fill:  $66,955.21  |  Start: $66,969.94
+    Expected:     $66,916.77 - $67,023.11 (1-sigma)
+    Final BTC:    $67,001.79  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-391.87 (-100.00%)
+    Reason:      p=0.3747 sig=3.00e-05 z=-0.28 tau=701s edge=0.1403 thresh=0.0824 spread=0.010 kelly=0.2864 $378
+------------------------------------------------------------------------
+  btc-updown-15m-1775237400
+    Side:        DOWN  |  Time left: 5:12
+    Entry price: 0.595667  (fee/sh: 0.004835)
+    Shares:      601.02  |  Cost: $358.01
+    BTC at fill:  $66,853.73  |  Start: $66,873.40
+    Expected:     $66,837.98 - $66,908.83 (1-sigma)
+    Final BTC:    $66,893.14  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-358.01 (-100.00%)
+    Reason:      p=0.3243 sig=3.00e-05 z=-0.56 tau=312s edge=0.0708 thresh=0.0683 spread=0.010 kelly=0.1995 $358
+------------------------------------------------------------------------
+  btc-updown-15m-1775241000
+    Side:        UP  |  Time left: 6:59
+    Entry price: 0.531244  (fee/sh: 0.004984)
+    Shares:      610.90  |  Cost: $324.54
+    BTC at fill:  $66,885.44  |  Start: $66,876.71
+    Expected:     $66,835.62 - $66,917.79 (1-sigma)
+    Final BTC:    $66,849.87  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-324.54 (-100.00%)
+    Reason:      p=0.6046 sig=3.00e-05 z=0.21 tau=419s edge=0.0796 thresh=0.0728 spread=0.010 kelly=0.1848 $315
+------------------------------------------------------------------------
+  btc-updown-15m-1775242800
+    Side:        DOWN  |  Time left: 3:25
+    Entry price: 0.731735  (fee/sh: 0.003959)
+    Shares:      454.01  |  Cost: $332.21
+    BTC at fill:  $66,781.85  |  Start: $66,807.37
+    Expected:     $66,778.67 - $66,836.07 (1-sigma)
+    Final BTC:    $66,771.09  |  In range: NO
+    Outcome:     DOWN  |  Payout: $454.01
+    PnL:         $+121.79 (+36.66%)
+    Reason:      p=0.1918 sig=3.00e-05 z=-0.89 tau=205s edge=0.0841 thresh=0.0629 spread=0.010 kelly=0.3291 $324
+------------------------------------------------------------------------
+  btc-updown-15m-1775246400
+    Side:        DOWN  |  Time left: 5:02
+    Entry price: 0.525817  (fee/sh: 0.004990)
+    Shares:      641.37  |  Cost: $337.24
+    BTC at fill:  $66,861.16  |  Start: $66,877.78
+    Expected:     $66,842.90 - $66,912.66 (1-sigma)
+    Final BTC:    $66,893.09  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-337.24 (-100.00%)
+    Reason:      p=0.3404 sig=3.00e-05 z=-0.48 tau=302s edge=0.1346 thresh=0.0678 spread=0.010 kelly=0.2982 $330
+------------------------------------------------------------------------
+  btc-updown-15m-1775247300
+    Side:        UP  |  Time left: 12:41
+    Entry price: 0.473101  (fee/sh: 0.004977)
+    Shares:      688.96  |  Cost: $325.95
+    BTC at fill:  $66,896.17  |  Start: $66,892.18
+    Expected:     $66,836.79 - $66,947.57 (1-sigma)
+    Final BTC:    $66,874.11  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-325.95 (-100.00%)
+    Reason:      p=0.5641 sig=3.00e-05 z=0.07 tau=762s edge=0.0992 thresh=0.0842 spread=0.010 kelly=0.2003 $313
+------------------------------------------------------------------------
+  btc-updown-15m-1775248200
+    Side:        UP  |  Time left: 10:07
+    Entry price: 0.432727  (fee/sh: 0.004895)
+    Shares:      699.38  |  Cost: $302.64
+    BTC at fill:  $66,875.26  |  Start: $66,874.07
+    Expected:     $66,824.62 - $66,923.51 (1-sigma)
+    Final BTC:    $66,881.44  |  In range: YES
+    Outcome:     UP  |  Payout: $699.38
+    PnL:         $+396.74 (+131.09%)
+    Reason:      p=0.5558 sig=3.00e-05 z=0.02 tau=607s edge=0.1209 thresh=0.0794 spread=0.010 kelly=0.2277 $297
+------------------------------------------------------------------------
+  btc-updown-15m-1775250900
+    Side:        UP  |  Time left: 10:02
+    Entry price: 0.414307  (fee/sh: 0.004835)
+    Shares:      783.06  |  Cost: $324.43
+    BTC at fill:  $66,918.02  |  Start: $66,905.84
+    Expected:     $66,856.56 - $66,955.11 (1-sigma)
+    Final BTC:    $66,875.25  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-324.43 (-100.00%)
+    Reason:      p=0.6092 sig=3.00e-05 z=0.25 tau=602s edge=0.1944 thresh=0.0793 spread=0.010 kelly=0.3434 $317
+------------------------------------------------------------------------
+  btc-updown-15m-1775251800
+    Side:        UP  |  Time left: 5:03
+    Entry price: 0.670856  (fee/sh: 0.004442)
+    Shares:      318.02  |  Cost: $213.35
+    BTC at fill:  $66,919.66  |  Start: $66,887.41
+    Expected:     $66,852.44 - $66,922.37 (1-sigma)
+    Final BTC:    $66,936.66  |  In range: NO
+    Outcome:     UP  |  Payout: $318.02
+    PnL:         $+104.67 (+49.06%)
+    Reason:      p=0.7800 sig=3.00e-05 z=0.92 tau=303s edge=0.1154 thresh=0.0679 spread=0.010 kelly=0.3630 $301
+------------------------------------------------------------------------
+  btc-updown-15m-1775252700
+    Side:        UP  |  Time left: 3:41
+    Entry price: 0.503654  (fee/sh: 0.004999)
+    Shares:      522.27  |  Cost: $263.04
+    BTC at fill:  $66,939.22  |  Start: $66,936.65
+    Expected:     $66,906.74 - $66,966.56 (1-sigma)
+    Final BTC:    $66,959.17  |  In range: YES
+    Outcome:     UP  |  Payout: $522.27
+    PnL:         $+259.23 (+98.55%)
+    Reason:      p=0.5803 sig=3.00e-05 z=0.09 tau=222s edge=0.0753 thresh=0.0638 spread=0.010 kelly=0.1690 $259
+------------------------------------------------------------------------
+  btc-updown-15m-1775255400
+    Side:        UP  |  Time left: 13:44
+    Entry price: 0.484415  (fee/sh: 0.004991)
+    Shares:      671.51  |  Cost: $325.29
+    BTC at fill:  $66,924.99  |  Start: $66,916.67
+    Expected:     $66,859.01 - $66,974.33 (1-sigma)
+    Final BTC:    $66,925.36  |  In range: YES
+    Outcome:     UP  |  Payout: $671.51
+    PnL:         $+346.22 (+106.43%)
+    Reason:      p=0.5802 sig=3.00e-05 z=0.14 tau=825s edge=0.0953 thresh=0.0859 spread=0.010 kelly=0.2005 $319
+------------------------------------------------------------------------
+  btc-updown-15m-1775257200
+    Side:        UP  |  Time left: 6:53
+    Entry price: 0.502699  (fee/sh: 0.004998)
+    Shares:      645.81  |  Cost: $324.65
+    BTC at fill:  $66,889.95  |  Start: $66,885.36
+    Expected:     $66,844.56 - $66,926.16 (1-sigma)
+    Final BTC:    $66,877.47  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-324.65 (-100.00%)
+    Reason:      p=0.5809 sig=3.00e-05 z=0.11 tau=413s edge=0.0859 thresh=0.0725 spread=0.010 kelly=0.1863 $313
+------------------------------------------------------------------------
+  btc-updown-15m-1775258100
+    Side:        DOWN  |  Time left: 10:03
+    Entry price: 0.533794  (fee/sh: 0.004978)
+    Shares:      177.15  |  Cost: $94.56
+    BTC at fill:  $66,849.71  |  Start: $66,867.31
+    Expected:     $66,818.04 - $66,916.58 (1-sigma)
+    Final BTC:    $66,854.97  |  In range: YES
+    Outcome:     DOWN  |  Payout: $177.15
+    PnL:         $+82.59 (+87.34%)
+    Reason:      p=0.3590 sig=3.00e-05 z=-0.36 tau=604s edge=0.1060 thresh=0.0793 spread=0.020 kelly=0.2598 $320
+------------------------------------------------------------------------
+  btc-updown-15m-1775259000
+    Side:        UP  |  Time left: 10:02
+    Entry price: 0.544037  (fee/sh: 0.004966)
+    Shares:      617.46  |  Cost: $335.92
+    BTC at fill:  $66,891.95  |  Start: $66,852.62
+    Expected:     $66,803.37 - $66,901.87 (1-sigma)
+    Final BTC:    $66,862.20  |  In range: YES
+    Outcome:     UP  |  Payout: $617.46
+    PnL:         $+281.54 (+83.81%)
+    Reason:      p=0.7483 sig=3.00e-05 z=0.80 tau=602s edge=0.2133 thresh=0.0793 spread=0.010 kelly=0.4701 $324
+------------------------------------------------------------------------
+  btc-updown-15m-1775261700
+    Side:        DOWN  |  Time left: 7:58
+    Entry price: 0.577980  (fee/sh: 0.004890)
+    Shares:      609.50  |  Cost: $352.28
+    BTC at fill:  $66,885.97  |  Start: $66,903.25
+    Expected:     $66,859.36 - $66,947.14 (1-sigma)
+    Final BTC:    $66,909.78  |  In range: YES
+    Outcome:     UP  |  Payout: $0.00
+    PnL:         $-352.28 (-100.00%)
+    Reason:      p=0.3535 sig=3.00e-05 z=-0.39 tau=478s edge=0.0816 thresh=0.0750 spread=0.010 kelly=0.2057 $338
+------------------------------------------------------------------------
+  btc-updown-15m-1775265300
+    Side:        DOWN  |  Time left: 5:03
+    Entry price: 0.302254  (fee/sh: 0.004181)
+    Shares:      305.90  |  Cost: $92.46
+    BTC at fill:  $66,844.14  |  Start: $66,851.22
+    Expected:     $66,816.31 - $66,886.13 (1-sigma)
+    Final BTC:    $66,836.35  |  In range: YES
+    Outcome:     DOWN  |  Payout: $305.90
+    PnL:         $+213.44 (+230.85%)
+    Reason:      p=0.5094 sig=3.00e-05 z=-0.20 tau=303s edge=0.1965 thresh=0.0679 spread=0.010 kelly=0.2885 $321
+------------------------------------------------------------------------
+  btc-updown-15m-1775266200
+    Side:        DOWN  |  Time left: 14:39
+    Entry price: 0.396940  (fee/sh: 0.004766)
+    Shares:      771.37  |  Cost: $306.19
+    BTC at fill:  $66,827.74  |  Start: $66,837.86
+    Expected:     $66,778.39 - $66,897.32 (1-sigma)
+    Final BTC:    $66,826.90  |  In range: YES
+    Outcome:     DOWN  |  Payout: $771.37
+    PnL:         $+465.18 (+151.93%)
+    Reason:      p=0.5051 sig=3.00e-05 z=-0.17 tau=880s edge=0.1002 thresh=0.0875 spread=0.010 kelly=0.1791 $297
+------------------------------------------------------------------------
+  btc-updown-15m-1775269800
+    Side:        UP  |  Time left: 0:02
+    Entry price: 0.244607  (fee/sh: 0.003654)
+    Shares:      45.65  |  Cost: $11.17
+    BTC at fill:  $66,836.96  |  Start: $66,827.80
+    Expected:     $66,824.88 - $66,830.72 (1-sigma)
+    Final BTC:    $66,825.01  |  In range: YES
+    Outcome:     DOWN  |  Payout: $0.00
+    PnL:         $-11.17 (-100.00%)
+    Reason:      p=0.8051 sig=3.00e-05 z=1.00(cap) tau=2s edge=0.5716 thresh=0.0423 spread=0.010 kelly=0.7490 $355
+------------------------------------------------------------------------
+  btc-updown-15m-1775421000
+    Side:        UP  |  Time left: 14:22
+    Entry price: 0.437721  (fee/sh: 0.004909)
+    Shares:      813.98  |  Cost: $356.29
+    BTC at fill:  $67,464.85  |  Start: $67,462.82
+    Expected:     $67,370.25 - $67,555.39 (1-sigma)
+    Final BTC:    $67,540.33  |  In range: YES
+    Outcome:     UP  |  Payout: $813.98
+    PnL:         $+457.68 (+128.46%)
+    Reason:      p=0.6010 sig=4.67e-05 z=0.19 tau=862s edge=0.1561 thresh=0.0870 spread=0.010 kelly=0.2940 $354
+------------------------------------------------------------------------
+
+==============================================================
+  BACKTEST SUMMARY: diffusion
+==============================================================
+  Bankroll:       $10,000 -> $7,537.68
+  Latency:        0ms  |  Slippage: 0.0
+  Trades:         79
+  Win rate:       54.4%
+  Total PnL:      $-2462.32
+  Total fees:     $252.78
+  Avg PnL/trade:  $-31.17
+  Avg win:        $+274.75
+  Avg loss:       $-396.57
+  Max drawdown:   $5373.39 (47.5%)
+  Sharpe (ann.):  -0.85
+==============================================================
+
+==============================================================
+  WALK-FORWARD COMPARISON: diffusion
+==============================================================
+  Metric                   TRAIN (in-sample)  TEST (out-of-sample)
+  --------------------------------------------------------------
+  Windows                               2033                   872
+  Trades fired                           375                    79
+  Win rate                             60.8%                 54.4%
+  Total PnL                             $-51               $-2,462
+  Bankroll end                        $9,949                $7,538
+  Sharpe (ann.)                        -0.00                 -0.85
+  Max drawdown                         50.1%                 47.5%
+==============================================================
+
+  Verdict: ✗ NO EDGE — win rate below 50% out-of-sample
+

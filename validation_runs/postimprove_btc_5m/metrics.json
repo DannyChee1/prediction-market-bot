@@ -1,0 +1,49 @@
+{
+  "train": {
+    "signal": "diffusion",
+    "latency_ms": 0,
+    "slippage": 0.0,
+    "initial_bankroll": 10000.0,
+    "final_bankroll": 10941.851470468053,
+    "n_trades": 655,
+    "total_pnl": 941.85,
+    "total_fees": 1708.37,
+    "win_rate": 0.5954,
+    "avg_pnl": 1.44,
+    "avg_win": 227.04,
+    "avg_loss": -330.58,
+    "max_drawdown": 7083.8,
+    "max_dd_pct": 0.7084,
+    "sharpe": 0.05,
+    "sharpe_deflated": 0.05,
+    "n_trials": 1,
+    "n_windows": 9940
+  },
+  "test": {
+    "signal": "diffusion",
+    "latency_ms": 0,
+    "slippage": 0.0,
+    "initial_bankroll": 10000.0,
+    "final_bankroll": 6792.5640096695315,
+    "n_trades": 285,
+    "total_pnl": -3207.44,
+    "total_fees": 816.89,
+    "win_rate": 0.5684,
+    "avg_pnl": -11.25,
+    "avg_win": 240.12,
+    "avg_loss": -342.33,
+    "max_drawdown": 7119.38,
+    "max_dd_pct": 0.582,
+    "sharpe": -0.35,
+    "sharpe_deflated": -0.35,
+    "n_trials": 1,
+    "n_windows": 4260
+  },
+  "args": {
+    "market": "btc_5m",
+    "tag": "postimprove",
+    "bankroll": 10000.0,
+    "train_frac": 0.7,
+    "seed": 42
+  }
+}

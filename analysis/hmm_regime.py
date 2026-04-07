@@ -36,8 +36,10 @@ from sklearn.preprocessing import StandardScaler
 
 DATA_DIR      = Path("data")
 VOL_LOOKBACK  = 90
-# "Early" tau: use first available checkpoint ≥600s (window has ≥600s left)
-EARLY_TAU     = 700   # target tau for early z-score
+# "Early" tau: target tau for early z-score. Default 700 = ~200s into a
+# 15m window. Override per-market for 5m markets where tau never reaches
+# 700 by passing `early_tau` to window_features() / load_all_windows().
+EARLY_TAU     = 700
 MAX_Z         = 1.5
 
 
@@ -61,12 +63,16 @@ def compute_sigma(prices: list[float], timestamps: list[int]) -> float:
     return float(np.std(log_rets, ddof=1))
 
 
-def window_features(df: pd.DataFrame) -> dict | None:
+def window_features(df: pd.DataFrame, early_tau: float = EARLY_TAU) -> dict | None:
     """
     Extract feature vector for one window.
 
     All input features are observable before the window ends.
     Outcome is computed for analysis only — never used as an HMM input.
+
+    `early_tau` lets the caller pick the seconds-remaining target for
+    the early-z feature; defaults to the module-level EARLY_TAU=700
+    (correct for 15m windows). For 5m windows pass ~200.
     """
     if "chainlink_btc" in df.columns and "chainlink_price" not in df.columns:
         df = df.rename(columns={"chainlink_btc": "chainlink_price"})
@@ -98,9 +104,9 @@ def window_features(df: pd.DataFrame) -> dict | None:
     sigma_full = compute_sigma(prices, ts_list)
     vol_regime = sigma_full / sigma_first if (sigma_first > 0 and sigma_full > 0) else 1.0
 
-    # ── Feature 3: early z-score at tau ≈ EARLY_TAU (no future info) ─────────
-    best_idx = min(range(len(tau_all)), key=lambda i: abs(tau_all[i] - EARLY_TAU))
-    if abs(tau_all[best_idx] - EARLY_TAU) > 60:
+    # ── Feature 3: early z-score at tau ≈ early_tau (no future info) ────────
+    best_idx = min(range(len(tau_all)), key=lambda i: abs(tau_all[i] - early_tau))
+    if abs(tau_all[best_idx] - early_tau) > 60:
         return None   # window too short to have early signal
     lo     = max(0, best_idx - VOL_LOOKBACK)
     sigma_e = compute_sigma(prices[lo:best_idx+1], ts_list[lo:best_idx+1])
@@ -147,13 +153,14 @@ def window_features(df: pd.DataFrame) -> dict | None:
     }
 
 
-def load_all_windows(subdir: Path) -> list[dict]:
+def load_all_windows(subdir: Path,
+                     early_tau: float = EARLY_TAU) -> list[dict]:
     rows = []
     for f in sorted(subdir.glob("*.parquet")):
         df = pd.read_parquet(f)
         if df.empty:
             continue
-        feat = window_features(df)
+        feat = window_features(df, early_tau=early_tau)
         if feat:
             rows.append(feat)
     rows.sort(key=lambda r: r["window_ts"])

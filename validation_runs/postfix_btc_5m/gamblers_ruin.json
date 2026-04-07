@@ -1,0 +1,33 @@
+{
+  "n_trades": 316,
+  "p_win": 0.5854430379746836,
+  "avg_win_usd": 269.0081081081081,
+  "avg_loss_usd": 373.3098473282443,
+  "ev_per_trade_usd": 2.730727848101253,
+  "r_favorability": 0.9826608260576895,
+  "favorable": true,
+  "initial_bankroll_usd": 10000.0,
+  "units_initial": 27,
+  "ruin_by_target": {
+    "target_1.5x": {
+      "units_initial": 27,
+      "units_target": 40,
+      "p_ruin": 8.866937277165621e-05
+    },
+    "target_2.0x": {
+      "units_initial": 27,
+      "units_target": 54,
+      "p_ruin": 8.967045443450497e-05
+    },
+    "target_5.0x": {
+      "units_initial": 27,
+      "units_target": 134,
+      "p_ruin": 8.967849594598944e-05
+    },
+    "target_10.0x": {
+      "units_initial": 27,
+      "units_target": 268,
+      "p_ruin": 8.967849594598945e-05
+    }
+  }
+}

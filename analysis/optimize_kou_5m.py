@@ -109,11 +109,17 @@ def preload_windows(vol_lookback_s: int = 90, sample_every: int = 30):
 
 
 def evaluate_params(windows, lam, p_up, eta1, eta2, max_z=1.0, n_bins=10):
-    """Evaluate Kou params on preloaded windows. Returns (brier, ece, logloss)."""
-    q_dn = 1.0 - p_up
-    zeta = (p_up * eta1 / max(eta1 - 1, 0.01)
-            + q_dn * eta2 / (eta2 + 1) - 1.0)
+    """Evaluate Kou params on preloaded windows. Returns (brier, ece, logloss).
 
+    NOTE: After fixing the Kou risk-neutral drift bug in `_model_cdf`, the
+    "kou" tail mode in the live model is just `norm_cdf(z)` (sigma is treated
+    as total realized vol). The (lam, p_up, eta1, eta2) arguments here have
+    no effect on the prediction — we keep the signature so existing call
+    sites still work, but every (lam, p_up, eta1, eta2) combination produces
+    identical Brier/ECE/LogLoss for the same z's. Use this script to verify
+    the calibration of the *no-drift* Kou path; do not use it to "search"
+    for an optimal lambda — there isn't one anymore.
+    """
     preds = []
     actuals = []
 
@@ -122,8 +128,8 @@ def evaluate_params(windows, lam, p_up, eta1, eta2, max_z=1.0, n_bins=10):
             z_raw = delta / (sigma * math.sqrt(tau))
             z_capped = max(-max_z, min(max_z, z_raw))
 
-            drift_z = -lam * zeta * math.sqrt(tau) / max(sigma, 1e-8)
-            p_gbm = norm_cdf(z_capped + drift_z)
+            # Live model: norm_cdf(z) with sigma as total vol — no drift.
+            p_gbm = norm_cdf(z_capped)
 
             preds.append(p_gbm)
             actuals.append(w.outcome)
@@ -156,11 +162,12 @@ def evaluate_params(windows, lam, p_up, eta1, eta2, max_z=1.0, n_bins=10):
 
 
 def get_bin_details(windows, lam, p_up, eta1, eta2, max_z=1.0, n_bins=10):
-    """Get per-bin calibration details for a param set."""
-    q_dn = 1.0 - p_up
-    zeta = (p_up * eta1 / max(eta1 - 1, 0.01)
-            + q_dn * eta2 / (eta2 + 1) - 1.0)
+    """Get per-bin calibration details for a param set.
 
+    See note on `evaluate_params` — the (lam, p_up, eta1, eta2) inputs are
+    unused now that the Kou drift bug has been fixed; keeping the signature
+    only for call-site compatibility.
+    """
     preds = []
     actuals = []
 
@@ -168,8 +175,7 @@ def get_bin_details(windows, lam, p_up, eta1, eta2, max_z=1.0, n_bins=10):
         for delta, sigma, tau in w.observations:
             z_raw = delta / (sigma * math.sqrt(tau))
             z_capped = max(-max_z, min(max_z, z_raw))
-            drift_z = -lam * zeta * math.sqrt(tau) / max(sigma, 1e-8)
-            p_gbm = norm_cdf(z_capped + drift_z)
+            p_gbm = norm_cdf(z_capped)
             preds.append(p_gbm)
             actuals.append(w.outcome)
 
@@ -195,10 +201,23 @@ def main():
           f"{sum(len(w.observations) for w in windows)} observations")
     print(f"UP rate: {sum(w.outcome for w in windows) / len(windows):.1%}\n")
 
-    # Current params for reference
+    # Read CURRENT params from market_config so this can never go stale
+    # again (it previously hard-coded lambda=0.100 while config had 0.007).
+    from market_config import MARKET_CONFIGS
+    cfg = MARKET_CONFIGS["btc_5m"]
+    cur_lam, cur_pup = cfg.kou_lambda, cfg.kou_p_up
+    cur_e1, cur_e2 = cfg.kou_eta1, cfg.kou_eta2
+
     print("=" * 70)
-    print("CURRENT PARAMS: lambda=0.100, p_up=0.526, eta1=1254.1, eta2=1200.5")
-    b, e, l = evaluate_params(windows, 0.100, 0.526, 1254.1, 1200.5)
+    print(f"CURRENT PARAMS (from market_config): "
+          f"lambda={cur_lam}, p_up={cur_pup}, eta1={cur_e1}, eta2={cur_e2}")
+    print("NOTE: After the Kou drift bug fix, the live `_model_cdf` ignores "
+          "the (lam, p_up, eta1, eta2)\nKou parameters and just returns "
+          "norm_cdf(z). The Brier/ECE/LogLoss numbers below will\ntherefore "
+          "be identical for every parameter combination — there is no "
+          "lambda to tune. This\nscript is kept only as a calibration sanity "
+          "check on the now-bug-free Kou path.")
+    b, e, l = evaluate_params(windows, cur_lam, cur_pup, cur_e1, cur_e2)
     print(f"  Brier={b:.4f}  ECE={e:.4f}  LogLoss={l:.4f}")
     print()
 
@@ -298,8 +317,8 @@ def main():
     final_e1 = best_eta[0]
     final_e2 = best_eta[1]
 
-    print(f"\n  CURRENT:   lambda=0.100, p_up=0.526, eta1=1254.1, eta2=1200.5")
-    b_old, e_old, l_old = evaluate_params(windows, 0.100, 0.526, 1254.1, 1200.5)
+    print(f"\n  CURRENT:   lambda={cur_lam}, p_up={cur_pup}, eta1={cur_e1}, eta2={cur_e2}")
+    b_old, e_old, l_old = evaluate_params(windows, cur_lam, cur_pup, cur_e1, cur_e2)
     print(f"             Brier={b_old:.4f}  ECE={e_old:.4f}  LogLoss={l_old:.4f}")
 
     print(f"\n  NO JUMPS:  lambda=0 (pure Normal CDF)")
@@ -340,8 +359,8 @@ def main():
     axes[0].plot(lams_all, eces_all, "o-", color="steelblue", linewidth=2)
     axes[0].axvline(final_lam, color="green", linestyle="--", alpha=0.7,
                      label=f"Optimal={final_lam:.4f}")
-    axes[0].axvline(0.100, color="red", linestyle="--", alpha=0.7,
-                     label="Current=0.100")
+    axes[0].axvline(cur_lam, color="red", linestyle="--", alpha=0.7,
+                     label=f"Current={cur_lam}")
     axes[0].set_xlabel("kou_lambda")
     axes[0].set_ylabel("ECE")
     axes[0].set_title("Lambda vs ECE (BTC 5m)")
@@ -350,7 +369,7 @@ def main():
 
     # Reliability: old vs new
     for ax_idx, (label, lam, pu, e1, e2, color) in enumerate([
-        ("Current", 0.100, 0.526, 1254.1, 1200.5, "red"),
+        ("Current", cur_lam, cur_pup, cur_e1, cur_e2, "red"),
         ("Optimized", final_lam, final_pup, final_e1, final_e2, "green"),
     ]):
         rows, preds, actuals = get_bin_details(windows, lam, pu, e1, e2)

@@ -16,4 +16,7 @@ rust/*.dll
 rust/*.dll.a
 rust/*.d
 Claude.md
+.DS_Store
+dashboard_paper_trades.jsonl
+dashboard_lag_history.jsonl
 

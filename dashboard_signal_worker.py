@@ -102,6 +102,7 @@ def _signal_kwargs(mkey: str, settings: dict) -> tuple[dict, dict]:
     signal_kw["kou_eta1"] = config.kou_eta1
     signal_kw["kou_eta2"] = config.kou_eta2
     signal_kw["market_blend"] = config.market_blend
+    signal_kw["max_book_age_ms"] = config.max_book_age_ms
     signal_kw["slippage"] = float(settings["slippage"])
     signal_kw["inventory_skew"] = 0.02
     signal_kw["maker_warmup_s"] = 30.0 if is_5m else 200.0

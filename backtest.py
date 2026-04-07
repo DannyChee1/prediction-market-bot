@@ -924,6 +924,10 @@ class DiffusionSignal(Signal):
         # Direct p_model blend with contract mid (anti-fade-the-market)
         # Applied AFTER _p_model() for any tail_mode. 0=off, 0.3=BTC 5m default.
         market_blend: float = 0.0,
+        # Stale-book gate: skip trades when book WS data is older than this.
+        # Live data shows trades during book WS disconnects (book_age >1s) win
+        # 25% vs 58% for fresh-book trades. None=off, 1000=BTC 5m default.
+        max_book_age_ms: float | None = None,
         # Avellaneda-Stoikov unified quoting mode
         as_mode: bool = False,
         gamma_inv: float = 0.15,       # risk aversion for inventory penalty
@@ -1010,6 +1014,7 @@ class DiffusionSignal(Signal):
         self.kou_eta2 = kou_eta2
         self.market_blend_alpha = market_blend_alpha
         self.market_blend = market_blend
+        self.max_book_age_ms = max_book_age_ms
         self.as_mode = as_mode
         self.gamma_inv = gamma_inv
         self.gamma_spread = gamma_spread
@@ -1826,6 +1831,18 @@ class DiffusionSignal(Signal):
             reason = "invalid asks"
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
+
+        # Stale-book gate: don't trade against a book older than max_book_age_ms.
+        # The book WS occasionally drops and reconnects; during the gap the bot
+        # is making decisions on minutes-old prices. Live data shows these
+        # stale-book trades win 25% (vs 58% fresh) and lose ~$ for $.
+        if self.max_book_age_ms is not None:
+            book_age = ctx.get("_book_age_ms")
+            if book_age is not None and book_age > self.max_book_age_ms:
+                reason = f"stale book ({book_age:.0f}ms > {self.max_book_age_ms}ms)"
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+
         self._record_book_state(snapshot, ctx)
 
         # Spread gate

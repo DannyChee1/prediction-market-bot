@@ -3330,6 +3330,7 @@ def build_diffusion_signal(
     min_z: float = 0.0,
     maker: bool = False,
     use_regime_classifier: bool = True,
+    market_blend_override: float | None = None,
 ):
     """Construct the production DiffusionSignal for a given market.
 
@@ -3400,6 +3401,11 @@ def build_diffusion_signal(
         except (ImportError, FileNotFoundError):
             regime_classifier = None
 
+    # market_blend: pull from config by default, allow explicit override for A/B
+    effective_blend = (market_blend_override
+                       if market_blend_override is not None
+                       else config.market_blend)
+
     return DiffusionSignal(
         bankroll=bankroll,
         slippage=slippage,
@@ -3420,6 +3426,7 @@ def build_diffusion_signal(
         kou_p_up=config.kou_p_up,
         kou_eta1=config.kou_eta1,
         kou_eta2=config.kou_eta2,
+        market_blend=effective_blend,
         max_book_age_ms=config.max_book_age_ms,
         max_chainlink_age_ms=config.max_chainlink_age_ms,
         max_binance_age_ms=config.max_binance_age_ms,
@@ -3467,6 +3474,10 @@ def main():
     parser.add_argument("--min-z", type=float, default=0.0,
                         help="Minimum |z-score| to enter a trade (default 0.0 = disabled, "
                              "recommended 0.7 based on walk-forward analysis)")
+    parser.add_argument("--market-blend", type=float, default=None,
+                        help="Override market_blend from config (0.0 = pure model, "
+                             "0.5 = 50/50, 1.0 = pure market consensus). "
+                             "If omitted, uses config value (btc_5m=0.3, btc=0.0).")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -3502,6 +3513,7 @@ def main():
             cross_asset_min_z=args.cross_asset_min_z,
             min_z=args.min_z,
             maker=args.maker,
+            market_blend_override=args.market_blend,
         ),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

@@ -63,6 +63,16 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         binance_symbol="btcusdt",
         tail_mode="kou",
         tail_nu_default=20.0,
+        # Market-blend: post-fix 50-day backfill (14k BTC 5m / 4.7k BTC 15m
+        # REST + live windows) sweep showed BTC 15m Sharpe climbs from 0.61
+        # @ blend=0.0 to 1.36 @ blend=0.5 (+123%), max drawdown drops from
+        # 11.7% to 4.7%, with only a ~50% trade-count reduction (1294 → 620
+        # test trades). Post-fix model still benefits from market-consensus
+        # smoothing even though the Kou drift bug is gone — the 15m window
+        # gives the model more time to drift away from market mid before
+        # resolution, and pulling it back toward mid at entry nets a big
+        # Sharpe win. See tasks/findings/post_fix_revalidation_2026-04-07.md.
+        market_blend=0.5,
         # σ estimator: A/B test (validation_runs/sigma_estimators/btc.json)
         # showed EWMA has 26% lower 1-step forecast MSE than YZ. BUT a
         # second ablation (validation_runs/ablation_btc.json) showed that

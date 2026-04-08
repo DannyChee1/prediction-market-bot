@@ -35,6 +35,18 @@ MIN_FINAL_REMAINING_S = 5.0
 # Skip windows where recording started more than this many seconds late
 MAX_START_GAP_S = 30.0
 
+# Adaptive sigma floor: short-window σ (vol_lookback_s) cannot drop below
+# MIN_SIGMA_RATIO × long-window σ (vol_regime_lookback_s). Prevents the
+# "sigma collapse" pattern where 90s realized variance briefly bottoms out
+# during a quiet sub-period of an otherwise volatile session, which would
+# otherwise blow up z = delta / (sigma · √τ) and spike p_model into the
+# max_z cap for one tick. Empirically, the worst spikes saw 8-20× σ drops
+# in a single 60s diagnostic interval; 0.5 keeps the short window
+# responsive but anchors it to the longer baseline so single-tick spikes
+# can't fire trades. Disabled when the long-window baseline isn't yet
+# computable (history < vol_regime_lookback_s).
+MIN_SIGMA_RATIO = 0.5
+
 
 # ── Fee & math helpers ──────────────────────────────────────────────────────
 
@@ -1925,12 +1937,26 @@ class DiffusionSignal(Signal):
         raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
 
         # Vol regime filter: compare recent vol to longer baseline
+        sigma_baseline = 0.0
         if len(hist) >= self.vol_regime_lookback_s:
             sigma_baseline = self._compute_vol(hist[-self.vol_regime_lookback_s:], ts_hist[-self.vol_regime_lookback_s:])
             if sigma_baseline > 0 and raw_sigma > self.vol_regime_mult * sigma_baseline:
                 return Decision("FLAT", 0.0, 0.0,
                     f"vol spike ({raw_sigma:.2e} > "
                     f"{self.vol_regime_mult}x baseline {sigma_baseline:.2e})")
+
+        # Adaptive sigma floor: prevent the short-window σ from dropping
+        # much below the long-window baseline. This stops the "sigma
+        # collapse" pattern where 90s realized variance briefly bottoms
+        # out during a quiet sub-period of an otherwise volatile session,
+        # which would otherwise blow up z = delta / (sigma · √τ) and
+        # spike p_model into the cap for one tick (causing rogue trades
+        # that disappear next tick when sigma recovers). Floor is
+        # MIN_SIGMA_RATIO * sigma_baseline.
+        if sigma_baseline > 0:
+            adaptive_floor = MIN_SIGMA_RATIO * sigma_baseline
+            if raw_sigma < adaptive_floor:
+                raw_sigma = adaptive_floor
 
         # EMA smoothing + asset cap
         sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
@@ -2353,6 +2379,7 @@ class DiffusionSignal(Signal):
         raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
 
         # Vol regime filter
+        sigma_baseline = 0.0
         if len(hist) >= self.vol_regime_lookback_s:
             sigma_baseline = self._compute_vol(hist[-self.vol_regime_lookback_s:], ts_hist[-self.vol_regime_lookback_s:])
             if sigma_baseline > 0 and raw_sigma > self.vol_regime_mult * sigma_baseline:
@@ -2360,6 +2387,12 @@ class DiffusionSignal(Signal):
                           f"{self.vol_regime_mult}x baseline {sigma_baseline:.2e})")
                 return (Decision("FLAT", 0.0, 0.0, reason),
                         Decision("FLAT", 0.0, 0.0, reason))
+
+        # Adaptive sigma floor (see decide() for explanation).
+        if sigma_baseline > 0:
+            adaptive_floor = MIN_SIGMA_RATIO * sigma_baseline
+            if raw_sigma < adaptive_floor:
+                raw_sigma = adaptive_floor
 
         # EMA smoothing + asset cap
         sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)

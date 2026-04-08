@@ -668,7 +668,31 @@ async def run_window(
         tracker._log_flat_summary()
         tracker.flat_reason_counts = {}
 
-    return (slug, price_state.get("price"), window_start_price, tracker.condition_id)
+    # CRITICAL: do NOT use price_state.get("price") for the final price.
+    # That returns the LAST chainlink update, which is up to 5 seconds
+    # AFTER window end (because of the +5s sleep above). In those 5s,
+    # chainlink can publish a new price that's different from what
+    # Polymarket actually settled on (Polymarket uses the price AT
+    # window end exactly, via the same Chainlink feed).
+    #
+    # Mirror the start-price logic from above: walk price_history
+    # for the LAST update at-or-before end_ts_ms.
+    end_ts_ms = int(end.timestamp() * 1000)
+    final_price_exact = None
+    history = price_state.get("price_history", [])
+    if history:
+        for ts_ms, px in history:
+            if ts_ms <= end_ts_ms:
+                final_price_exact = px
+            else:
+                break  # history is chronological — stop at first post-end entry
+    if final_price_exact is None:
+        # No in-window chainlink update — fall back to current price (rare)
+        final_price_exact = price_state.get("price")
+        print(f"  [{config.display_name}] WARNING: no in-window chainlink "
+              f"price for resolution, using current ${final_price_exact}")
+
+    return (slug, final_price_exact, window_start_price, tracker.condition_id)
 
 
 async def _resolve_background(

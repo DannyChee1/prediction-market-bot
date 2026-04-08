@@ -77,6 +77,61 @@ def realized_variance_per_s(prices: Sequence[float],
     return float(rets.std(ddof=1))
 
 
+def bipower_variation_per_s(prices: Sequence[float],
+                            ts: Sequence[int]) -> float:
+    """Jump-robust σ estimator via Barndorff-Nielsen-Shephard bipower variation.
+
+    Under the assumption of no jumps and Gaussian increments, the product
+    of consecutive absolute returns has expectation (2/π)·σ² — because
+    E[|X|·|Y|] = (2/π)·σ² when X, Y are independent N(0, σ²). So:
+
+        σ² ≈ (π/2) · mean(|r_i|·|r_{i−1}|)
+
+    Why it's jump-robust: a single jump contaminates ONE return but not
+    its neighbor. The product |r_i|·|r_{i−1}| therefore only inflates in
+    a single cross-term per jump, and averaging kills the contribution
+    as N → ∞. Realized variance, by contrast, squares the jump and keeps
+    the whole variance.
+
+    The continuous component of σ² separated this way is what a proper
+    jump-diffusion model (e.g. Kou) expects as its `sigma` input, so
+    jump variance isn't double-counted. The jump-variance component can
+    be recovered as `max(0, RV² − BV²)`.
+
+    Returns σ in per-second units, same convention as
+    `realized_variance_per_s`.
+
+    Reference: Barndorff-Nielsen & Shephard (2004),
+    "Power and Bipower Variation with Stochastic Volatility and Jumps",
+    J. Financial Econometrics 2(1): 1-37.
+    """
+    rets = _normalised_log_returns(prices, ts)
+    n = len(rets)
+    if n < 3:
+        return 0.0
+    # |r_i| · |r_{i-1}| over consecutive pairs
+    products = np.abs(rets[1:]) * np.abs(rets[:-1])
+    # Finite-sample debias factor N/(N-1) (unbiased under Gaussian)
+    bv = (math.pi / 2.0) * float(products.mean()) * (n / (n - 1))
+    return float(math.sqrt(max(bv, 0.0)))
+
+
+def jump_variance_per_s(prices: Sequence[float],
+                        ts: Sequence[int]) -> float:
+    """Estimate the jump component of variance in per-second units.
+
+    jump_var = max(0, RV² − BV²)
+
+    This is the standard BNS jump-variation estimator. Returns 0 if BV
+    exceeds RV (finite-sample noise) or if either estimator fails.
+    """
+    rv = realized_variance_per_s(prices, ts)
+    bv = bipower_variation_per_s(prices, ts)
+    if rv <= 0.0 or bv <= 0.0:
+        return 0.0
+    return float(max(0.0, rv * rv - bv * bv))
+
+
 def ewma_sigma_per_s(prices: Sequence[float], ts: Sequence[int],
                      lambda_: float = 0.94) -> float:
     """RiskMetrics-style EWMA σ:

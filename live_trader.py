@@ -1147,7 +1147,10 @@ def _build_tracker(
         exit_min_hold = 10.0
         exit_min_remaining = 20.0
 
-    max_trades = args.max_trades_per_window if args.max_trades_per_window is not None else 1
+    # Per-market max_trades_per_window (from config), CLI overrides
+    max_trades = (args.max_trades_per_window
+                  if args.max_trades_per_window is not None
+                  else config.max_trades_per_window)
 
     # Shared trades log and state file (named after base asset, not timeframe)
     trades_log = Path(f"live_trades_{base_market}.jsonl")
@@ -1163,6 +1166,7 @@ def _build_tracker(
         cooldown_ms=cooldown_ms,
         max_loss_pct=args.max_loss_pct,
         max_trades_per_window=max_trades,
+        same_direction_stacking_only=config.same_direction_stacking_only,
         stale_price_timeout_s=stale_timeout,
         window_duration_s=config.window_duration_s,
         edge_cancel_threshold=args.edge_cancel_threshold,
@@ -1197,6 +1201,14 @@ def _build_tracker(
         tracker.peak_bankroll = saved.get("peak_bankroll", bankroll)
         tracker.max_drawdown = saved.get("max_drawdown", 0.0)
         tracker.max_dd_pct = saved.get("max_dd_pct", 0.0)
+        # Restore trade history so the displayed PnL is lifetime, not
+        # session-since-restart. Without this, the bot's display PnL
+        # resets to $0 every restart even though `bankroll` reflects
+        # cumulative trades — confusing the operator about real returns.
+        saved_results = saved.get("all_results", [])
+        if saved_results:
+            tracker.all_results = LiveTradeTracker._restore_results(saved_results)
+            print(f"  [{config.display_name}] Restored {len(tracker.all_results)} prior trades from state")
 
     return tracker
 

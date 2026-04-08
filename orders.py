@@ -151,6 +151,7 @@ class OrderMixin:
                     })
                     self.window_trade_count += 1
                     self.position_count += 1
+                    self._record_window_fill_side(order["side"])
 
                     entry_px = order["price"]
                     self._event(
@@ -222,6 +223,7 @@ class OrderMixin:
                     })
                     self.window_trade_count += 1
                     self.position_count += 1
+                    self._record_window_fill_side(order["side"])
 
                     entry_px = order["price"]
                     self._event(
@@ -245,9 +247,20 @@ class OrderMixin:
                     })
                     return False
             except Exception as verify_exc:
+                # CRITICAL: do NOT refund or remove the order. The cancel
+                # API call succeeded, but we don't know whether Polymarket
+                # actually cancelled it OR matched it in the race window.
+                # Falling through to refund here used to lose ~$2-3 per
+                # event when the order had actually filled — the position
+                # would still exist on Polymarket but the bot would treat
+                # the funds as returned. Mark for re-verification on the
+                # next decision cycle and leave it in open_orders.
+                order["_verify_pending"] = True
+                order["_verify_pending_since"] = _time.time()
                 self._event(
                     f"[CANCEL WARNING] Could not verify "
-                    f"{order_id[:12]}...: {verify_exc}"
+                    f"{order_id[:12]}...: {verify_exc} — keeping order in "
+                    f"open_orders for re-verification"
                 )
                 self._log({
                     "type": "cancel_verify_failed",
@@ -256,7 +269,9 @@ class OrderMixin:
                     "side": order["side"],
                     "cost_est": round(order["cost_est"], 2),
                     "error": str(verify_exc),
+                    "action": "deferred_pending_reverify",
                 })
+                return False
 
         # Refund reserved bankroll
         self.bankroll += order["cost_est"]
@@ -448,6 +463,7 @@ class OrderMixin:
             self.last_fill_ts_ms = snapshot.ts_ms
             self.window_trade_count += 1
             self.position_count += 1
+            self._record_window_fill_side(side_label)
 
             entry_px = actual_cost / filled_shares if filled_shares > 0 else 0
             ms = model_snapshot
@@ -523,6 +539,7 @@ class OrderMixin:
                     self.last_fill_ts_ms = snapshot.ts_ms
                     self.window_trade_count += 1
                     self.position_count += 1
+                    self._record_window_fill_side(order["side"])
                     entry_px = actual_cost / order["shares"] if order["shares"] > 0 else 0
                     self._event(
                         f"[DRY FILL] {order['side']} {order['shares']:.1f}sh "
@@ -586,6 +603,7 @@ class OrderMixin:
                 self.last_fill_ts_ms = snapshot.ts_ms
                 self.window_trade_count += 1
                 self.position_count += 1
+                self._record_window_fill_side(order["side"])
 
                 entry_px = order["price"]
                 self._event(
@@ -645,6 +663,7 @@ class OrderMixin:
                 self.last_fill_ts_ms = snapshot.ts_ms
                 self.window_trade_count += 1
                 self.position_count += 1
+                self._record_window_fill_side(order["side"])
 
                 self._event(
                     f"[PARTIAL FILL] {order['side']} {new_fill_shares:.1f}sh "
@@ -744,6 +763,7 @@ class OrderMixin:
                 self.last_fill_ts_ms = snapshot.ts_ms
                 self.window_trade_count += 1
                 self.position_count += 1
+                self._record_window_fill_side(order["side"])
 
                 entry_px = order["price"]
                 self._event(

@@ -165,6 +165,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         cooldown_ms: int = 30_000,
         max_loss_pct: float = 50.0,
         max_trades_per_window: int = 1,
+        same_direction_stacking_only: bool = True,
         stale_price_timeout_s: float = 10.0,
         min_balance_usd: float = 5.0,
         window_duration_s: float = 900.0,
@@ -208,6 +209,11 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         # Failsafes
         self.max_loss_pct = max_loss_pct
         self.max_trades_per_window = max_trades_per_window
+        self.same_direction_stacking_only = same_direction_stacking_only
+        # Track first-trade side per window so subsequent trades can be
+        # restricted to the same direction (averaging in, not hedging).
+        # Reset on each new window. Set by _record_window_fill_side.
+        self.window_first_side: str | None = None
         self.stale_price_timeout_s = stale_price_timeout_s
         self.min_balance_usd = min_balance_usd
         self.circuit_breaker_tripped = False
@@ -284,6 +290,14 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.last_diag_ts: float = 0.0
         self.latency_samples: collections.deque = collections.deque(maxlen=512)
 
+    def _record_window_fill_side(self, side: str) -> None:
+        """Lock in the first-trade side for this window so subsequent
+        trades can be filtered against it (same-direction stacking).
+        Idempotent: only sets the first time per window. Called from
+        every fill site in orders.py."""
+        if self.window_first_side is None and side in ("UP", "DOWN"):
+            self.window_first_side = side
+
     def new_window(self, window_end: datetime):
         if self.flat_reason_counts:
             self._log_flat_summary()
@@ -314,6 +328,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.last_down_decision = Decision("FLAT", 0.0, 0.0, "")
         self.windows_seen += 1
         self.window_trade_count = 0
+        self.window_first_side = None
         self.position_count = 0
         self.exited_sides = set()
         self.open_sell_orders = []
@@ -491,12 +506,42 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             if self.window_trade_count >= self.max_trades_per_window:
                 break
 
+            # Same-direction stacking guard: when max_trades_per_window > 1
+            # AND a prior trade fired in this window, only allow subsequent
+            # trades on the SAME side as the first. Prevents in-window
+            # whipsaws from generating opposite-direction hedges that
+            # fight each other.
+            if (self.same_direction_stacking_only
+                    and self.window_first_side is not None
+                    and side_label != self.window_first_side):
+                continue
+
             existing = self._get_open_order(side_label)
 
             if existing is not None:
                 order_age = now - existing.get("placed_ts_unix", now)
                 current_edge = dec.edge if dec.action != "FLAT" else 0.0
                 current_bid = current_bids.get(side_label)
+
+                # Skip cancel/requote on orders pending verify-retry. They
+                # are waiting for _poll_open_orders to determine actual
+                # status from Polymarket. Re-attempting cancel here would
+                # spam the API and could trigger duplicate verify failures.
+                if existing.get("_verify_pending"):
+                    continue
+
+                # Cancel-on-bid-drop: when the bid moves significantly below
+                # our resting order price, our order is the highest bid in
+                # the book and gets adversely picked off when sellers come
+                # in. Cancel rather than wear the loss.
+                # Threshold: 2 ticks below order price.
+                if (current_bid is not None
+                        and existing["price"] > current_bid + 2 * self.tick_size):
+                    self._cancel_single_order(
+                        existing,
+                        f"bid_dropped ({existing['price']:.3f} -> {current_bid:.3f})"
+                    )
+                    continue
 
                 if current_edge < self.edge_cancel_threshold:
                     self._cancel_single_order(existing, f"edge_gone ({current_edge:.4f} < {self.edge_cancel_threshold})")
@@ -1157,6 +1202,37 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
     def save_state(self):
         wins = [r for r in self.all_results if r.pnl > 0]
+        # Serialize all_results so the display PnL persists across restarts.
+        # Without this, restarting the bot wipes the in-memory list and the
+        # display shows $0 PnL for the new session even though bankroll
+        # reflects prior trades. Cap the persisted history at 5000 trades
+        # to keep the state file small.
+        results_serialized = [
+            {
+                "fill": {
+                    "market_slug": r.fill.market_slug,
+                    "side": r.fill.side,
+                    "entry_ts_ms": r.fill.entry_ts_ms,
+                    "time_remaining_s": r.fill.time_remaining_s,
+                    "entry_price": r.fill.entry_price,
+                    "fee_per_share": r.fill.fee_per_share,
+                    "shares": r.fill.shares,
+                    "cost_usd": r.fill.cost_usd,
+                    "signal_name": r.fill.signal_name,
+                    "decision_reason": r.fill.decision_reason,
+                    "btc_at_fill": r.fill.btc_at_fill,
+                    "start_price": r.fill.start_price,
+                    "expected_low": r.fill.expected_low,
+                    "expected_high": r.fill.expected_high,
+                },
+                "outcome_up": r.outcome_up,
+                "final_btc": r.final_btc,
+                "payout": r.payout,
+                "pnl": r.pnl,
+                "pnl_pct": r.pnl_pct,
+            }
+            for r in self.all_results[-5000:]
+        ]
         data = {
             "bankroll": round(self.bankroll, 2),
             "initial_bankroll": round(self.initial_bankroll, 2),
@@ -1172,12 +1248,48 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "max_dd_pct": round(self.max_dd_pct, 4),
             "circuit_breaker": self.circuit_breaker_tripped,
             "saved_at": datetime.now(timezone.utc).isoformat(),
+            "all_results": results_serialized,
         }
         try:
             with open(self.state_file, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
+
+    @staticmethod
+    def _restore_results(serialized: list) -> list[TradeResult]:
+        """Reconstruct TradeResult objects from save_state's serialized form."""
+        out = []
+        for r in serialized:
+            f = r.get("fill", {})
+            try:
+                fill = Fill(
+                    market_slug=f.get("market_slug", ""),
+                    side=f.get("side", ""),
+                    entry_ts_ms=int(f.get("entry_ts_ms", 0)),
+                    time_remaining_s=float(f.get("time_remaining_s", 0.0)),
+                    entry_price=float(f.get("entry_price", 0.0)),
+                    fee_per_share=float(f.get("fee_per_share", 0.0)),
+                    shares=float(f.get("shares", 0.0)),
+                    cost_usd=float(f.get("cost_usd", 0.0)),
+                    signal_name=f.get("signal_name", ""),
+                    decision_reason=f.get("decision_reason", ""),
+                    btc_at_fill=float(f.get("btc_at_fill", 0.0)),
+                    start_price=float(f.get("start_price", 0.0)),
+                    expected_low=float(f.get("expected_low", 0.0)),
+                    expected_high=float(f.get("expected_high", 0.0)),
+                )
+                out.append(TradeResult(
+                    fill=fill,
+                    outcome_up=int(r.get("outcome_up", 0)),
+                    final_btc=float(r.get("final_btc", 0.0)),
+                    payout=float(r.get("payout", 0.0)),
+                    pnl=float(r.get("pnl", 0.0)),
+                    pnl_pct=float(r.get("pnl_pct", 0.0)),
+                ))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     @classmethod
     def load_state(cls, state_file: Path) -> dict | None:

@@ -33,6 +33,15 @@ class MarketConfig:
     min_entry_price: float = 0.25      # Minimum contract price to enter
     edge_threshold: float = 0.06       # Minimum edge to enter
     market_blend: float = 0.0          # Blend p_model with contract mid (0=off)
+    # Per-window trade caps. The 1-trade-per-window default keeps the
+    # bot from chasing every signal flip. Setting this >1 enables
+    # "averaging in" — additional trades in the same window after the
+    # first fills.
+    max_trades_per_window: int = 1
+    # When max_trades_per_window > 1, restrict subsequent trades to
+    # the SAME direction as the first. Prevents the bot from hedging
+    # against itself when the signal whipsaws within a window.
+    same_direction_stacking_only: bool = True
     # σ estimator selector for _compute_vol. Options:
     #   "yz"   — Yang-Zhang on 5s OHLC bars (legacy default; suboptimal
     #            on continuously-traded feeds because the var_oc term
@@ -85,6 +94,13 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # downstream consumer reads _hawkes_intensity (e.g. retrained
         # filtration model with hawkes feature).
         hawkes_params=(0.011611, 0.0300, 0.0500, 3.0),
+        # User asked to allow 2 trades per 15m window when the signal
+        # persists in the same direction (averaging in). The 15m window
+        # has more elapsed time for the signal to evolve and same-side
+        # confirmation is the trend-following case we want to capture;
+        # opposite-direction in-window would be a hedge that fights
+        # itself. Default same_direction_stacking_only=True enforces.
+        max_trades_per_window=2,
         # Market-blend: post-fix 50-day backfill (14k BTC 5m / 4.7k BTC 15m
         # REST + live windows) sweep showed BTC 15m Sharpe climbs from 0.61
         # @ blend=0.0 to 1.36 @ blend=0.5 (+123%), max drawdown drops from
@@ -159,6 +175,16 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         hawkes_params=(0.023712, 0.0200, 0.0500, 3.0),
         min_entry_z=0.0,            # blend filters disagreement (was 0.7)
         min_entry_price=0.20,       # avoid deep OTM tail (was 0.10)
+        # NOTE on edge_threshold: user asked to halve trade frequency
+        # for better Sharpe. Backtest A/B showed this is the WRONG lever:
+        #   edge=0.06 (current): 3577 trades, $26,826 PnL, Sharpe 1.52
+        #   edge=0.08:           1596 trades,  $9,382 PnL, Sharpe 1.18
+        #   edge=0.10:            904 trades,  $5,279 PnL, Sharpe 1.16
+        # The marginal trades being filtered are collectively profitable,
+        # so over-filtering hurts more than it helps. Keeping at 0.06.
+        # If the user still wants to reduce live activity, the better
+        # levers are min_entry_z (selectivity by signal strength) or
+        # max_spread (selectivity by liquidity), not edge_threshold.
         edge_threshold=0.06,
         market_blend=0.3,           # pull p_model toward market mid
         max_book_age_ms=1000.0,     # skip trades during book WS disconnects

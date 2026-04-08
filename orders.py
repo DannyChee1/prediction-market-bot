@@ -31,6 +31,21 @@ class OrderMixin:
         return None
 
     @staticmethod
+    def _fee_for_fill(price: float, shares: float) -> tuple[float, float]:
+        """Compute (fee_total, fee_per_share) for a Polymarket binary fill.
+
+        Polymarket charges a 2%·p·(1−p) taker fee on binary markets.
+        At p=0.5 this is the maximum 0.5%. At p=0.2 it's 0.32%.
+        Tiny per fill, but compounds across hundreds of fills per day —
+        the bot's bankroll silently drifts above the on-chain wallet
+        without this. The makingAmount returned by the CLOB is gross.
+        """
+        if price <= 0 or price >= 1.0 or shares <= 0:
+            return 0.0, 0.0
+        fee_per_share = poly_fee(price)
+        return fee_per_share * shares, fee_per_share
+
+    @staticmethod
     def _model_log_fields(order: dict) -> dict:
         """Extract model_snapshot fields from an order dict for JSONL logging."""
         ms = order.get("model_snapshot")
@@ -113,7 +128,12 @@ class OrderMixin:
                     size_matched / original_size if original_size > 0 else 0
                 )
 
-                if status == "MATCHED" or fill_pct >= 0.99:
+                # M3 fix: only treat as fully filled when the exchange
+                # explicitly says MATCHED. The 0.99 fill_pct heuristic
+                # used to mean "close enough" but the residual could
+                # later trickle in as a surprise position the bot had
+                # already removed from open_orders, going untracked.
+                if status == "MATCHED":
                     # Order filled before cancel — treat as a fill
                     # Account for shares already recorded from prior partial fills
                     prev_matched = order.get("_last_matched", 0)
@@ -127,6 +147,9 @@ class OrderMixin:
                         return False
 
                     new_fill_cost = new_fill_shares * order["price"]
+                    fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                    new_fill_cost += fee
+                    self.total_fees += fee
                     drift = order["cost_est"] - new_fill_cost
                     self.bankroll += drift
                     self.signal.bankroll = self.bankroll
@@ -141,6 +164,7 @@ class OrderMixin:
                         "side": order["side"],
                         "cost_usd": new_fill_cost,
                         "shares": new_fill_shares,
+                        "fee": fee,
                         "order_id": order_id,
                         "entry_ts": order["placed_ts"],
                         "fill_ts_unix": _time.time(),
@@ -198,6 +222,9 @@ class OrderMixin:
                         return True
 
                     new_fill_cost = new_fill_shares * order["price"]
+                    fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                    new_fill_cost += fee
+                    self.total_fees += fee
                     unfilled_cost_est = order["cost_est"] - new_fill_cost
 
                     self.bankroll += unfilled_cost_est
@@ -213,6 +240,7 @@ class OrderMixin:
                         "side": order["side"],
                         "cost_usd": new_fill_cost,
                         "shares": new_fill_shares,
+                        "fee": fee,
                         "order_id": order_id,
                         "entry_ts": order["placed_ts"],
                         "fill_ts_unix": _time.time(),
@@ -273,8 +301,13 @@ class OrderMixin:
                 })
                 return False
 
-        # Refund reserved bankroll
-        self.bankroll += order["cost_est"]
+        # Refund only the UNFILLED portion of the reservation. P12.9:
+        # the original cost_est snapshot is preserved (no in-place
+        # mutation), so the unfilled portion is cost_est minus the
+        # cumulative cost of partial fills already moved to pending_fills.
+        already_filled = order.get("_cumulative_filled_cost", 0.0)
+        unfilled_refund = max(0.0, order["cost_est"] - already_filled)
+        self.bankroll += unfilled_refund
         self.signal.bankroll = self.bankroll
 
         # Remove from open_orders
@@ -287,7 +320,8 @@ class OrderMixin:
             "side": order["side"],
             "status": "cancelled_by_bot",
             "reason": reason,
-            "refund": round(order["cost_est"], 2),
+            "refund": round(unfilled_refund, 2),
+            "filled_before_cancel": round(already_filled, 2),
         })
         self._event(
             f"[CANCEL] {order['side']} {order['shares']:.1f}sh "
@@ -441,15 +475,23 @@ class OrderMixin:
         making = resp.get("makingAmount", "")
         filled_shares = float(taking) if taking else 0.0
         if status == "MATCHED" and filled_shares > 0:
-            actual_cost = float(making) if making else filled_shares * limit_price
+            # makingAmount = gross cash leg (limit_price × shares). It is
+            # NOT net of the Polymarket binary-market taker fee. Apply it
+            # explicitly so bankroll matches the actual on-chain debit.
+            gross_cost = float(making) if making else filled_shares * limit_price
+            entry_price = gross_cost / filled_shares if filled_shares > 0 else limit_price
+            taker_fee, _fps = self._fee_for_fill(entry_price, filled_shares)
+            actual_cost = gross_cost + taker_fee
             self.bankroll -= actual_cost
             self.signal.bankroll = self.bankroll
+            self.total_fees += taker_fee
 
             self.pending_fills.append({
                 "market_slug": snapshot.market_slug,
                 "side": side_label,
                 "cost_usd": actual_cost,
                 "shares": filled_shares,
+                "fee": taker_fee,
                 "order_id": order_id,
                 "entry_ts": now_iso,
                 "fill_ts_unix": _time.time(),
@@ -520,6 +562,9 @@ class OrderMixin:
                 age = _time.time() - order.get("placed_ts_unix", _time.time())
                 if age >= 5.0:
                     actual_cost = order["shares"] * order["price"]
+                    fee, _ = self._fee_for_fill(order["price"], order["shares"])
+                    actual_cost += fee
+                    self.total_fees += fee
                     drift = order["cost_est"] - actual_cost
                     self.bankroll += drift
                     self.signal.bankroll = self.bankroll
@@ -528,6 +573,7 @@ class OrderMixin:
                         "side": order["side"],
                         "cost_usd": actual_cost,
                         "shares": order["shares"],
+                        "fee": fee,
                         "order_id": order_id,
                         "entry_ts": order["placed_ts"],
                         "fill_ts_unix": _time.time(),
@@ -563,9 +609,43 @@ class OrderMixin:
 
             try:
                 resp = self.client.get_order(order_id)
+                # Successful poll clears any verify-pending flag from a
+                # prior cancel-verify failure (P11.1) — we now have a
+                # definitive status from the exchange.
+                if order.get("_verify_pending"):
+                    order.pop("_verify_pending", None)
+                    order.pop("_verify_pending_since", None)
             except Exception as exc:
                 if self.debug:
                     self._event(f"[POLL] error checking {order_id[:12]}...: {exc}")
+                # P12.10: TTL on _verify_pending. If verification has
+                # been failing for >60s, force a final cleanup: refund
+                # the unfilled portion to bankroll, drop from open_orders,
+                # and log loudly. The position (if any) becomes a
+                # phantom that the operator must reconcile manually,
+                # but at least the bot's bankroll stays usable instead
+                # of leaking the reservation forever.
+                pending_since = order.get("_verify_pending_since")
+                if pending_since and (_time.time() - pending_since) > 60.0:
+                    already_filled = order.get("_cumulative_filled_cost", 0.0)
+                    refund = max(0.0, order["cost_est"] - already_filled)
+                    self.bankroll += refund
+                    self.signal.bankroll = self.bankroll
+                    self._event(
+                        f"[POLL] TTL force-cleanup {order_id[:12]}... after "
+                        f"{(_time.time() - pending_since):.0f}s of verify failures. "
+                        f"Refunded ${refund:.2f}. Reconcile on-chain manually."
+                    )
+                    self._log({
+                        "type": "verify_pending_ttl_cleanup",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "order_id": order_id,
+                        "side": order["side"],
+                        "refund": round(refund, 2),
+                        "filled_before_cleanup": round(already_filled, 2),
+                        "warning": "phantom_position_possible",
+                    })
+                    continue  # don't append to still_open
                 still_open.append(order)
                 continue
 
@@ -574,7 +654,9 @@ class OrderMixin:
             original_size = float(resp.get("original_size", order["shares"]) or order["shares"])
             fill_pct = size_matched / original_size if original_size > 0 else 0
 
-            if status == "MATCHED" or fill_pct >= 0.99:
+            # M3 fix: only treat as fully filled when the exchange explicitly
+            # says MATCHED. The 0.99 fill_pct heuristic missed the residual.
+            if status == "MATCHED":
                 # Account for shares already recorded from prior partial fills
                 prev_matched = order.get("_last_matched", 0)
                 new_fill_shares = size_matched - prev_matched
@@ -583,6 +665,9 @@ class OrderMixin:
                     continue
 
                 new_fill_cost = new_fill_shares * order["price"]
+                fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                new_fill_cost += fee
+                self.total_fees += fee
                 drift = order["cost_est"] - new_fill_cost
                 self.bankroll += drift
                 self.signal.bankroll = self.bankroll
@@ -592,6 +677,7 @@ class OrderMixin:
                     "side": order["side"],
                     "cost_usd": new_fill_cost,
                     "shares": new_fill_shares,
+                    "fee": fee,
                     "order_id": order_id,
                     "entry_ts": order["placed_ts"],
                     "fill_ts_unix": _time.time(),
@@ -619,6 +705,7 @@ class OrderMixin:
                     "shares": round(new_fill_shares, 2),
                     "price": order["price"],
                     "cost_usd": round(new_fill_cost, 2),
+                    "fee": round(fee, 4),
                     **self._model_log_fields(order),
                 })
 
@@ -642,16 +729,34 @@ class OrderMixin:
                 prev_matched = order.get("_last_matched", 0)
                 new_fill_shares = size_matched - prev_matched
                 new_fill_cost = new_fill_shares * order["price"]
+                fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                new_fill_cost += fee
+                self.total_fees += fee
 
-                order["cost_est"] -= new_fill_cost
-                order["shares"] -= new_fill_shares
+                # P12.9 fix: instead of mutating order["cost_est"] /
+                # order["shares"] in place (which corrupts the snapshot
+                # used by _cancel_single_order's refund math), track
+                # cumulative filled cost/shares in dedicated fields and
+                # let the cancel path subtract them. The original snapshot
+                # of cost_est and shares is preserved.
+                order["_cumulative_filled_cost"] = (
+                    order.get("_cumulative_filled_cost", 0.0) + new_fill_cost
+                )
+                order["_cumulative_filled_shares"] = (
+                    order.get("_cumulative_filled_shares", 0.0) + new_fill_shares
+                )
                 order["_last_matched"] = size_matched
+
+                # Remaining for display only — derived from cumulative.
+                remaining_shares = max(0.0,
+                    order["shares"] - order["_cumulative_filled_shares"])
 
                 self.pending_fills.append({
                     "market_slug": order["market_slug"],
                     "side": order["side"],
                     "cost_usd": new_fill_cost,
                     "shares": new_fill_shares,
+                    "fee": fee,
                     "order_id": order_id,
                     "entry_ts": order["placed_ts"],
                     "fill_ts_unix": _time.time(),
@@ -668,7 +773,7 @@ class OrderMixin:
                 self._event(
                     f"[PARTIAL FILL] {order['side']} {new_fill_shares:.1f}sh "
                     f"@ {order['price']:.4f} (${new_fill_cost:.2f}) — "
-                    f"{order['shares']:.1f}sh still open"
+                    f"{remaining_shares:.1f}sh still open"
                     + self._model_fill_line(order)
                 )
                 self._log({
@@ -707,6 +812,14 @@ class OrderMixin:
         if not events:
             return
 
+        # M4: dedup by (event_id) across the entire process lifetime so
+        # WS retransmits and WS+poll overlap can't double-record the
+        # same event. The _last_matched cumulative tracker on each
+        # order also dedupes by size, so this is belt+suspenders.
+        if not hasattr(self, "_seen_user_event_ids"):
+            self._seen_user_event_ids: set[str] = set()
+            self._seen_event_ids_max: int = 4096
+
         # Index open orders by order_id for fast lookup
         order_map: dict[str, dict] = {}
         for order in self.open_orders:
@@ -715,6 +828,19 @@ class OrderMixin:
         processed_ids: set[str] = set()
 
         for evt in events:
+            # M4 dedup: per-event-id check (if exchange provides one).
+            evt_id = evt.get("event_id") or evt.get("id") or ""
+            if evt_id and evt_id in self._seen_user_event_ids:
+                continue
+            if evt_id:
+                self._seen_user_event_ids.add(evt_id)
+                # Bound the set size to avoid unbounded growth
+                if len(self._seen_user_event_ids) > self._seen_event_ids_max:
+                    # Drop the oldest half (set has no order — drop arbitrary)
+                    self._seen_user_event_ids = set(
+                        list(self._seen_user_event_ids)[self._seen_event_ids_max // 2:]
+                    )
+
             order_id = evt.get("order_id", "")
             if not order_id or order_id not in order_map:
                 continue
@@ -743,6 +869,9 @@ class OrderMixin:
                     continue
 
                 new_fill_cost = new_fill_shares * order["price"]
+                fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                new_fill_cost += fee
+                self.total_fees += fee
                 drift = order["cost_est"] - new_fill_cost
                 self.bankroll += drift
                 self.signal.bankroll = self.bankroll
@@ -752,6 +881,7 @@ class OrderMixin:
                     "side": order["side"],
                     "cost_usd": new_fill_cost,
                     "shares": new_fill_shares,
+                    "fee": fee,
                     "order_id": order_id,
                     "entry_ts": order["placed_ts"],
                     "fill_ts_unix": _time.time(),
@@ -779,6 +909,7 @@ class OrderMixin:
                     "shares": round(new_fill_shares, 2),
                     "price": order["price"],
                     "cost_usd": round(new_fill_cost, 2),
+                    "fee": round(fee, 4),
                     **self._model_log_fields(order),
                 })
                 processed_ids.add(order_id)
@@ -1041,7 +1172,8 @@ class OrderMixin:
             )
             fill_pct = size_matched / original_size if original_size > 0 else 0
 
-            if status == "MATCHED" or fill_pct >= 0.99:
+            # M3 fix: strict MATCHED only — see comment in _poll_open_orders.
+            if status == "MATCHED":
                 proceeds = size_matched * order["price"]
                 self._process_sell_fill(order["source_fill"], proceeds, order["price"])
 
@@ -1083,7 +1215,12 @@ class OrderMixin:
                     size_matched / original_size if original_size > 0 else 0
                 )
 
-                if status == "MATCHED" or fill_pct >= 0.99:
+                # M3 fix: only treat as fully filled when the exchange
+                # explicitly says MATCHED. The 0.99 fill_pct heuristic
+                # used to mean "close enough" but the residual could
+                # later trickle in as a surprise position the bot had
+                # already removed from open_orders, going untracked.
+                if status == "MATCHED":
                     proceeds = size_matched * order["price"]
                     self.open_sell_orders = [
                         o for o in self.open_sell_orders

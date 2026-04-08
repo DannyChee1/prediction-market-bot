@@ -123,6 +123,8 @@ class BacktestEngine:
         slippage: float = 0.0,
         initial_bankroll: float = 10_000.0,
         max_trades_per_window: int = 1,
+        same_direction_stacking_only: bool = True,
+        window_duration_s: float | None = None,
     ):
         self.signal = signal
         self.data_dir = data_dir
@@ -131,6 +133,22 @@ class BacktestEngine:
         self.initial_bankroll = initial_bankroll
         self.bankroll = initial_bankroll
         self.max_trades_per_window = max_trades_per_window
+        # When max_trades_per_window > 1, restrict subsequent in-window
+        # trades to the same direction as the first (averaging in, not
+        # hedging). Mirrors the live tracker.py guard so backtest A/B
+        # results actually reflect what live will do.
+        self.same_direction_stacking_only = same_direction_stacking_only
+        # Annualization factor for Sharpe — derived from window length so
+        # 5m markets get sqrt(288) and 15m markets get sqrt(96).
+        # Note: this is windows-per-DAY (matches the legacy convention,
+        # which was sqrt(96) for 15m). Real per-year annualization would
+        # multiply by 365 — but doing that here would silently inflate
+        # every reported Sharpe ~19x and break comparison with all
+        # historical reports / memory notes. Stay on per-day for parity.
+        if window_duration_s is not None and window_duration_s > 0:
+            self.windows_per_day = 86400.0 / window_duration_s
+        else:
+            self.windows_per_day = 96.0  # 15m legacy default
 
     def load_data(self) -> pd.DataFrame:
         if not self.data_dir.exists() or not any(self.data_dir.glob("*.parquet")):
@@ -288,19 +306,27 @@ class BacktestEngine:
             if pending is not None:
                 exec_ts, decision = pending
                 if snap.ts_ms >= exec_ts:
-                    fill = self._execute_fill(snap, decision, ctx)
-                    if fill is not None:
-                        results.append(self._resolve_fill(fill, outcome_up, final_btc))
-                        self.bankroll += results[-1].pnl
-                        if hasattr(self.signal, "bankroll"):
-                            self.signal.bankroll = self.bankroll
-                        last_fill_ts = snap.ts_ms
-                        ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
-                        if "UP" in decision.action:
-                            ctx["inventory_up"] = ctx.get("inventory_up", 0) + fill.shares
-                        elif "DOWN" in decision.action:
-                            ctx["inventory_down"] = ctx.get("inventory_down", 0) + fill.shares
-                    pending = None
+                    pending_side = "UP" if "UP" in decision.action else "DOWN"
+                    pending_opp = "DOWN" if pending_side == "UP" else "UP"
+                    # Same-direction guard for pending fills (parity with live)
+                    if (self.same_direction_stacking_only
+                            and pending_opp in filled_sides):
+                        pending = None
+                    else:
+                        fill = self._execute_fill(snap, decision, ctx)
+                        if fill is not None:
+                            filled_sides.add(pending_side)
+                            results.append(self._resolve_fill(fill, outcome_up, final_btc))
+                            self.bankroll += results[-1].pnl
+                            if hasattr(self.signal, "bankroll"):
+                                self.signal.bankroll = self.bankroll
+                            last_fill_ts = snap.ts_ms
+                            ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
+                            if "UP" in decision.action:
+                                ctx["inventory_up"] = ctx.get("inventory_up", 0) + fill.shares
+                            elif "DOWN" in decision.action:
+                                ctx["inventory_down"] = ctx.get("inventory_down", 0) + fill.shares
+                        pending = None
 
             # Cooldown between bets
             if snap.ts_ms - last_fill_ts < cooldown_ms and last_fill_ts > 0:
@@ -348,9 +374,20 @@ class BacktestEngine:
             # FOK mode: run single-side signal
             decision = self.signal.decide(snap, ctx)
             if decision.action != "FLAT" and decision.size_usd > 0:
+                # Same-direction stacking guard (parity with live tracker.py).
+                # When max_trades_per_window > 1 and a prior trade in this
+                # window already filled on one side, subsequent trades MUST
+                # match that side. Without this guard the FOK backtest would
+                # accept opposite-direction hedges that live blocks.
+                fok_side = "UP" if "UP" in decision.action else "DOWN"
+                fok_opp = "DOWN" if fok_side == "UP" else "UP"
+                if (self.same_direction_stacking_only
+                        and fok_opp in filled_sides):
+                    continue
                 if self.latency_ms <= 0:
                     fill = self._execute_fill(snap, decision, ctx)
                     if fill is not None:
+                        filled_sides.add(fok_side)
                         results.append(self._resolve_fill(fill, outcome_up, final_btc))
                         self.bankroll += results[-1].pnl
                         if hasattr(self.signal, "bankroll"):
@@ -608,10 +645,14 @@ class BacktestEngine:
                 max_dd = dd
                 max_dd_pct = dd_pct
 
-        # Sharpe (96 windows/day for 15-min markets)
+        # Sharpe — derive sqrt(windows/day) from the engine's window length
+        # so 5m markets get sqrt(288) and 15m markets get sqrt(96). The
+        # legacy hardcoded sqrt(96) inflated all 5m Sharpe numbers by
+        # ~1.73× and made cross-market comparisons meaningless.
+        ann_factor = math.sqrt(self.windows_per_day)
         mean_pnl = float(np.mean(pnls))
         std_pnl = float(np.std(pnls, ddof=1)) if len(pnls) > 1 else 0.0
-        sharpe = (mean_pnl / std_pnl) * math.sqrt(96) if std_pnl > 0 else 0.0
+        sharpe = (mean_pnl / std_pnl) * ann_factor if std_pnl > 0 else 0.0
 
         # Deflated Sharpe (Bailey & Lopez de Prado, 2014)
         # Penalizes for multiple testing: SR* = SR - sqrt(2 * log(N) / T)
@@ -619,7 +660,7 @@ class BacktestEngine:
         # N_trials is set by the caller via the engine; defaults to 1 (no penalty).
         n_trials = getattr(self, "n_trials", 1)
         if n_trials > 1 and len(pnls) > 1:
-            haircut = math.sqrt(2.0 * math.log(n_trials) / len(pnls)) * math.sqrt(96)
+            haircut = math.sqrt(2.0 * math.log(n_trials) / len(pnls)) * ann_factor
             sharpe_deflated = sharpe - haircut
         else:
             sharpe_deflated = sharpe
@@ -669,6 +710,9 @@ def run_sensitivity(
                 latency_ms=lat,
                 slippage=slip,
                 initial_bankroll=initial_bankroll,
+                # Sensitivity is a 15m default sweep — no per-config plumbing
+                # but at least set the window length so Sharpe is correct.
+                window_duration_s=900.0,
             )
             engine.n_trials = total
             _, metrics, _ = engine.run()
@@ -819,8 +863,13 @@ def build_diffusion_signal(
     # Per-market signal overrides
     eth_overrides = {}
     if market == "eth":
+        # M1 fix: don't override edge_threshold here. config.edge_threshold
+        # is already plumbed via the explicit `edge_threshold=` kwarg below,
+        # so eth_overrides clobbering it would silently win over any future
+        # market_config.py change. The other knobs stay because they're
+        # eth-specific tuning that doesn't belong in the per-market config
+        # (yet).
         eth_overrides = dict(
-            edge_threshold=0.15,
             reversion_discount=0.10,
             momentum_lookback_s=15,
             momentum_majority=0.7,
@@ -1078,6 +1127,11 @@ def main():
             latency_ms=args.latency,
             slippage=args.slippage,
             initial_bankroll=args.bankroll,
+            # Plumb live-parity knobs from market_config so backtest A/B
+            # actually reflects what the live trader will do.
+            max_trades_per_window=config.max_trades_per_window,
+            same_direction_stacking_only=config.same_direction_stacking_only,
+            window_duration_s=config.window_duration_s,
         )
         print(f"\n{'='*62}")
         print(f"  Running: {signal.name} ({config.display_name}) [{mode_str}]")

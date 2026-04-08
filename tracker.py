@@ -132,12 +132,22 @@ class RedemptionQueue:
     # ── persistence ───────────────────────────────────────────────────
 
     def _save(self):
+        # Atomic write: dump to temp file, fsync, rename. Prevents
+        # partial-write corruption on crash mid-write. Logs the
+        # exception loudly instead of swallowing — silent save failures
+        # combined with hard-kill have lost whole sessions of state.
         try:
             data = [asdict(it) for it in self._items]
-            with open(self._file, "w") as f:
+            tmp = self._file.with_suffix(self._file.suffix + ".tmp")
+            with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
-        except Exception:
-            pass
+                f.flush()
+                import os as _os
+                _os.fsync(f.fileno())
+            tmp.replace(self._file)
+        except Exception as exc:
+            print(f"  [REDEMPTION_QUEUE] save FAILED: "
+                  f"{type(exc).__name__}: {exc}")
 
     def _load(self):
         if not self._file.exists():
@@ -254,6 +264,16 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.max_drawdown: float = 0.0
         self.max_dd_pct: float = 0.0
 
+        # Lifetime scalars — separate from all_results so the displayed
+        # totals don't drift after the in-memory results list is truncated
+        # at the 5000-trade cap during save_state. These are the source of
+        # truth for lifetime PnL/win/loss counts; all_results is the
+        # rolling history used by display widgets.
+        self.lifetime_pnl: float = 0.0
+        self.lifetime_wins: int = 0
+        self.lifetime_losses: int = 0
+        self.lifetime_trades: int = 0
+
         # On-chain redemption
         self.condition_id: str = ""
         queue_file = self.state_file.parent / self.state_file.name.replace(
@@ -297,6 +317,23 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         every fill site in orders.py."""
         if self.window_first_side is None and side in ("UP", "DOWN"):
             self.window_first_side = side
+
+    def _increment_lifetime_totals(self, result) -> None:
+        """Update lifetime scalar counters when a trade resolves.
+
+        These scalars (lifetime_pnl, lifetime_wins, lifetime_losses,
+        lifetime_trades) are persisted to state separately from
+        all_results, so the displayed lifetime PnL never drifts after
+        the all_results list is truncated at 5000 entries during
+        save_state. Without this, restart-then-save would silently
+        drop the historical PnL of everything beyond window 5000.
+        """
+        self.lifetime_pnl += result.pnl
+        self.lifetime_trades += 1
+        if result.pnl > 0:
+            self.lifetime_wins += 1
+        else:
+            self.lifetime_losses += 1
 
     def new_window(self, window_end: datetime):
         if self.flat_reason_counts:
@@ -461,12 +498,22 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         }
 
         # Exposure-aware position gating
-        # Count both filled AND resting orders toward position limits
+        # Count both filled AND resting orders toward position limits.
+        # Open orders MUST be included in net_exposure / gross_exposure
+        # so the cap is airtight — without this, you can place an UP
+        # then a DOWN limit while both pass the gate (because only
+        # filled positions are summed), then end up dual-sided when
+        # both fill. The same_direction_stacking_only guard depends on
+        # this being correct.
         filled_sides = {f["side"] for f in self.pending_fills}
         open_sides = {o["side"] for o in self.open_orders}
         committed_sides = filled_sides | open_sides
         up_shares = sum(f["shares"] for f in self.pending_fills if f["side"] == "UP")
         down_shares = sum(f["shares"] for f in self.pending_fills if f["side"] == "DOWN")
+        # Add open-order shares to both sides so net_exposure /
+        # gross_exposure reflect the worst-case fill state.
+        up_shares += sum(o.get("shares", 0) for o in self.open_orders if o.get("side") == "UP")
+        down_shares += sum(o.get("shares", 0) for o in self.open_orders if o.get("side") == "DOWN")
         net_exposure = up_shares - down_shares   # +ve = long UP
         gross_exposure = up_shares + down_shares
         # Effective position count: filled + resting orders
@@ -670,7 +717,18 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             if side in self.exited_sides:
                 continue
 
-            fill_age = now - fill.get("fill_ts_unix", now)
+            # M5 fix: default to a LARGE age (not now), so fills restored
+            # from a state file that didn't have fill_ts_unix don't
+            # immediately become eligible for early exit. Restored fills
+            # whose age is unknown are treated as "fully aged" (safe to
+            # consider for exit), not "just filled" (which would block
+            # exit indefinitely). Pick the larger of: actual age if
+            # available, OR 2× the min hold (ensures eligibility).
+            fill_ts = fill.get("fill_ts_unix")
+            if fill_ts is None or fill_ts <= 0:
+                fill_age = self.exit_min_hold_s * 2.0
+            else:
+                fill_age = now - fill_ts
             if fill_age < self.exit_min_hold_s:
                 continue
 
@@ -737,6 +795,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             pnl_pct=pnl_pct,
         )
         self.all_results.append(result)
+        self._increment_lifetime_totals(result)
 
         if self.bankroll > self.peak_bankroll:
             self.peak_bankroll = self.bankroll
@@ -828,6 +887,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 pnl_pct=pnl_pct,
             )
             self.all_results.append(result)
+            self._increment_lifetime_totals(result)
 
             tag = "WON" if pnl > 0 else "LOST"
             print(
@@ -869,6 +929,18 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 print(f"  [REDEEM] Enqueued for redemption "
                       f"(conditionId: {cond_id[:10]}..., "
                       f"queue size: {len(self.redemption_queue)})")
+                # M6: process the queue inline immediately so a crash
+                # between enqueue and the live_trader's background spawn
+                # doesn't leave wins waiting >4h. enqueue() already
+                # persisted to disk, so worst case is a duplicate
+                # process attempt — process_redemption_queue handles
+                # already-redeemed conditions idempotently.
+                if not self.dry_run:
+                    try:
+                        self.process_redemption_queue(max_per_cycle=3)
+                    except Exception as exc:
+                        print(f"  [REDEEM] inline process error: "
+                              f"{type(exc).__name__}: {exc}")
             elif has_winning and not cond_id:
                 self._log({
                     "type": "redemption_skipped",
@@ -1238,10 +1310,22 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "initial_bankroll": round(self.initial_bankroll, 2),
             "windows_seen": self.windows_seen,
             "windows_traded": self.windows_traded,
+            # Per-process display counters (derived from in-memory list).
+            # These reset to the trimmed-list view after a restart, which
+            # is fine for "session display" but not for lifetime totals —
+            # see lifetime_* fields below.
             "total_trades": len(self.all_results),
             "wins": len(wins),
             "losses": len(self.all_results) - len(wins),
             "total_pnl": round(sum(r.pnl for r in self.all_results), 2),
+            # Lifetime scalars — incremented on every fill resolution and
+            # NOT reconstructed from all_results, so they survive the
+            # 5000-trade truncation during save. These are the source of
+            # truth for cumulative PnL across the bot's lifetime.
+            "lifetime_pnl": round(self.lifetime_pnl, 2),
+            "lifetime_wins": self.lifetime_wins,
+            "lifetime_losses": self.lifetime_losses,
+            "lifetime_trades": self.lifetime_trades,
             "total_fees": round(self.total_fees, 2),
             "peak_bankroll": round(self.peak_bankroll, 2),
             "max_drawdown": round(self.max_drawdown, 2),
@@ -1250,11 +1334,21 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "all_results": results_serialized,
         }
+        # Atomic write: dump to temp file, fsync, rename. Without
+        # tmp+rename, a crash mid-write leaves a partial JSON file that
+        # fails to parse on next load — silently losing all session
+        # state. Log save failures loudly instead of swallowing.
         try:
-            with open(self.state_file, "w") as f:
+            tmp = self.state_file.with_suffix(self.state_file.suffix + ".tmp")
+            with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
-        except Exception:
-            pass
+                f.flush()
+                import os as _os
+                _os.fsync(f.fileno())
+            tmp.replace(self.state_file)
+        except Exception as exc:
+            print(f"  [STATE] save_state FAILED for {self.state_file.name}: "
+                  f"{type(exc).__name__}: {exc}")
 
     @staticmethod
     def _restore_results(serialized: list) -> list[TradeResult]:

@@ -22,6 +22,13 @@ class MarketConfig:
     kou_p_up: float = 0.51             # Kou upward jump probability
     kou_eta1: float = 1100.0           # Kou upward jump rate (1/mean_size)
     kou_eta2: float = 1100.0           # Kou downward jump rate
+    # Self-exciting Hawkes intensity for jump clustering. When non-None,
+    # DiffusionSignal maintains a per-window HawkesIntensity instance
+    # fed by detected jumps and publishes _hawkes_intensity / _hawkes_n_events
+    # to ctx for downstream consumers (filtration features, dashboards).
+    # Tuple is (mu, alpha, beta, k_sigma) where alpha < beta is required
+    # for stationarity. Fit via /tmp/fit_hawkes.py on parquet history.
+    hawkes_params: tuple[float, float, float, float] | None = None
     min_entry_z: float = 0.5           # Minimum |z| to enter
     min_entry_price: float = 0.25      # Minimum contract price to enter
     edge_threshold: float = 0.06       # Minimum edge to enter
@@ -71,6 +78,13 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         kou_p_up=0.5013,
         kou_eta1=4504.3,
         kou_eta2=4509.6,
+        # Hawkes self-exciting jump intensity, fit on 1000 BTC 15m post-fix
+        # parquets via /tmp/fit_hawkes.py at k_sigma=3.0. Branching ratio
+        # alpha/beta = 0.6 (moderate clustering), half-life ln(2)/beta = 13.9s.
+        # Steady-state intensity 0.029/s ≈ 1.74 jumps/min. Inert until a
+        # downstream consumer reads _hawkes_intensity (e.g. retrained
+        # filtration model with hawkes feature).
+        hawkes_params=(0.011611, 0.0300, 0.0500, 3.0),
         # Market-blend: post-fix 50-day backfill (14k BTC 5m / 4.7k BTC 15m
         # REST + live windows) sweep showed BTC 15m Sharpe climbs from 0.61
         # @ blend=0.0 to 1.36 @ blend=0.5 (+123%), max drawdown drops from
@@ -136,6 +150,13 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         kou_p_up=0.5014,
         kou_eta1=4884.8,
         kou_eta2=4867.7,
+        # Hawkes self-exciting jump intensity, fit on 1000 BTC 5m post-fix
+        # parquets via /tmp/fit_hawkes.py at k_sigma=3.0. Branching ratio
+        # alpha/beta = 0.4 (moderate clustering), half-life ln(2)/beta = 13.9s.
+        # Steady-state intensity 0.040/s ≈ 2.37 jumps/min. Inert until a
+        # downstream consumer reads _hawkes_intensity (e.g. retrained
+        # filtration model with hawkes feature).
+        hawkes_params=(0.023712, 0.0200, 0.0500, 3.0),
         min_entry_z=0.0,            # blend filters disagreement (was 0.7)
         min_entry_price=0.20,       # avoid deep OTM tail (was 0.10)
         edge_threshold=0.06,

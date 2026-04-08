@@ -1575,6 +1575,12 @@ class DiffusionSignal(Signal):
                    sum(sz for _, sz in snapshot.ask_levels_down)
         imb_dn = imb_dn / total_dn if total_dn > 0 else 0.0
 
+        # Hawkes features (default 0.0/0 when hawkes is disabled — the
+        # filtration model trained without hawkes_params will treat these
+        # as constant features and effectively ignore them).
+        hawkes_intensity = float(ctx.get("_hawkes_intensity", 0.0) or 0.0)
+        hawkes_n_events = int(ctx.get("_hawkes_n_events", 0) or 0)
+
         features = extract_features(
             z=z,
             sigma=sigma,
@@ -1589,6 +1595,8 @@ class DiffusionSignal(Signal):
             hour_of_day=hour_of_day,
             is_weekend=is_weekend,
             asset_id=self.filtration_asset_id,
+            hawkes_intensity=hawkes_intensity,
+            hawkes_n_events=hawkes_n_events,
         )
 
         confidence = self.filtration_model.predict_proba(features)
@@ -2359,6 +2367,11 @@ class DiffusionSignal(Signal):
             reason = "zero vol"
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
+
+        # Hawkes intensity (opt-in feature; published to ctx, no gating).
+        # Same call as decide() — needed in both paths so the filtration
+        # model sees populated _hawkes_intensity / _hawkes_n_events.
+        self._maybe_publish_hawkes(hist, ts_hist, sigma_per_s, ctx)
 
         # Volatility kill switch: hard pause when EMA sigma exceeds
         # an absolute ceiling.  Distinct from the relative regime filter
@@ -3537,6 +3550,7 @@ def build_diffusion_signal(
         filtration_model=filtration_model,
         filtration_threshold=filtration_threshold,
         filtration_asset_id=filtration_asset_id,
+        hawkes_params=config.hawkes_params,
         data_subdir=config.data_subdir,
         **{**eth_overrides, **maker_overrides, **vamp_kw},
     )

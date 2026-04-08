@@ -19,4 +19,5 @@ Claude.md
 .DS_Store
 dashboard_paper_trades.jsonl
 dashboard_lag_history.jsonl
+filtration_model.pkl.*
 

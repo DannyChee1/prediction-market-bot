@@ -40,6 +40,13 @@ def extract_features(
     is_weekend: int,          # 0 or 1
     asset_id: int,            # 0=btc_15m, 1=eth_15m, 2=sol_15m, 3=xrp_15m,
                               # 4=btc_5m, 5=eth_5m, 6=sol_5m, 7=xrp_5m
+    # Optional kwargs accepted for forward-compat with experiments that
+    # add new features to the model. They are SILENTLY IGNORED by the
+    # current 29-feature model — see filtration_model.pkl.with_hawkes_features
+    # for the alternate 33-feature model that uses these. We keep the
+    # kwargs in the signature so callers don't have to branch.
+    hawkes_intensity: float = 0.0,  # NOT USED in the current 29-feature model
+    hawkes_n_events: int = 0,       # NOT USED in the current 29-feature model
 ) -> list[float]:
     """
     Extract the feature vector used for both training and inference.

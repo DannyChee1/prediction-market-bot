@@ -798,6 +798,8 @@ def build_diffusion_signal(
     filtration_threshold: float = 0.55,
     filtration_mode: str = "size_mult",
     filtration_size_mult_floor: float = 0.45,
+    filtration_ev_full: float = 0.50,
+    filtration_model_path: str | None = None,
     market_blend_override: float | None = None,
     tail_mode_override: str | None = None,
 ):
@@ -884,7 +886,10 @@ def build_diffusion_signal(
         try:
             from filtration_model import FiltrationModel, ASSET_IDS
             from pathlib import Path as _Path
-            fpkl = _Path(__file__).parent / "filtration_model.pkl"
+            if filtration_model_path:
+                fpkl = _Path(filtration_model_path)
+            else:
+                fpkl = _Path(__file__).parent / "filtration_model.pkl"
             if fpkl.exists():
                 filtration_model = FiltrationModel.load(
                     fpkl, threshold=filtration_threshold
@@ -934,6 +939,7 @@ def build_diffusion_signal(
         filtration_asset_id=filtration_asset_id,
         filtration_mode=filtration_mode,
         filtration_size_mult_floor=filtration_size_mult_floor,
+        filtration_ev_full=filtration_ev_full,
         hawkes_params=config.hawkes_params,
         data_subdir=config.data_subdir,
         **{**eth_overrides, **maker_overrides, **vamp_kw},
@@ -999,6 +1005,14 @@ def main():
                         help="Confidence floor for size_mult mode (default 0.45). "
                              "Below this, the trade is fully suppressed (mult=0). "
                              "From floor to 1.0, mult scales linearly to 1.0.")
+    parser.add_argument("--filtration-ev-full", type=float, default=0.50,
+                        help="EV ceiling for regression-mode filtration (default 0.50). "
+                             "Predicted PnL/$ at-or-above this saturates the multiplier. "
+                             "Below 0, the trade is fully suppressed.")
+    parser.add_argument("--filtration-model-path", type=str, default=None,
+                        help="Path to filtration model pkl. Defaults to "
+                             "filtration_model.pkl. Use filtration_model_pnl.pkl for "
+                             "the regression model trained with --target regression.")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -1038,6 +1052,8 @@ def main():
             filtration_threshold=args.filtration_threshold,
             filtration_mode=args.filtration_mode,
             filtration_size_mult_floor=args.filtration_size_mult_floor,
+            filtration_ev_full=args.filtration_ev_full,
+            filtration_model_path=args.filtration_model_path,
             market_blend_override=args.market_blend,
             tail_mode_override=args.tail_mode,
         ),

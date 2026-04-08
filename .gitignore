@@ -20,4 +20,5 @@ Claude.md
 dashboard_paper_trades.jsonl
 dashboard_lag_history.jsonl
 filtration_model.pkl.*
+filtration_model_pnl.pkl
 

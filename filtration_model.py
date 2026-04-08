@@ -111,7 +111,12 @@ ASSET_IDS = {
 # ── Model wrapper ─────────────────────────────────────────────────────────────
 
 class CalibratedWrapper:
-    """Wraps XGBoost + logistic calibration so the pair is picklable."""
+    """Wraps XGBoost classifier + logistic calibration so the pair is picklable.
+
+    target_type = "classification". predict_proba returns P(direction correct).
+    """
+
+    target_type = "classification"
 
     def __init__(self, base, cal):
         self._base = base
@@ -123,12 +128,42 @@ class CalibratedWrapper:
         return self._cal.predict_proba(raw.reshape(-1, 1))
 
 
+class RegressionWrapper:
+    """Wraps XGBRegressor for the EV-positive label experiment.
+
+    target_type = "regression". The model predicts expected realized
+    PnL per dollar at the entry tick (continuous, can be negative).
+    Exposes the same predict_proba(X)[:, 1] interface as the classifier
+    so downstream code can call it polymorphically — but the meaning
+    of the "second column" is now "expected return per dollar" rather
+    than "probability of correctness".
+    """
+
+    target_type = "regression"
+
+    def __init__(self, base):
+        self._base = base
+        self.feature_importances_ = base.feature_importances_
+
+    def predict_proba(self, X):
+        # Return as a 2-column array (col 0 unused, col 1 is the EV) so
+        # callers using `[:, 1]` still work without branching.
+        ev = self._base.predict(X)
+        out = np.zeros((len(ev), 2), dtype=np.float32)
+        out[:, 1] = ev
+        return out
+
+
 class FiltrationModel:
-    """Thin wrapper around a trained XGBoost classifier."""
+    """Thin wrapper around a trained XGBoost classifier OR regressor."""
 
     def __init__(self, model, threshold: float = 0.55):
         self._model = model
         self.threshold = threshold
+        # "classification" → confidence is P(correct), threshold gates trades
+        # "regression"     → confidence is expected_pnl_per_dollar, threshold
+        #                    is interpreted as the EV cutoff (default 0.0)
+        self.target_type = getattr(model, "target_type", "classification")
 
     @classmethod
     def load(cls, path: Path = MODEL_PATH, threshold: float = 0.55) -> "FiltrationModel":
@@ -142,7 +177,12 @@ class FiltrationModel:
         return cls(model, threshold)
 
     def predict_proba(self, features: list[float]) -> float:
-        """Return probability that the current signal direction is correct."""
+        """Return the model's primary score for the feature row.
+
+        For classification models: probability the direction is correct (0..1).
+        For regression models: predicted realized PnL per dollar (typically
+        in [-1.0, +1.0] range, can extend slightly outside).
+        """
         X = np.array(features, dtype=np.float32).reshape(1, -1)
         return float(self._model.predict_proba(X)[0, 1])
 

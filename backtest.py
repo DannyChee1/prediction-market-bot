@@ -3401,6 +3401,8 @@ def build_diffusion_signal(
     min_z: float = 0.0,
     maker: bool = False,
     use_regime_classifier: bool = True,
+    use_filtration: bool = True,
+    filtration_threshold: float = 0.55,
     market_blend_override: float | None = None,
     tail_mode_override: str | None = None,
 ):
@@ -3473,6 +3475,29 @@ def build_diffusion_signal(
         except (ImportError, FileNotFoundError):
             regime_classifier = None
 
+    # Optional filtration model (XGBoost confidence gate). Loads from
+    # `filtration_model.pkl` if it exists. Trained across all markets
+    # in one model with asset_id as a feature; we pass the per-market
+    # asset_id here so the model knows which market it's gating.
+    # None-safe — absence of the pkl is a hard no-op (returns True).
+    # The _check_filtration gate has an early-exit at abs(z) < 0.10
+    # which means it ONLY acts on directional setups, never on
+    # indecision ticks.
+    filtration_model = None
+    filtration_asset_id = 0
+    if use_filtration:
+        try:
+            from filtration_model import FiltrationModel, ASSET_IDS
+            from pathlib import Path as _Path
+            fpkl = _Path(__file__).parent / "filtration_model.pkl"
+            if fpkl.exists():
+                filtration_model = FiltrationModel.load(
+                    fpkl, threshold=filtration_threshold
+                )
+                filtration_asset_id = ASSET_IDS.get(config.data_subdir, 0)
+        except (ImportError, FileNotFoundError):
+            filtration_model = None
+
     # market_blend: pull from config by default, allow explicit override for A/B
     effective_blend = (market_blend_override
                        if market_blend_override is not None
@@ -3509,6 +3534,9 @@ def build_diffusion_signal(
         sigma_estimator=config.sigma_estimator,
         regime_classifier=regime_classifier,
         regime_early_tau_s=regime_early_tau_s,
+        filtration_model=filtration_model,
+        filtration_threshold=filtration_threshold,
+        filtration_asset_id=filtration_asset_id,
         data_subdir=config.data_subdir,
         **{**eth_overrides, **maker_overrides, **vamp_kw},
     )
@@ -3558,6 +3586,12 @@ def main():
                         help="Override tail_mode from config. Use 'kou_full' for the "
                              "proper Kou jump-diffusion path (bipower variation for "
                              "continuous σ + physical-measure drift). Default uses config.")
+    parser.add_argument("--no-filtration", action="store_true",
+                        help="Disable the XGBoost filtration confidence gate (it "
+                             "auto-loads from filtration_model.pkl by default).")
+    parser.add_argument("--filtration-threshold", type=float, default=0.55,
+                        help="Confidence threshold for the filtration gate (default 0.55). "
+                             "Lower = more permissive, higher = more strict.")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -3593,6 +3627,8 @@ def main():
             cross_asset_min_z=args.cross_asset_min_z,
             min_z=args.min_z,
             maker=args.maker,
+            use_filtration=not args.no_filtration,
+            filtration_threshold=args.filtration_threshold,
             market_blend_override=args.market_blend,
             tail_mode_override=args.tail_mode,
         ),

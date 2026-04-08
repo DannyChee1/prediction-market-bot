@@ -1036,6 +1036,17 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
     def _log_diagnostic(self, snapshot: Snapshot, decision: Decision):
         """Log a signal diagnostic snapshot every 60s."""
+        # None-safe rounder: dict.get(key, default) only substitutes the
+        # default when the key is MISSING, not when the value is None.
+        # Several ctx fields (_book_age_ms, _chainlink_age_ms, etc.) are
+        # explicitly set to None by live_trader when no feed data is
+        # available, which would crash round(None, 1).
+        def _r(key, default, ndigits):
+            v = self.ctx.get(key, default)
+            if v is None:
+                v = default
+            return round(v, ndigits)
+
         hist = self.ctx.get("price_history", [])
         ts_hist = self.ctx.get("ts_history", [])
         raw_sigma = self.signal._compute_vol(
@@ -1055,12 +1066,18 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         edge_up = edge_down = p_model = 0.0
         spread_up = spread_down = 0.0
 
+        # Snapshot fields can be None during warmup / missing book. Use
+        # safe defaults so we can still emit a diagnostic row.
+        cl_price = snapshot.chainlink_price if snapshot.chainlink_price is not None else 0.0
+        ws_price = snapshot.window_start_price if snapshot.window_start_price is not None else 0.0
+
         if (ask_up and ask_down and bid_up and bid_down
                 and 0 < ask_up < 1 and 0 < ask_down < 1
-                and sigma_per_s > 0 and tau > 0):
+                and sigma_per_s > 0 and tau > 0
+                and cl_price > 0 and ws_price > 0):
             spread_up = ask_up - bid_up
             spread_down = ask_down - bid_down
-            delta = (snapshot.chainlink_price - snapshot.window_start_price) / snapshot.window_start_price
+            delta = (cl_price - ws_price) / ws_price
             z_raw = delta / (sigma_per_s * math.sqrt(tau))
             z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
             p_model = self.signal._p_model(z, tau, self.ctx)
@@ -1073,9 +1090,9 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "ts": datetime.now(timezone.utc).isoformat(),
             "market_slug": snapshot.market_slug,
             "tau": round(tau, 0),
-            "chainlink_price": round(snapshot.chainlink_price, 2),
-            "window_start_price": round(snapshot.window_start_price, 2),
-            "delta": round(snapshot.chainlink_price - snapshot.window_start_price, 2),
+            "chainlink_price": round(cl_price, 2),
+            "window_start_price": round(ws_price, 2),
+            "delta": round(cl_price - ws_price, 2),
             "sigma_per_s": f"{sigma_per_s:.2e}",
             "p_model": round(p_model, 4),
             "ask_up": ask_up,
@@ -1085,23 +1102,23 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "edge_up": round(edge_up, 4),
             "edge_down": round(edge_down, 4),
             "dyn_threshold": round(dyn_threshold, 4),
-            "dyn_threshold_down": round(self.ctx.get("_dyn_threshold_down", dyn_threshold), 4),
+            "dyn_threshold_down": _r("_dyn_threshold_down", dyn_threshold, 4),
             "best_edge": round(max(edge_up, edge_down), 4),
             "edge_gap": round(max(edge_up, edge_down) - dyn_threshold, 4),
-            "toxicity": round(self.ctx.get("_toxicity", 0.0), 4),
-            "vpin": round(self.ctx.get("_vpin", 0.0), 4),
-            "oracle_lag": round(self.ctx.get("_oracle_lag", 0.0), 6),
-            "regime_z_factor": round(self.ctx.get("_regime_z_factor", 1.0), 4),
+            "toxicity": _r("_toxicity", 0.0, 4),
+            "vpin": _r("_vpin", 0.0, 4),
+            "oracle_lag": _r("_oracle_lag", 0.0, 6),
+            "regime_z_factor": _r("_regime_z_factor", 1.0, 4),
             "signal_trigger_source": self.ctx.get("_signal_trigger_source"),
-            "signal_trigger_age_ms": round(self.ctx.get("_signal_trigger_age_ms", 0.0), 1),
-            "signal_trigger_feed_age_ms": round(self.ctx.get("_signal_trigger_feed_age_ms", 0.0), 1),
-            "signal_eval_ms": round(self.ctx.get("_signal_eval_ms", 0.0), 1),
-            "decision_total_ms": round(self.ctx.get("_decision_total_ms", 0.0), 1),
-            "chainlink_age_ms": round(self.ctx.get("_chainlink_age_ms", 0.0), 1),
-            "binance_age_ms": round(self.ctx.get("_binance_age_ms", 0.0), 1),
-            "book_age_ms": round(self.ctx.get("_book_age_ms", 0.0), 1),
+            "signal_trigger_age_ms": _r("_signal_trigger_age_ms", 0.0, 1),
+            "signal_trigger_feed_age_ms": _r("_signal_trigger_feed_age_ms", 0.0, 1),
+            "signal_eval_ms": _r("_signal_eval_ms", 0.0, 1),
+            "decision_total_ms": _r("_decision_total_ms", 0.0, 1),
+            "chainlink_age_ms": _r("_chainlink_age_ms", 0.0, 1),
+            "binance_age_ms": _r("_binance_age_ms", 0.0, 1),
+            "book_age_ms": _r("_book_age_ms", 0.0, 1),
             "down_bonus_active": self.ctx.get("_down_bonus_active", False),
-            "down_share": round(self.ctx.get("_down_share", 0.5), 4),
+            "down_share": _r("_down_share", 0.5, 4),
             "reason": decision.reason,
             "hist_len": len(hist),
             "evals": self.signal_eval_count,

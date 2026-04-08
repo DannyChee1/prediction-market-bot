@@ -63,15 +63,24 @@ class OrderMixin:
         )
 
     def _latency_log_fields(self: "LiveTradeTracker") -> dict:
+        # None-safe rounder: dict.get(key, default) only substitutes the
+        # default when the key is MISSING, not when the value is None.
+        # live_trader explicitly sets these *_age_ms fields to None when
+        # the corresponding feed has no data, which would crash round(None, 1).
+        def _r(key, ndigits):
+            v = self.ctx.get(key, 0.0)
+            if v is None:
+                v = 0.0
+            return round(v, ndigits)
         return {
             "signal_trigger_source": self.ctx.get("_signal_trigger_source"),
-            "signal_trigger_age_ms": round(self.ctx.get("_signal_trigger_age_ms", 0.0), 1),
-            "signal_trigger_feed_age_ms": round(self.ctx.get("_signal_trigger_feed_age_ms", 0.0), 1),
-            "signal_eval_ms": round(self.ctx.get("_signal_eval_ms", 0.0), 1),
-            "decision_total_ms": round(self.ctx.get("_decision_total_ms", 0.0), 1),
-            "chainlink_age_ms": round(self.ctx.get("_chainlink_age_ms", 0.0), 1),
-            "binance_age_ms": round(self.ctx.get("_binance_age_ms", 0.0), 1),
-            "book_age_ms": round(self.ctx.get("_book_age_ms", 0.0), 1),
+            "signal_trigger_age_ms": _r("_signal_trigger_age_ms", 1),
+            "signal_trigger_feed_age_ms": _r("_signal_trigger_feed_age_ms", 1),
+            "signal_eval_ms": _r("_signal_eval_ms", 1),
+            "decision_total_ms": _r("_decision_total_ms", 1),
+            "chainlink_age_ms": _r("_chainlink_age_ms", 1),
+            "binance_age_ms": _r("_binance_age_ms", 1),
+            "book_age_ms": _r("_book_age_ms", 1),
         }
 
     # ── Cancel ─────────────────────────────────────────────────────────────

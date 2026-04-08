@@ -32,18 +32,22 @@ class OrderMixin:
 
     @staticmethod
     def _fee_for_fill(price: float, shares: float) -> tuple[float, float]:
-        """Compute (fee_total, fee_per_share) for a Polymarket binary fill.
+        """Compute (fee_total, fee_per_share) for a Polymarket fill.
 
-        Polymarket charges a 2%·p·(1−p) taker fee on binary markets.
-        At p=0.5 this is the maximum 0.5%. At p=0.2 it's 0.32%.
-        Tiny per fill, but compounds across hundreds of fills per day —
-        the bot's bankroll silently drifts above the on-chain wallet
-        without this. The makingAmount returned by the CLOB is gross.
+        IMPORTANT: the bot only places GTC limit orders that rest on the
+        bid (see _place_limit_order: limit_price = best_bid). When those
+        get hit by a market taker, WE are the maker → 0% fee on
+        Polymarket binary markets. The reviewer's P12.3 fix that applied
+        2%·p·(1−p) was WRONG — it deducted fees from maker fills and
+        caused visible bankroll drift (operator: "we're profiting but
+        bankroll is going down").
+
+        Returns (0.0, 0.0) for the maker case. The taker rate would only
+        apply if our limit order somehow crossed the spread and immediately
+        matched as a self-taker, which is extremely rare in practice and
+        not worth tracking until the operator says otherwise.
         """
-        if price <= 0 or price >= 1.0 or shares <= 0:
-            return 0.0, 0.0
-        fee_per_share = poly_fee(price)
-        return fee_per_share * shares, fee_per_share
+        return 0.0, 0.0
 
     @staticmethod
     def _model_log_fields(order: dict) -> dict:

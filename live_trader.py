@@ -709,12 +709,38 @@ async def _resolve_background(
     This keeps resolution fast so the next window isn't blocked.
     """
     window_pnl = 0.0
+    resolve_succeeded = False
     try:
         window_pnl = await asyncio.to_thread(
             tracker.resolve_window, slug, final_price, start_price, condition_id,
         ) or 0.0
+        resolve_succeeded = True
     except Exception as exc:
-        print(f"  [RESOLVE] ERROR: {type(exc).__name__}: {exc}")
+        # CRITICAL: do NOT default to pnl=0 and sync_bankroll. Real
+        # positions are still in tracker.pending_fills; if we sync now,
+        # the ledger silently diverges from on-chain truth. Log loudly,
+        # leave the pending fills in place, and let the next window's
+        # new_window() flag them as unresolved (which it already does).
+        import traceback
+        tb = traceback.format_exc(limit=3)
+        print(f"  [RESOLVE] FAILED for {slug}: {type(exc).__name__}: {exc}")
+        print(f"  [RESOLVE] traceback: {tb}")
+        print(f"  [RESOLVE] {len(tracker.pending_fills)} pending fills NOT synced")
+        try:
+            tracker._log({
+                "type": "resolution_failed",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "slug": slug,
+                "error": f"{type(exc).__name__}: {exc}",
+                "pending_fills": len(tracker.pending_fills),
+            })
+        except Exception:
+            pass
+        # Skip the bankroll sync — leave bankroll where it was so that
+        # the operator can retry / reconcile manually rather than
+        # silently absorbing a phantom $0 PnL.
+        tracker.save_state()
+        return
     _sync_bankroll(all_trackers, resolved_tracker=tracker, window_pnl=window_pnl)
     tracker.save_state()
     # Fire-and-forget: kick off queue processing without blocking.
@@ -768,9 +794,17 @@ async def _window_loop(
     wake_state: dict,
     section: dict,
     all_trackers: list[LiveTradeTracker],
+    shutdown: asyncio.Event,
     record: bool = True,
 ):
-    """Main loop for one timeframe — runs forever, handles search/trade/resolve."""
+    """Main loop for one timeframe — runs forever, handles search/trade/resolve.
+
+    The `shutdown` event lets the main task signal a graceful exit:
+    when set, the loop finishes the current window, awaits any pending
+    background resolve, and returns. Without this, Ctrl-C hangs because
+    asyncio.gather waits for the loop forever and the loop has no exit
+    condition.
+    """
     # Trade state persists across windows — VPIN needs 20+ min history
     vpin_bar_s = tracker.signal.vpin_bar_s
     trade_state: dict = {
@@ -783,7 +817,7 @@ async def _window_loop(
 
     pending_resolve: asyncio.Task | None = None
 
-    while True:
+    while not shutdown.is_set():
         result = await run_window(
             tracker, config, price_state, trade_state,
             binance_state, signal_wakeup, wake_state, section,
@@ -814,6 +848,18 @@ async def _window_loop(
                 condition_id, all_trackers,
             )
         )
+
+    # Graceful shutdown — drain any in-flight resolution before returning
+    # so we don't lose state or leave pending fills mid-resolve.
+    if pending_resolve is not None and not pending_resolve.done():
+        try:
+            print(f"  [{config.display_name}] Shutdown: awaiting pending resolve...")
+            await asyncio.wait_for(pending_resolve, timeout=15.0)
+        except asyncio.TimeoutError:
+            print(f"  [{config.display_name}] Shutdown: pending resolve timed out")
+        except Exception as exc:
+            print(f"  [{config.display_name}] Shutdown: pending resolve error: {exc}")
+    print(f"  [{config.display_name}] Window loop exited cleanly")
 
 
 async def run(
@@ -850,8 +896,26 @@ async def run(
         binance_feed, binance_mode = _make_binance_feed(base_config.binance_symbol)
         print(f"  [BinanceFeed] started ({base_config.binance_symbol}, mode={binance_mode})")
 
-    # Shared polling loops
+    # Shared polling loops + global shutdown signal
     feed_cancel = asyncio.Event()
+    shutdown = asyncio.Event()
+    # Wire SIGINT/SIGTERM to set the shutdown event so window loops exit
+    # cleanly. Without this, Ctrl-C asks asyncio.gather to cancel — but
+    # the inner `while True:` loops never check for cancellation, so the
+    # process hangs until the OS hard-kills it.
+    import signal as _signal
+    loop = asyncio.get_running_loop()
+    def _request_shutdown():
+        if not shutdown.is_set():
+            print("\n  [SHUTDOWN] Signal received, finishing current windows...")
+            shutdown.set()
+    for sig_name in ("SIGINT", "SIGTERM"):
+        try:
+            loop.add_signal_handler(getattr(_signal, sig_name), _request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            # Windows / non-main-thread case — fall back to default handler
+            pass
+
     price_poll = asyncio.create_task(
         _poll_price_feed(price_feed, price_state, all_trackers, feed_cancel,
                          debug=debug, symbol=base_config.chainlink_symbol,
@@ -934,6 +998,7 @@ async def run(
                     tracker, config, price_state, binance_state,
                     signal_wakeup, wake_state,
                     display_sections[i], all_trackers,
+                    shutdown,
                     record=record,
                 )
             )
@@ -1201,6 +1266,15 @@ def _build_tracker(
         tracker.peak_bankroll = saved.get("peak_bankroll", bankroll)
         tracker.max_drawdown = saved.get("max_drawdown", 0.0)
         tracker.max_dd_pct = saved.get("max_dd_pct", 0.0)
+        # Restore lifetime scalar totals (P12.4). These are the source
+        # of truth for cumulative PnL — they survive truncation of the
+        # all_results list during save. Fall back to the legacy total_pnl
+        # field for backward compat with older state files that don't
+        # have lifetime_* yet.
+        tracker.lifetime_pnl = float(saved.get("lifetime_pnl", saved.get("total_pnl", 0.0)))
+        tracker.lifetime_wins = int(saved.get("lifetime_wins", saved.get("wins", 0)))
+        tracker.lifetime_losses = int(saved.get("lifetime_losses", saved.get("losses", 0)))
+        tracker.lifetime_trades = int(saved.get("lifetime_trades", saved.get("total_trades", 0)))
         # Restore trade history so the displayed PnL is lifetime, not
         # session-since-restart. Without this, the bot's display PnL
         # resets to $0 every restart even though `bankroll` reflects

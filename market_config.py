@@ -37,6 +37,11 @@ class MarketConfig:
     # bot from chasing every signal flip. Setting this >1 enables
     # "averaging in" — additional trades in the same window after the
     # first fills.
+    #
+    # Default applies to ALL markets that don't override (eth, sol, xrp,
+    # 5m variants). At max=1 the same_direction_stacking_only flag is
+    # dormant since there's never a "second trade" decision to gate.
+    # Only btc 15m currently sets max_trades_per_window=2.
     max_trades_per_window: int = 1
     # When max_trades_per_window > 1, restrict subsequent trades to
     # the SAME direction as the first. Prevents the bot from hedging

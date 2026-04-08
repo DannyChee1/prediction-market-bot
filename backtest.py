@@ -916,6 +916,7 @@ def build_diffusion_signal(
         maker_withdraw_s=maker_withdraw_s,
         max_sigma=config.max_sigma,
         min_sigma=config.min_sigma,
+        edge_threshold=config.edge_threshold,
         oracle_cancel_threshold=oracle_cancel_threshold,
         cross_asset_z_lookup=cross_asset_lookup,
         cross_asset_min_z=cross_asset_min_z,

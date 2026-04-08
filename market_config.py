@@ -63,6 +63,14 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         binance_symbol="btcusdt",
         tail_mode="kou",
         tail_nu_default=20.0,
+        # Kou jump params moment-matched from 4.8k post-fix BTC 15m
+        # windows (2M+ returns) at k=3σ jump threshold. See comment on
+        # btc_5m below for methodology. Inert under tail_mode="kou";
+        # used only under tail_mode="kou_full".
+        kou_lambda=0.0684,
+        kou_p_up=0.5013,
+        kou_eta1=4504.3,
+        kou_eta2=4509.6,
         # Market-blend: post-fix 50-day backfill (14k BTC 5m / 4.7k BTC 15m
         # REST + live windows) sweep showed BTC 15m Sharpe climbs from 0.61
         # @ blend=0.0 to 1.36 @ blend=0.5 (+123%), max drawdown drops from
@@ -117,12 +125,17 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         binance_symbol="btcusdt",
         tail_mode="kou",
         tail_nu_default=20.0,
-        # Kou jump params — currently inert: see _model_cdf comment for why.
-        # Kept in config for forward-compat in case `kou_cdf` is wired in.
-        kou_lambda=0.007,
-        kou_p_up=0.526,
-        kou_eta1=1254.1,
-        kou_eta2=1200.5,
+        # Kou jump params moment-matched from 14k post-fix BTC 5m windows
+        # (2M+ returns). Old values (λ=0.007, p_up=0.526, η=1254/1200)
+        # were fit against the buggy model — p_up asymmetry was an
+        # artifact of the Kou drift bug's downward p_UP bias. New values
+        # reflect the actually-observed jump distribution at k=3σ.
+        # Used only when tail_mode="kou_full"; inert under tail_mode="kou".
+        # See /tmp/fit_kou_params.py + tasks/findings/post_fix_revalidation_2026-04-07.md.
+        kou_lambda=0.0758,
+        kou_p_up=0.5014,
+        kou_eta1=4884.8,
+        kou_eta2=4867.7,
         min_entry_z=0.0,            # blend filters disagreement (was 0.7)
         min_entry_price=0.20,       # avoid deep OTM tail (was 0.10)
         edge_threshold=0.06,

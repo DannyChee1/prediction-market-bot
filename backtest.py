@@ -218,7 +218,8 @@ def _poisson_pmf(k: int, lam: float) -> float:
 
 
 def kou_cdf(x: float, sigma: float, lam: float, p_up: float,
-            eta1: float, eta2: float, tau: float) -> float:
+            eta1: float, eta2: float, tau: float,
+            mu_override: float | None = None) -> float:
     """CDF of log-return under Kou double-exponential jump-diffusion.
 
     P(X_tau < x) where X_tau = (drift)*tau + sigma*W_tau + sum_jumps.
@@ -228,17 +229,34 @@ def kou_cdf(x: float, sigma: float, lam: float, p_up: float,
 
     Uses CLT approximation when expected jumps (lam*tau) > 5, exact
     Poisson-weighted Gaussian convolution otherwise.
+
+    `sigma` must be the CONTINUOUS-component σ (not total realized σ).
+    The function adds jump variance on top of it via `lam_tau * ej2`,
+    so passing a total-σ (which already absorbs jumps) will double-count
+    variance. Use `bipower_variation_per_s` to get the continuous
+    component.
+
+    `mu_override`: when None, the risk-neutral (Q-measure) martingale
+    drift `-σ²/2 - λ·ζ` is used — that's the option-pricing convention.
+    For physical-measure binary prediction (P(S_T > S_0) on short-
+    horizon crypto), pass `mu_override=0.0` so the drift term
+    disappears entirely; short-horizon crypto has ~zero expected return
+    per second and we just want the spread of the distribution around
+    the current price.
     """
     q_down = 1.0 - p_up
     # Jump moments
     ej  = p_up / eta1 - q_down / eta2            # E[Y_i]
     ej2 = 2.0 * p_up / (eta1**2) + 2.0 * q_down / (eta2**2)  # E[Y_i^2]
 
-    # Drift correction (risk-neutral): mu = -sigma^2/2 - lam*(E[e^Y]-1)
-    # For small jumps: E[e^Y]-1 ≈ ej + ej2/2
-    zeta = p_up * eta1 / (eta1 - 1.0) + q_down * eta2 / (eta2 + 1.0) - 1.0 \
-        if eta1 > 1.0 else ej + ej2 / 2.0
-    mu = -0.5 * sigma**2 - lam * zeta
+    if mu_override is not None:
+        mu = float(mu_override)
+    else:
+        # Drift correction (risk-neutral): mu = -sigma^2/2 - lam*(E[e^Y]-1)
+        # For small jumps: E[e^Y]-1 ≈ ej + ej2/2
+        zeta = p_up * eta1 / (eta1 - 1.0) + q_down * eta2 / (eta2 + 1.0) - 1.0 \
+            if eta1 > 1.0 else ej + ej2 / 2.0
+        mu = -0.5 * sigma**2 - lam * zeta
 
     lam_tau = lam * tau
 
@@ -1726,11 +1744,38 @@ class DiffusionSignal(Signal):
             # produced a -1.7% to -7% systematic downward bias on p_UP that
             # asymmetrically favored BUY_DOWN trades. Removed.
             #
-            # If you want jump variance to actually fatten the tails (rather
-            # than relying on realized vol to absorb it), wire `kou_cdf` from
-            # this module into the call below — but be aware that doing so
-            # double-counts whatever jump variance is already in sigma_per_s.
+            # For the proper Kou with jump-variance fattening without
+            # double-counting, use tail_mode="kou_full" (below), which
+            # uses bipower variation for the continuous σ component.
             return norm_cdf(z)
+        if self.tail_mode == "kou_full":
+            # Proper Kou jump-diffusion under physical measure.
+            #
+            # σ input to kou_cdf must be the CONTINUOUS-component σ
+            # (bipower variation), so the function's internal
+            # `lam_tau*ej2` jump-variance addition doesn't double-count
+            # what our total-σ already absorbs.
+            #
+            # `mu_override=0.0` = physical-measure drift (short-horizon
+            # crypto has ~zero expected log-return per second). The
+            # kou_cdf default is the Q-measure martingale correction
+            # which would reintroduce the -1.7% to -7% p_UP bias we
+            # fought to remove from the plain "kou" path.
+            sigma_cont = ctx.get("_sigma_continuous_per_s", 0.0)
+            tau = ctx.get("_tau", 300.0)
+            if sigma_cont <= 0 or tau <= 0:
+                return norm_cdf(z)  # graceful fallback
+            delta_log = ctx.get("_delta_log", 0.0)
+            # P(UP) = P(log(S_T/S_0) > 0 | observed log(S_t/S_0) = delta_log)
+            #       = P(log(S_T/S_t) > -delta_log)   (future increment)
+            #       = 1 - kou_cdf(-delta_log, σ_cont, λ, p_up, η1, η2, τ)
+            p_down = kou_cdf(
+                -delta_log, sigma_cont,
+                self.kou_lambda, self.kou_p_up,
+                self.kou_eta1, self.kou_eta2, tau,
+                mu_override=0.0,
+            )
+            return 1.0 - p_down
         if self.tail_mode == "market_adaptive":
             p_gbm = norm_cdf(z)
             market_mid = ctx.get("_market_mid", 0.5)
@@ -1914,9 +1959,23 @@ class DiffusionSignal(Signal):
         z = max(-self.max_z, min(self.max_z, z_raw))
         ctx["_z_raw"] = z_raw
         ctx["_z"] = z
-        # Populate context for kou / market_adaptive CDF
+        # Populate context for kou / market_adaptive / kou_full CDFs
         ctx["_sigma_per_s"] = sigma_per_s
         ctx["_tau"] = tau
+        # Uncapped log-delta for kou_full (kou_cdf handles its own
+        # distribution spread so no reason to cap delta like we do z)
+        if price > 0 and snapshot.window_start_price > 0:
+            ctx["_delta_log"] = math.log(price / snapshot.window_start_price)
+        else:
+            ctx["_delta_log"] = 0.0
+        # Continuous-component σ via bipower variation — only when the
+        # model tail mode needs it. BV is cheap (one mean over a product)
+        # but still worth skipping on the default path.
+        if self.tail_mode == "kou_full":
+            from scripts.sigma_estimators import bipower_variation_per_s
+            ctx["_sigma_continuous_per_s"] = bipower_variation_per_s(
+                hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
+            )
         dur_s = ctx.get("_window_duration_s", tau + 1.0)
         if "_window_duration_s" not in ctx:
             ctx["_window_duration_s"] = snapshot.time_remaining_s  # first call ≈ full duration
@@ -2381,9 +2440,21 @@ class DiffusionSignal(Signal):
         z = max(-self.max_z, min(self.max_z, z_raw))
         ctx["_z_raw"] = z_raw
         ctx["_z"] = z
-        # Populate context for kou / market_adaptive CDF
+        # Populate context for kou / market_adaptive / kou_full CDFs
         ctx["_sigma_per_s"] = sigma_per_s
         ctx["_tau"] = tau
+        # Uncapped log-delta for kou_full (kou_cdf handles its own spread)
+        if price > 0 and snapshot.window_start_price > 0:
+            ctx["_delta_log"] = math.log(price / snapshot.window_start_price)
+        else:
+            ctx["_delta_log"] = 0.0
+        # Continuous-component σ via bipower variation — only computed
+        # when the model tail mode needs it.
+        if self.tail_mode == "kou_full":
+            from scripts.sigma_estimators import bipower_variation_per_s
+            ctx["_sigma_continuous_per_s"] = bipower_variation_per_s(
+                hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
+            )
         dur_s = ctx.get("_window_duration_s", tau + 1.0)
         if "_window_duration_s" not in ctx:
             ctx["_window_duration_s"] = snapshot.time_remaining_s
@@ -3331,6 +3402,7 @@ def build_diffusion_signal(
     maker: bool = False,
     use_regime_classifier: bool = True,
     market_blend_override: float | None = None,
+    tail_mode_override: str | None = None,
 ):
     """Construct the production DiffusionSignal for a given market.
 
@@ -3405,6 +3477,9 @@ def build_diffusion_signal(
     effective_blend = (market_blend_override
                        if market_blend_override is not None
                        else config.market_blend)
+    effective_tail_mode = (tail_mode_override
+                           if tail_mode_override is not None
+                           else config.tail_mode)
 
     return DiffusionSignal(
         bankroll=bankroll,
@@ -3420,7 +3495,7 @@ def build_diffusion_signal(
         cross_asset_z_lookup=cross_asset_lookup,
         cross_asset_min_z=cross_asset_min_z,
         min_entry_z=min_z,
-        tail_mode=config.tail_mode,
+        tail_mode=effective_tail_mode,
         tail_nu_default=config.tail_nu_default,
         kou_lambda=config.kou_lambda,
         kou_p_up=config.kou_p_up,
@@ -3477,7 +3552,12 @@ def main():
     parser.add_argument("--market-blend", type=float, default=None,
                         help="Override market_blend from config (0.0 = pure model, "
                              "0.5 = 50/50, 1.0 = pure market consensus). "
-                             "If omitted, uses config value (btc_5m=0.3, btc=0.0).")
+                             "If omitted, uses config value (btc_5m=0.3, btc=0.5).")
+    parser.add_argument("--tail-mode", default=None,
+                        choices=[None, "normal", "kou", "kou_full", "student_t", "market_adaptive"],
+                        help="Override tail_mode from config. Use 'kou_full' for the "
+                             "proper Kou jump-diffusion path (bipower variation for "
+                             "continuous σ + physical-measure drift). Default uses config.")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -3514,6 +3594,7 @@ def main():
             min_z=args.min_z,
             maker=args.maker,
             market_blend_override=args.market_blend,
+            tail_mode_override=args.tail_mode,
         ),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

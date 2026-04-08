@@ -212,12 +212,18 @@ class DiffusionSignal(Signal):
         # on both BTC markets and meaningfully wins on btc 15m
         # (Sharpe 1.28 → 1.36, PnL +$238, DD 6.3% → 5.8%).
         filtration_mode: str = "size_mult",
-        # Confidence-to-multiplier mapping for "size_mult" mode.
+        # Confidence-to-multiplier mapping for "size_mult" mode (classification).
         # Linear from filtration_size_mult_floor (mult=0) to 1.0 (mult=1).
         # At conf=floor, the trade is fully suppressed; at conf=1.0, full
         # size; in between, scaled linearly. Default floor 0.45 means trades
         # the model thinks are worse than coin-flip get zero size.
         filtration_size_mult_floor: float = 0.45,
+        # Multiplier ceiling for regression-mode filtration (target=regression).
+        # Confidence is now predicted PnL per dollar (typically -1.0 to ~+1.0).
+        # Linear from 0.0 (mult=0) to filtration_ev_full (mult=1). Above the
+        # ceiling, mult stays at 1.0. Default 0.50 means a predicted 50% per-
+        # dollar return saturates the multiplier.
+        filtration_ev_full: float = 0.50,
         # Oracle hard cancel: return FLAT immediately when Binance-Chainlink
         # gap exceeds this fraction.  Set to 0.0 to disable (default).
         # 0.004 = cancel when gap > 0.4% (Chainlink triggers at 0.5%).
@@ -328,6 +334,7 @@ class DiffusionSignal(Signal):
             )
         self.filtration_mode = filtration_mode
         self.filtration_size_mult_floor = float(filtration_size_mult_floor)
+        self.filtration_ev_full = float(filtration_ev_full)
         self.oracle_cancel_threshold = oracle_cancel_threshold
         self.cross_asset_z_lookup = cross_asset_z_lookup
         self.cross_asset_min_z = cross_asset_min_z
@@ -757,10 +764,21 @@ class DiffusionSignal(Signal):
     def _filtration_size_multiplier(self, ctx: dict) -> float:
         """Return Kelly multiplier from filtration confidence in size_mult mode.
 
-        Linear interpolation from `filtration_size_mult_floor` (mult=0)
-        to 1.0 (mult=1). Confidence at-or-below the floor → zero size
-        (effectively gated). Confidence at 1.0 → full size. In between,
-        scaled linearly. Returns 1.0 when:
+        Two cases depending on the filtration model's target_type:
+
+        Classification model (legacy):
+          confidence is P(direction correct) ∈ [0, 1].
+          Linear interpolation from filtration_size_mult_floor (mult=0)
+          to 1.0 (mult=1). Default floor 0.45.
+
+        Regression model (filtration_model_pnl.pkl):
+          confidence is predicted_pnl_per_dollar (typically -1.0 to ~+1.0).
+          Linear interpolation from 0.0 (mult=0) to filtration_ev_full (mult=1).
+          Below 0 → zero size (predicted negative EV → don't trade).
+          Above filtration_ev_full → full size.
+          Default ceiling 0.50 (i.e. 50% per-dollar EV → max sizing).
+
+        Returns 1.0 when:
           - filtration_mode != "size_mult" (no-op)
           - no filtration model loaded
           - confidence not in ctx (early-exit fired in _check_filtration)
@@ -775,6 +793,16 @@ class DiffusionSignal(Signal):
         conf = ctx.get("_filtration_confidence")
         if conf is None:
             return 1.0
+        target_type = getattr(self.filtration_model, "target_type", "classification")
+        if target_type == "regression":
+            # conf is predicted PnL per dollar; map to [0, 1] mult
+            if conf <= 0.0:
+                return 0.0
+            ceiling = self.filtration_ev_full
+            if conf >= ceiling:
+                return 1.0
+            return float(conf / ceiling)
+        # classification
         floor = self.filtration_size_mult_floor
         if conf <= floor:
             return 0.0

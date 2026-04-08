@@ -74,16 +74,28 @@ def _render_section(
             "waiting": "Waiting for window start...",
         }
         lines.append(f"  Status: {status_map.get(status, status)}")
-        # Still show session stats for this tracker
-        all_results = _safe_list(tracker.all_results)
-        total = len(all_results)
-        total_pnl = sum(r.pnl for r in all_results)
-        wins = sum(1 for r in all_results if r.pnl > 0)
-        win_str = f"{wins}/{total} ({wins / total:.0%})" if total > 0 else "---"
-        lines.append(
-            f"  Bankroll: ${tracker.bankroll:,.2f}  |  "
-            f"Win: {win_str}  |  PnL: ${total_pnl:+,.2f}"
-        )
+        # Lifetime stats survive restarts (P12.4); fall back to session
+        # if lifetime tracking is empty (pre-P12.4 state file).
+        lifetime_pnl = getattr(tracker, "lifetime_pnl", 0.0)
+        lifetime_trades = getattr(tracker, "lifetime_trades", 0)
+        lifetime_wins = getattr(tracker, "lifetime_wins", 0)
+        if lifetime_trades > 0:
+            wr = lifetime_wins / lifetime_trades
+            lines.append(
+                f"  Bankroll: ${tracker.bankroll:,.2f}  |  "
+                f"Lifetime: ${lifetime_pnl:+,.2f} "
+                f"({lifetime_trades} trades, {wr:.0%})"
+            )
+        else:
+            all_results = _safe_list(tracker.all_results)
+            total = len(all_results)
+            total_pnl = sum(r.pnl for r in all_results)
+            wins = sum(1 for r in all_results if r.pnl > 0)
+            win_str = f"{wins}/{total} ({wins / total:.0%})" if total > 0 else "---"
+            lines.append(
+                f"  Bankroll: ${tracker.bankroll:,.2f}  |  "
+                f"Win: {win_str}  |  PnL: ${total_pnl:+,.2f}"
+            )
         lines.append("")
         return
 
@@ -188,14 +200,29 @@ def _render_section(
         lat_parts.append(f"eval p95={p95_eval:.1f}ms")
     lines.append(f"  Lat: {'  |  '.join(lat_parts)}")
 
-    # Bankroll + trades compact line
+    # Bankroll + trades compact line. Show available cash AND the
+    # cost locked up in resting orders + filled-but-unresolved positions
+    # so the operator can see why bankroll != cumulative PnL when there
+    # are open orders / pending fills.
     open_orders = _safe_list(tracker.open_orders)
     pending_fills = _safe_list(tracker.pending_fills)
-    lines.append(
-        f"  Bankroll: ${tracker.bankroll:,.2f}  |  "
-        f"Trades: {tracker.window_trade_count} this window  |  "
-        f"Open: {len(open_orders)}  |  Pos: {len(pending_fills)}"
-    )
+    locked = sum(o.get("cost_est", 0) for o in open_orders) + \
+             sum(f.get("cost_usd", 0) for f in pending_fills)
+    avail = tracker.bankroll
+    total_equity = avail + locked
+    if locked > 0.01:
+        lines.append(
+            f"  Equity: ${total_equity:,.2f}  "
+            f"(cash ${avail:,.2f} + locked ${locked:,.2f})  |  "
+            f"Trades: {tracker.window_trade_count}/win  |  "
+            f"Open: {len(open_orders)}  |  Pos: {len(pending_fills)}"
+        )
+    else:
+        lines.append(
+            f"  Bankroll: ${avail:,.2f}  |  "
+            f"Trades: {tracker.window_trade_count}/win  |  "
+            f"Open: {len(open_orders)}  |  Pos: {len(pending_fills)}"
+        )
 
     # Toxicity / VPIN indicators (compact)
     toxicity = tracker.ctx.get("_toxicity", 0.0)
@@ -337,6 +364,10 @@ def render_display(
     max_dd_pct = 0.0
     event_logs = []
 
+    # Aggregate lifetime + session totals across all timeframe trackers
+    lifetime_pnl_total = 0.0
+    lifetime_trades_total = 0
+    lifetime_wins_total = 0
     for sec in sections:
         t = sec["tracker"]
         all_results_combined.extend(_safe_list(t.all_results))
@@ -347,21 +378,45 @@ def render_display(
             max_dd = t.max_drawdown
             max_dd_pct = t.max_dd_pct
         event_logs.extend(_safe_list(t.event_log))
+        # Lifetime scalars (P12.4) — survive restarts via state file
+        lifetime_pnl_total += getattr(t, "lifetime_pnl", 0.0)
+        lifetime_trades_total += getattr(t, "lifetime_trades", 0)
+        lifetime_wins_total += getattr(t, "lifetime_wins", 0)
 
-    total = len(all_results_combined)
-    total_pnl = sum(r.pnl for r in all_results_combined)
-    wins = sum(1 for r in all_results_combined if r.pnl > 0)
-    win_str = f"{wins}/{total} ({wins / total:.0%})" if total > 0 else "---"
+    # Session = since last restart (in-memory all_results)
+    session_total = len(all_results_combined)
+    session_pnl = sum(r.pnl for r in all_results_combined)
+    session_wins = sum(1 for r in all_results_combined if r.pnl > 0)
 
-    lines.append("  -- Session Stats " + "-" * 40)
-    lines.append(
-        f"  PnL: ${total_pnl:+,.2f}  |  Win: {win_str}  |  "
-        f"DD: ${max_dd:.0f} ({max_dd_pct:.1%})"
-    )
-    lines.append(
-        f"  Windows: {total_windows_traded}/{total_windows_seen} traded  |  "
-        f"Fees: ~${total_fees:.2f}"
-    )
+    lines.append("  -- Stats " + "-" * 50)
+    if lifetime_trades_total > 0:
+        # Show lifetime AND session when both are meaningful
+        lifetime_wr = (lifetime_wins_total / lifetime_trades_total
+                       if lifetime_trades_total > 0 else 0.0)
+        lines.append(
+            f"  Lifetime: ${lifetime_pnl_total:+,.2f}  "
+            f"({lifetime_trades_total} trades, {lifetime_wr:.0%} win)  |  "
+            f"DD: ${max_dd:.0f} ({max_dd_pct:.1%})"
+        )
+        if session_total > 0:
+            session_wr = session_wins / session_total
+            lines.append(
+                f"  Session:  ${session_pnl:+,.2f}  "
+                f"({session_total} trades, {session_wr:.0%} win)  |  "
+                f"Windows: {total_windows_traded}/{total_windows_seen}"
+            )
+    else:
+        # Pre-P12.4 path or first session: only show session
+        win_str = (f"{session_wins}/{session_total} ({session_wins / session_total:.0%})"
+                   if session_total > 0 else "---")
+        lines.append(
+            f"  PnL: ${session_pnl:+,.2f}  |  Win: {win_str}  |  "
+            f"DD: ${max_dd:.0f} ({max_dd_pct:.1%})"
+        )
+        lines.append(
+            f"  Windows: {total_windows_traded}/{total_windows_seen} traded  |  "
+            f"Fees: ~${total_fees:.2f}"
+        )
 
     # Last result
     if all_results_combined:

@@ -634,7 +634,13 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         if down_dec.action == "FLAT":
             self._bucket_flat_reason(down_dec.reason)
 
-        if now - self.last_diag_ts >= 60:
+        # 2026-04-09: dropped from 60s → 5s after live debugging session.
+        # The 60s cadence meant the dashboard could be 30+s out of date when
+        # a fast trade fired between snapshots — making it impossible to
+        # see what the model was reacting to. 5s is the right tradeoff:
+        # ~12x larger jsonl growth (~5MB/day per market, acceptable) but
+        # the dashboard now reflects model decisions in near-real-time.
+        if now - self.last_diag_ts >= 5:
             self.last_diag_ts = now
             self._log_diagnostic(snapshot, self.last_decision)
 

@@ -121,6 +121,18 @@ class DiffusionSignal(Signal):
         # 0.05 = 5pp). The clip prevents huge biases from extreme gaps.
         # Set to 0.0 to disable.
         oracle_lead_bias: float = 0.05,
+        # Model-vs-market disagreement gate. When the diffusion model's
+        # raw output disagrees with the contract mid by more than this
+        # many percentage points, the model is probably wrong (not the
+        # market) — sustained low-vol periods make σ-based z-scores
+        # confidently incorrect. Skip the trade entirely.
+        #
+        # Empirically observed: σ collapse 4e-5 → 1.4e-5 over 1 second
+        # produces z=-1.00(cap), p_model_raw=0.16, while contract mid
+        # is at 0.47. The 31pp disagreement is a model failure, not
+        # an information edge. market_blend=0.3 only partially absorbs
+        # this; the gate is a hard backstop. Set to 1.0 to disable.
+        max_model_market_disagreement: float = 0.30,
         # Order book imbalance alpha: shift p_model by obi_weight * OBI
         obi_weight: float = 0.03,
         # Chainlink blend: seconds before expiry to start blending
@@ -253,6 +265,15 @@ class DiffusionSignal(Signal):
         cross_asset_min_z: float = 0.3,   # both |z| must exceed this to veto
         # Minimum |z| to enter: filter out low-conviction setups
         min_entry_z: float = 0.0,
+        # Edge persistence gate: require edge to be supported for at least
+        # this many seconds before firing the trade. Defends against
+        # spike-chasing where a fast Binance bookticker move briefly
+        # crosses the edge threshold and then mean-reverts. The bot would
+        # otherwise fire on the spike and lose when the price snaps back.
+        # 0.0 = disabled (legacy behavior). Recommended ~5s for 5m
+        # markets, ~10s for 15m markets. Tracks per-side first-edge
+        # timestamps in ctx; resets when edge drops back below threshold.
+        edge_persistence_s: float = 0.0,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -300,6 +321,7 @@ class DiffusionSignal(Signal):
         self.oracle_lag_threshold = oracle_lag_threshold
         self.oracle_lag_mult = oracle_lag_mult
         self.oracle_lead_bias = float(oracle_lead_bias)
+        self.max_model_market_disagreement = float(max_model_market_disagreement)
         self.obi_weight = obi_weight
         self.chainlink_blend_s = chainlink_blend_s
         self.tail_mode = tail_mode
@@ -358,6 +380,7 @@ class DiffusionSignal(Signal):
         self.cross_asset_z_lookup = cross_asset_z_lookup
         self.cross_asset_min_z = cross_asset_min_z
         self.min_entry_z = min_entry_z
+        self.edge_persistence_s = edge_persistence_s
 
     def _compute_vol(
         self,
@@ -1286,6 +1309,20 @@ class DiffusionSignal(Signal):
         ctx["_p_display"] = norm_cdf(z)
         ctx["_sigma_per_s"] = sigma_per_s
 
+        # Model-vs-market disagreement gate. When the diffusion model
+        # disagrees with the contract mid by more than X percentage
+        # points, the model is probably overconfident due to a σ
+        # collapse (sustained low-vol windows produce confidently
+        # incorrect z-scores). Skip the trade — trust the market.
+        if self.max_model_market_disagreement < 1.0:
+            mid_up_obs = (bid_up + ask_up) / 2.0
+            disagreement = abs(p_model - mid_up_obs)
+            if disagreement > self.max_model_market_disagreement:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"model-market disagreement (|p_model={p_model:.2f} - "
+                    f"mid={mid_up_obs:.2f}|={disagreement:.2f} > "
+                    f"{self.max_model_market_disagreement:.2f})")
+
         # F4: oracle lead-lag bias. Apply BEFORE filtration so the
         # filtration model's z/p features see the bias-adjusted view.
         # No-op when oracle_lead_bias=0 or binance_mid is unavailable.
@@ -1800,6 +1837,20 @@ class DiffusionSignal(Signal):
 
         p_model = self._p_model(z, tau, ctx)
 
+        # Model-vs-market disagreement gate (mirror of decide()).
+        # When raw p_model disagrees with mid by > threshold pp, the
+        # σ-based z-score is probably overconfident due to a low-vol
+        # collapse. Trust the market and skip both sides.
+        if self.max_model_market_disagreement < 1.0:
+            mid_up_obs = (bid_up + ask_up) / 2.0
+            disagreement = abs(p_model - mid_up_obs)
+            if disagreement > self.max_model_market_disagreement:
+                reason = (f"model-market disagreement (|p_model={p_model:.2f} - "
+                          f"mid={mid_up_obs:.2f}|={disagreement:.2f} > "
+                          f"{self.max_model_market_disagreement:.2f})")
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+
         # F4: oracle lead-lag bias. Apply BEFORE filtration so the
         # filtration model's z/p features see the bias-adjusted view.
         # No-op when oracle_lead_bias=0 or binance_mid is unavailable.
@@ -1968,21 +2019,55 @@ class DiffusionSignal(Signal):
                 dyn_threshold_down = dyn_threshold * (1.0 - self.down_edge_bonus)
             ctx["_dyn_threshold_down"] = dyn_threshold_down
 
+            # Edge persistence gate: defend against spike-chasing.
+            # Track when each side first crossed the edge threshold; if it
+            # hasn't been above threshold for at least edge_persistence_s,
+            # block the trade for that side this tick. Reset on no-edge.
+            up_persist_block = False
+            down_persist_block = False
+            if self.edge_persistence_s > 0:
+                now_ms = snapshot.ts_ms
+                persist_ms = self.edge_persistence_s * 1000.0
+                up_has_edge = (edge_up > dyn_threshold)
+                down_has_edge = (edge_down > dyn_threshold_down)
+                if up_has_edge:
+                    if "_edge_up_first_ms" not in ctx:
+                        ctx["_edge_up_first_ms"] = now_ms
+                    if now_ms - ctx["_edge_up_first_ms"] < persist_ms:
+                        up_persist_block = True
+                else:
+                    ctx.pop("_edge_up_first_ms", None)
+                if down_has_edge:
+                    if "_edge_down_first_ms" not in ctx:
+                        ctx["_edge_down_first_ms"] = now_ms
+                    if now_ms - ctx["_edge_down_first_ms"] < persist_ms:
+                        down_persist_block = True
+                else:
+                    ctx.pop("_edge_down_first_ms", None)
+
             up_dec = flat
             down_dec = flat
 
-            if edge_up > dyn_threshold:
+            if edge_up > dyn_threshold and not up_persist_block:
                 up_dec = self._size_decision(
                     "BUY_UP", edge_up, cost_up, p_model,
                     snapshot, sigma_per_s, tau, z, z_raw, p_model,
                     dyn_threshold, spread_up, ctx=ctx,
                 )
-            if edge_down > dyn_threshold_down:
+            elif up_persist_block:
+                elapsed = (snapshot.ts_ms - ctx["_edge_up_first_ms"]) / 1000.0
+                up_dec = Decision("FLAT", 0.0, 0.0,
+                    f"edge persistence (UP {elapsed:.1f}s < {self.edge_persistence_s}s)")
+            if edge_down > dyn_threshold_down and not down_persist_block:
                 down_dec = self._size_decision(
                     "BUY_DOWN", edge_down, cost_down, 1.0 - p_model,
                     snapshot, sigma_per_s, tau, z, z_raw, p_model,
                     dyn_threshold_down, spread_down, ctx=ctx,
                 )
+            elif down_persist_block:
+                elapsed = (snapshot.ts_ms - ctx["_edge_down_first_ms"]) / 1000.0
+                down_dec = Decision("FLAT", 0.0, 0.0,
+                    f"edge persistence (DOWN {elapsed:.1f}s < {self.edge_persistence_s}s)")
 
         # If neither has edge, report combined reason
         if up_dec.action == "FLAT" and down_dec.action == "FLAT":

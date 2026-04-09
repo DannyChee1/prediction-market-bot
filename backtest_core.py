@@ -46,17 +46,26 @@ MIN_SIGMA_RATIO = 0.5
 # ── Fee & math helpers ──────────────────────────────────────────────────────
 
 def poly_fee(p: float, maker: bool = False) -> float:
-    """Polymarket fee for 15-min crypto markets.
+    """Polymarket fee for crypto markets.
 
-    Taker: 2% * p * (1-p)  — standard Polymarket binary market fee.
-    Maker: 0%              — no fee for limit orders that provide liquidity.
+    Taker: feeRate * p * (1-p)
+    Maker: 0% (no fee for limit orders that provide liquidity)
 
-    NOTE: verify taker fee rate against current Polymarket documentation
-    before relying on backtest P&L figures for taker-mode strategies.
+    feeRate by category (as of March 2026):
+      Crypto:     0.072  (max 1.80% at p=0.50)
+      Economics:  0.060  (max 1.50%)
+      Sports:     0.030  (max 0.75%)
+      Politics:   0.040  (max 1.00%)
+      Geopolitics: 0     (free)
+
+    The bot trades crypto markets → feeRate = 0.072.
+
+    Previously used 0.02 (3.6x too low), which inflated every taker-mode
+    backtest PnL. Updated 2026-04-09 per Polymarket docs.
     """
     if maker:
         return 0.0
-    return 0.02 * p * (1.0 - p)
+    return 0.072 * p * (1.0 - p)
 
 
 def norm_cdf(x: float) -> float:

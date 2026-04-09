@@ -475,9 +475,13 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         # Process UserFeed WS events first (instant fills/cancels)
         self._process_user_events(snapshot)
 
-        # REST polling: every tick if no WS, every 10s as reconciliation if WS active
+        # REST polling: rate-limited to avoid blocking the hot path.
+        # Without UserFeed the old code polled on EVERY tick (~100-200Hz),
+        # each poll costing 200-500ms of HTTP round-trip. Now rate-limited
+        # to every 2s without WS, every 10s with WS.
         now_poll = _time.time()
-        if self.user_feed is None or (now_poll - self._last_rest_poll_ts >= self._rest_poll_interval_s):
+        poll_interval = self._rest_poll_interval_s if self.user_feed is not None else 2.0
+        if now_poll - self._last_rest_poll_ts >= poll_interval:
             self._poll_open_orders(snapshot)
             self._last_rest_poll_ts = now_poll
 

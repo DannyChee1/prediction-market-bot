@@ -166,12 +166,15 @@ async def record_sampler(
         except Exception:
             pass
 
-        # Periodic flush every 60s — writes only new rows since last flush
+        # Periodic flush every 60s — offloaded to a thread so the
+        # parquet read+concat+write (~50-200ms) doesn't block the
+        # event loop and delay signal evaluation.
         if _time.monotonic() - last_flush >= 60 and pending:
-            flush_parquet(pending, slug, data_subdir)
-            total_rows += len(pending)
+            flush_batch = list(pending)  # snapshot before clearing
             pending.clear()
+            total_rows += len(flush_batch)
             last_flush = _time.monotonic()
+            await asyncio.to_thread(flush_parquet, flush_batch, slug, data_subdir)
 
     # Final flush
     if pending:

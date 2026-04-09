@@ -559,6 +559,16 @@ async def run_window(
 
     book_feed = BookFeed([up_token, down_token])
 
+    # Warm up the order client's connection pool and cache tick_size/neg_risk
+    # for both tokens. This saves ~100-200ms per order (2 HTTP GETs that
+    # were happening on every single trade) and pre-establishes the TLS
+    # connection so the first order doesn't pay a cold-start penalty.
+    if hasattr(tracker, 'client') and tracker.client is not None:
+        try:
+            tracker.client.warmup([up_token, down_token])
+        except Exception as exc:
+            print(f"  [{config.display_name}] OrderClient warmup failed: {exc}")
+
     # UserFeed for real-time fill/cancel events (requires API creds)
     api_key = os.getenv("POLY_API_KEY", "")
     api_secret = os.getenv("POLY_API_SECRET", "")

@@ -3,9 +3,11 @@ use once_cell::sync::Lazy;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+use std::collections::HashMap;
+
 use polyfill_rs::ClobClient;
 use polyfill_rs::OrderArgs;  // simple struct from client module (token_id, price, size, side)
-use polyfill_rs::types::{ApiCreds, AssetType, BalanceAllowanceParams, ExtraOrderArgs, MarketOrderArgs, Side, OrderType as PolyfillOrderType};
+use polyfill_rs::types::{ApiCreds, AssetType, BalanceAllowanceParams, ExtraOrderArgs, MarketOrderArgs, OrderOptions, Side, OrderType as PolyfillOrderType};
 use polyfill_rs::orders::SigType;
 
 use crate::types;
@@ -36,6 +38,11 @@ pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 #[pyclass]
 pub struct OrderClient {
     inner: Arc<ClobClient>,
+    /// Cached OrderOptions (tick_size + neg_risk) per token_id.
+    /// These values are static for the lifetime of a market, so we
+    /// fetch them once during warmup and reuse on every place_order
+    /// call, saving 2 HTTP GETs (~100-200ms) per trade.
+    options_cache: std::sync::Mutex<HashMap<String, OrderOptions>>,
 }
 
 fn parse_side(s: &str) -> PyResult<Side> {
@@ -112,9 +119,81 @@ impl OrderClient {
             funder_addr,
         );
 
+        let inner = Arc::new(client);
+
         Ok(Self {
-            inner: Arc::new(client),
+            inner,
+            options_cache: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Pre-fetch and cache OrderOptions (tick_size, neg_risk) for a list
+    /// of token_ids, and establish HTTP keep-alive connections.
+    ///
+    /// Call this once at startup with all token_ids the bot will trade.
+    /// Eliminates 2 HTTP GETs per subsequent place_order/place_market_order.
+    /// The GIL is released during all network calls.
+    fn warmup(&self, py: Python<'_>, token_ids: Vec<String>) -> PyResult<()> {
+        let client = self.inner.clone();
+        let ids = token_ids.clone();
+
+        let results = py.allow_threads(move || {
+            RUNTIME.block_on(async {
+                // 1. Prewarm the HTTP connection pool (TLS handshake, etc.)
+                if let Err(e) = client.prewarm_connections().await {
+                    eprintln!("[OrderClient] prewarm_connections failed: {}", e);
+                }
+
+                // 2. Start keep-alive pings (every 30s) to prevent idle drops
+                client
+                    .start_keepalive(std::time::Duration::from_secs(30))
+                    .await;
+
+                // 3. Fetch tick_size + neg_risk for each token_id
+                let mut results = Vec::with_capacity(ids.len());
+                for tid in &ids {
+                    let tick = client.get_tick_size(tid).await;
+                    let neg = client.get_neg_risk(tid).await;
+                    results.push((tid.clone(), tick, neg));
+                }
+                results
+            })
+        });
+
+        // Populate the cache with successful results
+        let mut cache = self.options_cache.lock().unwrap();
+        for (tid, tick_result, neg_result) in results {
+            match (tick_result, neg_result) {
+                (Ok(tick_size), Ok(neg_risk)) => {
+                    cache.insert(
+                        tid.clone(),
+                        OrderOptions {
+                            tick_size: Some(tick_size),
+                            neg_risk: Some(neg_risk),
+                            fee_rate_bps: None,
+                        },
+                    );
+                    eprintln!(
+                        "[OrderClient] warmup OK for {}: tick_size={}, neg_risk={}",
+                        tid, tick_size, neg_risk
+                    );
+                }
+                (Err(e), _) => {
+                    eprintln!(
+                        "[OrderClient] warmup failed for {} (tick_size): {}",
+                        tid, e
+                    );
+                }
+                (_, Err(e)) => {
+                    eprintln!(
+                        "[OrderClient] warmup failed for {} (neg_risk): {}",
+                        tid, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Place a GTC limit order (create + sign + post in one call).
@@ -150,15 +229,23 @@ impl OrderClient {
             None
         };
 
+        // Look up cached OrderOptions to skip 2 HTTP GETs per order.
+        // Falls back to None (polyfill-rs fetches on demand) if not warmed.
+        let cached_opts = {
+            let cache = self.options_cache.lock().unwrap();
+            cache.get(token_id).cloned()
+        };
+        let opts_ref = cached_opts.as_ref();
+
         let client = self.inner.clone();
         // Release the GIL during the HTTP roundtrip so other Python
         // coroutines can run while we wait. Without this, asyncio.to_thread
         // would still block the event loop.
         let resp = py
-            .allow_threads(|| {
+            .allow_threads(move || {
                 RUNTIME.block_on(async move {
                     let signed = client
-                        .create_order(&args, None, extras, None)
+                        .create_order(&args, None, extras, opts_ref)
                         .await?;
                     client.post_order(signed, ot).await
                 })
@@ -195,12 +282,19 @@ impl OrderClient {
             None
         };
 
+        // Look up cached OrderOptions to skip 2 HTTP GETs per order.
+        let cached_opts = {
+            let cache = self.options_cache.lock().unwrap();
+            cache.get(token_id).cloned()
+        };
+        let opts_ref = cached_opts.as_ref();
+
         let client = self.inner.clone();
         let resp = py
-            .allow_threads(|| {
+            .allow_threads(move || {
                 RUNTIME.block_on(async move {
                     let signed = client
-                        .create_market_order(&args, extras, None)
+                        .create_market_order(&args, extras, opts_ref)
                         .await?;
                     client.post_order(signed, PolyfillOrderType::FOK).await
                 })

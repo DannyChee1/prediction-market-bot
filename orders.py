@@ -102,6 +102,80 @@ class OrderMixin:
             "book_age_ms": _r("_book_age_ms", 1),
         }
 
+    # ── Fill accounting helpers ─────────────────────────────────────────────
+    #
+    # Accounting invariant: at order placement we debit `cost_est` from
+    # bankroll. Each fill (full or partial) records a pending_fill row
+    # for the newly-filled shares and increments `_cumulative_filled_cost`
+    # on the order. Partials do NOT refund bankroll — that would be a
+    # double-count because the original cost_est has already been debited.
+    # On terminal events (MATCHED or CANCELLED/EXPIRED), we refund
+    # `cost_est - _cumulative_filled_cost` — the portion we reserved but
+    # never actually spent.
+    #
+    # Prior bug: the 6 fill/cancel sites each recomputed the refund as
+    # `cost_est - new_fill_cost`, which ignored prior partials and either
+    # over-refunded (phantom bankroll credit) or under-refunded (leak).
+
+    @staticmethod
+    def _terminal_refund(order: dict) -> float:
+        """Refund owed when an order reaches a terminal state.
+
+        After a terminal event (MATCHED with full shares, or CANCELLED),
+        the order's cumulative filled cost is final. The bankroll reservation
+        (cost_est) minus cumulative filled cost is what we reserved but
+        never spent, and should be returned to bankroll.
+        """
+        already = float(order.get("_cumulative_filled_cost", 0.0))
+        return max(0.0, float(order["cost_est"]) - already)
+
+    def _record_partial_fill(
+        self: "LiveTradeTracker",
+        order: dict,
+        new_fill_shares: float,
+        new_fill_cost: float,
+        fee: float,
+        size_matched_total: float,
+    ):
+        """Append a pending_fill row and update cumulative tracking.
+
+        Does NOT touch bankroll. Does NOT increment window_trade_count or
+        position_count for the second+ partial of the same order — those
+        are per-order counters, not per-fill-event.
+        """
+        order["_cumulative_filled_cost"] = (
+            float(order.get("_cumulative_filled_cost", 0.0)) + float(new_fill_cost)
+        )
+        order["_cumulative_filled_shares"] = (
+            float(order.get("_cumulative_filled_shares", 0.0)) + float(new_fill_shares)
+        )
+        order["_last_matched"] = float(size_matched_total)
+        self.total_fees += float(fee)
+
+        self.pending_fills.append({
+            "market_slug": order["market_slug"],
+            "side": order["side"],
+            "cost_usd": new_fill_cost,
+            "shares": new_fill_shares,
+            "fee": fee,
+            "order_id": order["order_id"],
+            "entry_ts": order["placed_ts"],
+            "fill_ts_unix": _time.time(),
+            "time_remaining_s": order["time_remaining_s"],
+            "chainlink_price": order["chainlink_price"],
+            "window_start_price": order["window_start_price"],
+            "model_snapshot": order.get("model_snapshot"),
+        })
+
+        # Per-order (not per-event) counters: mark on first fill only.
+        # A single 5-share order filled in 3 partials should count as ONE
+        # trade for max_trades_per_window and ONE position.
+        if not order.get("_counted", False):
+            order["_counted"] = True
+            self.window_trade_count += 1
+            self.position_count += 1
+            self._record_window_fill_side(order["side"])
+
     # ── Cancel ─────────────────────────────────────────────────────────────
 
     def _cancel_single_order(self: "LiveTradeTracker", order: dict, reason: str) -> bool:
@@ -138,144 +212,90 @@ class OrderMixin:
                 # later trickle in as a surprise position the bot had
                 # already removed from open_orders, going untracked.
                 if status == "MATCHED":
-                    # Order filled before cancel — treat as a fill
-                    # Account for shares already recorded from prior partial fills
-                    prev_matched = order.get("_last_matched", 0)
+                    # Order filled before cancel — treat as a terminal fill.
+                    prev_matched = float(order.get("_last_matched", 0) or 0)
                     new_fill_shares = size_matched - prev_matched
-                    if new_fill_shares < 0.001:
-                        # Already fully accounted for by prior partial fills
-                        self.open_orders = [
-                            o for o in self.open_orders
-                            if o["order_id"] != order_id
-                        ]
-                        return False
-
-                    new_fill_cost = new_fill_shares * order["price"]
-                    fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
-                    new_fill_cost += fee
-                    self.total_fees += fee
-                    drift = order["cost_est"] - new_fill_cost
-                    self.bankroll += drift
-                    self.signal.bankroll = self.bankroll
-
-                    self.open_orders = [
-                        o for o in self.open_orders
-                        if o["order_id"] != order_id
-                    ]
-
-                    self.pending_fills.append({
-                        "market_slug": order["market_slug"],
-                        "side": order["side"],
-                        "cost_usd": new_fill_cost,
-                        "shares": new_fill_shares,
-                        "fee": fee,
-                        "order_id": order_id,
-                        "entry_ts": order["placed_ts"],
-                        "fill_ts_unix": _time.time(),
-                        "time_remaining_s": order["time_remaining_s"],
-                        "chainlink_price": order["chainlink_price"],
-                        "window_start_price": order["window_start_price"],
-                        "model_snapshot": order.get("model_snapshot"),
-                    })
-                    self.window_trade_count += 1
-                    self.position_count += 1
-                    self._record_window_fill_side(order["side"])
-
-                    entry_px = order["price"]
-                    self._event(
-                        f"[CANCEL->FILL] {order['side']} "
-                        f"{new_fill_shares:.1f}sh @ {entry_px:.4f} "
-                        f"(${new_fill_cost:.2f}) — filled before cancel"
-                        + self._model_fill_line(order)
-                    )
-                    self._log({
-                        "type": "limit_fill",
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "order_id": order_id,
-                        "side": order["side"],
-                        "shares": round(new_fill_shares, 2),
-                        "price": order["price"],
-                        "cost_usd": round(new_fill_cost, 2),
-                        "note": f"filled_before_cancel: {reason}",
-                        **self._model_log_fields(order),
-                    })
-                    return False
-
-                elif size_matched > 0:
-                    # Partial fill before cancel — record filled, refund unfilled
-                    # Account for shares already recorded from prior partial fills
-                    prev_matched = order.get("_last_matched", 0)
-                    new_fill_shares = size_matched - prev_matched
-
-                    if new_fill_shares < 0.001:
-                        # All matched shares already recorded; just refund remaining
-                        self.bankroll += order["cost_est"]
-                        self.signal.bankroll = self.bankroll
-                        self.open_orders = [
-                            o for o in self.open_orders
-                            if o["order_id"] != order_id
-                        ]
+                    if new_fill_shares >= 0.001:
+                        new_fill_cost = new_fill_shares * order["price"]
+                        fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                        new_fill_cost += fee
+                        self._record_partial_fill(
+                            order, new_fill_shares, new_fill_cost, fee, size_matched,
+                        )
+                        entry_px = order["price"]
+                        self._event(
+                            f"[CANCEL->FILL] {order['side']} "
+                            f"{new_fill_shares:.1f}sh @ {entry_px:.4f} "
+                            f"(${new_fill_cost:.2f}) — filled before cancel"
+                            + self._model_fill_line(order)
+                        )
                         self._log({
-                            "type": "limit_cancel",
+                            "type": "limit_fill",
                             "ts": datetime.now(timezone.utc).isoformat(),
                             "order_id": order_id,
                             "side": order["side"],
-                            "status": "cancelled_partial_done",
-                            "refund": round(order["cost_est"], 2),
+                            "shares": round(new_fill_shares, 2),
+                            "price": order["price"],
+                            "cost_usd": round(new_fill_cost, 2),
+                            "note": f"filled_before_cancel: {reason}",
+                            **self._model_log_fields(order),
                         })
-                        return True
-
-                    new_fill_cost = new_fill_shares * order["price"]
-                    fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
-                    new_fill_cost += fee
-                    self.total_fees += fee
-                    unfilled_cost_est = order["cost_est"] - new_fill_cost
-
-                    self.bankroll += unfilled_cost_est
+                    # Terminal: refund the unused portion of the reservation.
+                    refund = self._terminal_refund(order)
+                    self.bankroll += refund
                     self.signal.bankroll = self.bankroll
-
                     self.open_orders = [
                         o for o in self.open_orders
                         if o["order_id"] != order_id
                     ]
+                    return False
 
-                    self.pending_fills.append({
-                        "market_slug": order["market_slug"],
-                        "side": order["side"],
-                        "cost_usd": new_fill_cost,
-                        "shares": new_fill_shares,
-                        "fee": fee,
-                        "order_id": order_id,
-                        "entry_ts": order["placed_ts"],
-                        "fill_ts_unix": _time.time(),
-                        "time_remaining_s": order["time_remaining_s"],
-                        "chainlink_price": order["chainlink_price"],
-                        "window_start_price": order["window_start_price"],
-                        "model_snapshot": order.get("model_snapshot"),
-                    })
-                    self.window_trade_count += 1
-                    self.position_count += 1
-                    self._record_window_fill_side(order["side"])
+                elif size_matched > 0:
+                    # Partial fill before cancel — record the new partial,
+                    # refund the unreserved portion, remove the order.
+                    prev_matched = float(order.get("_last_matched", 0) or 0)
+                    new_fill_shares = size_matched - prev_matched
 
-                    entry_px = order["price"]
-                    self._event(
-                        f"[CANCEL->PARTIAL] {order['side']} "
-                        f"{new_fill_shares:.1f}/{original_size:.1f}sh "
-                        f"@ {entry_px:.4f} (${new_fill_cost:.2f}) — "
-                        f"refunding ${unfilled_cost_est:.2f}"
-                        + self._model_fill_line(order)
-                    )
+                    if new_fill_shares >= 0.001:
+                        new_fill_cost = new_fill_shares * order["price"]
+                        fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                        new_fill_cost += fee
+                        self._record_partial_fill(
+                            order, new_fill_shares, new_fill_cost, fee, size_matched,
+                        )
+                        entry_px = order["price"]
+                        self._event(
+                            f"[CANCEL->PARTIAL] {order['side']} "
+                            f"{new_fill_shares:.1f}/{original_size:.1f}sh "
+                            f"@ {entry_px:.4f} (${new_fill_cost:.2f})"
+                            + self._model_fill_line(order)
+                        )
+                        self._log({
+                            "type": "partial_fill",
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "order_id": order_id,
+                            "side": order["side"],
+                            "filled_shares": round(new_fill_shares, 2),
+                            "price": order["price"],
+                            "cost_usd": round(new_fill_cost, 2),
+                            "note": f"partial_before_cancel: {reason}",
+                            **self._model_log_fields(order),
+                        })
+                    # Terminal: refund the unused portion of the reservation.
+                    refund = self._terminal_refund(order)
+                    self.bankroll += refund
+                    self.signal.bankroll = self.bankroll
+                    self.open_orders = [
+                        o for o in self.open_orders
+                        if o["order_id"] != order_id
+                    ]
                     self._log({
-                        "type": "partial_fill",
+                        "type": "limit_cancel",
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "order_id": order_id,
                         "side": order["side"],
-                        "filled_shares": round(new_fill_shares, 2),
-                        "price": order["price"],
-                        "cost_usd": round(new_fill_cost, 2),
-                        "refund": round(unfilled_cost_est, 2),
-                        "note": f"partial_before_cancel: {reason}",
-                        **self._model_log_fields(order),
+                        "status": "cancelled_partial_done",
+                        "refund": round(refund, 2),
                     })
                     return False
             except Exception as verify_exc:
@@ -305,12 +325,9 @@ class OrderMixin:
                 })
                 return False
 
-        # Refund only the UNFILLED portion of the reservation. P12.9:
-        # the original cost_est snapshot is preserved (no in-place
-        # mutation), so the unfilled portion is cost_est minus the
-        # cumulative cost of partial fills already moved to pending_fills.
-        already_filled = order.get("_cumulative_filled_cost", 0.0)
-        unfilled_refund = max(0.0, order["cost_est"] - already_filled)
+        # Refund only the UNFILLED portion of the reservation.
+        already_filled = float(order.get("_cumulative_filled_cost", 0.0))
+        unfilled_refund = self._terminal_refund(order)
         self.bankroll += unfilled_refund
         self.signal.bankroll = self.bankroll
 
@@ -650,8 +667,8 @@ class OrderMixin:
                 # of leaking the reservation forever.
                 pending_since = order.get("_verify_pending_since")
                 if pending_since and (_time.time() - pending_since) > 60.0:
-                    already_filled = order.get("_cumulative_filled_cost", 0.0)
-                    refund = max(0.0, order["cost_est"] - already_filled)
+                    already_filled = float(order.get("_cumulative_filled_cost", 0.0))
+                    refund = self._terminal_refund(order)
                     self.bankroll += refund
                     self.signal.bankroll = self.bankroll
                     self._event(
@@ -680,65 +697,51 @@ class OrderMixin:
             # M3 fix: only treat as fully filled when the exchange explicitly
             # says MATCHED. The 0.99 fill_pct heuristic missed the residual.
             if status == "MATCHED":
-                # Account for shares already recorded from prior partial fills
-                prev_matched = order.get("_last_matched", 0)
+                # Terminal fill. Record any residual delta and refund the
+                # unused reservation (cost_est - cumulative_filled_cost).
+                prev_matched = float(order.get("_last_matched", 0) or 0)
                 new_fill_shares = size_matched - prev_matched
-                if new_fill_shares < 0.001:
-                    # Already fully accounted for by prior partial fills
-                    continue
-
-                new_fill_cost = new_fill_shares * order["price"]
-                fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
-                new_fill_cost += fee
-                self.total_fees += fee
-                drift = order["cost_est"] - new_fill_cost
-                self.bankroll += drift
+                if new_fill_shares >= 0.001:
+                    new_fill_cost = new_fill_shares * order["price"]
+                    fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                    new_fill_cost += fee
+                    self._record_partial_fill(
+                        order, new_fill_shares, new_fill_cost, fee, size_matched,
+                    )
+                    self.last_fill_ts_ms = snapshot.ts_ms
+                    entry_px = order["price"]
+                    self._event(
+                        f"[LIMIT FILLED] {order['side']} {new_fill_shares:.1f}sh "
+                        f"@ {entry_px:.4f} (${new_fill_cost:.2f})"
+                        + self._model_fill_line(order)
+                    )
+                    self._log({
+                        "type": "limit_fill",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "order_id": order_id,
+                        "side": order["side"],
+                        "shares": round(new_fill_shares, 2),
+                        "price": order["price"],
+                        "cost_usd": round(new_fill_cost, 2),
+                        "fee": round(fee, 4),
+                        **self._model_log_fields(order),
+                    })
+                # Terminal: refund whatever portion of cost_est wasn't spent.
+                refund = self._terminal_refund(order)
+                self.bankroll += refund
                 self.signal.bankroll = self.bankroll
-
-                self.pending_fills.append({
-                    "market_slug": order["market_slug"],
-                    "side": order["side"],
-                    "cost_usd": new_fill_cost,
-                    "shares": new_fill_shares,
-                    "fee": fee,
-                    "order_id": order_id,
-                    "entry_ts": order["placed_ts"],
-                    "fill_ts_unix": _time.time(),
-                    "time_remaining_s": order["time_remaining_s"],
-                    "chainlink_price": order["chainlink_price"],
-                    "window_start_price": order["window_start_price"],
-                    "model_snapshot": order.get("model_snapshot"),
-                })
-                self.last_fill_ts_ms = snapshot.ts_ms
-                self.window_trade_count += 1
-                self.position_count += 1
-                self._record_window_fill_side(order["side"])
-
-                entry_px = order["price"]
-                self._event(
-                    f"[LIMIT FILLED] {order['side']} {new_fill_shares:.1f}sh "
-                    f"@ {entry_px:.4f} (${new_fill_cost:.2f})"
-                    + self._model_fill_line(order)
-                )
-                self._log({
-                    "type": "limit_fill",
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "order_id": order_id,
-                    "side": order["side"],
-                    "shares": round(new_fill_shares, 2),
-                    "price": order["price"],
-                    "cost_usd": round(new_fill_cost, 2),
-                    "fee": round(fee, 4),
-                    **self._model_log_fields(order),
-                })
+                # Not appended to still_open → removed from open_orders.
 
             elif status in ("CANCELLED", "EXPIRED"):
-                self.bankroll += order["cost_est"]
+                refund = self._terminal_refund(order)
+                self.bankroll += refund
                 self.signal.bankroll = self.bankroll
+                already_filled = float(order.get("_cumulative_filled_cost", 0.0))
                 self._event(
                     f"[LIMIT {status}] {order['side']} "
                     f"{order['shares']:.1f}sh @ {order['price']:.4f} "
-                    f"— refunded ${order['cost_est']:.2f}"
+                    f"— refunded ${refund:.2f}"
+                    + (f" (kept ${already_filled:.2f} of partials)" if already_filled > 0 else "")
                 )
                 self._log({
                     "type": "limit_cancel",
@@ -746,52 +749,23 @@ class OrderMixin:
                     "order_id": order_id,
                     "side": order["side"],
                     "status": status,
-                    "refund": round(order["cost_est"], 2),
+                    "refund": round(refund, 2),
+                    "filled_before_cancel": round(already_filled, 2),
                 })
-            elif size_matched > order.get("_last_matched", 0):
-                prev_matched = order.get("_last_matched", 0)
+            elif size_matched > float(order.get("_last_matched", 0) or 0):
+                prev_matched = float(order.get("_last_matched", 0) or 0)
                 new_fill_shares = size_matched - prev_matched
                 new_fill_cost = new_fill_shares * order["price"]
                 fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
                 new_fill_cost += fee
-                self.total_fees += fee
-
-                # P12.9 fix: instead of mutating order["cost_est"] /
-                # order["shares"] in place (which corrupts the snapshot
-                # used by _cancel_single_order's refund math), track
-                # cumulative filled cost/shares in dedicated fields and
-                # let the cancel path subtract them. The original snapshot
-                # of cost_est and shares is preserved.
-                order["_cumulative_filled_cost"] = (
-                    order.get("_cumulative_filled_cost", 0.0) + new_fill_cost
+                self._record_partial_fill(
+                    order, new_fill_shares, new_fill_cost, fee, size_matched,
                 )
-                order["_cumulative_filled_shares"] = (
-                    order.get("_cumulative_filled_shares", 0.0) + new_fill_shares
-                )
-                order["_last_matched"] = size_matched
+                self.last_fill_ts_ms = snapshot.ts_ms
 
-                # Remaining for display only — derived from cumulative.
+                # Remaining for display only.
                 remaining_shares = max(0.0,
                     order["shares"] - order["_cumulative_filled_shares"])
-
-                self.pending_fills.append({
-                    "market_slug": order["market_slug"],
-                    "side": order["side"],
-                    "cost_usd": new_fill_cost,
-                    "shares": new_fill_shares,
-                    "fee": fee,
-                    "order_id": order_id,
-                    "entry_ts": order["placed_ts"],
-                    "fill_ts_unix": _time.time(),
-                    "time_remaining_s": order["time_remaining_s"],
-                    "chainlink_price": order["chainlink_price"],
-                    "window_start_price": order["window_start_price"],
-                    "model_snapshot": order.get("model_snapshot"),
-                })
-                self.last_fill_ts_ms = snapshot.ts_ms
-                self.window_trade_count += 1
-                self.position_count += 1
-                self._record_window_fill_side(order["side"])
 
                 self._event(
                     f"[PARTIAL FILL] {order['side']} {new_fill_shares:.1f}sh "
@@ -805,7 +779,7 @@ class OrderMixin:
                     "order_id": order_id,
                     "side": order["side"],
                     "filled_shares": round(new_fill_shares, 2),
-                    "remaining_shares": round(order["shares"], 2),
+                    "remaining_shares": round(remaining_shares, 2),
                     "price": order["price"],
                     "cost_usd": round(new_fill_cost, 2),
                     **self._model_log_fields(order),
@@ -872,7 +846,16 @@ class OrderMixin:
             status = evt.get("status", "").upper()
             event_type = evt.get("event_type", "").lower()
 
-            # Full fill
+            # Fill event (full or partial).
+            #
+            # Polymarket emits a "trade" event_type for each match. The
+            # prior version treated every trade event as a full fill and
+            # added the order to processed_ids (removing it from
+            # open_orders), which lost the remaining unfilled shares when
+            # the match was actually partial. We now treat full vs
+            # partial explicitly: only add to processed_ids when the
+            # exchange explicitly says MATCHED OR size_matched >=
+            # original shares (within a tolerance).
             if status == "MATCHED" or event_type == "trade":
                 size_matched_str = evt.get("size_matched", "0")
                 try:
@@ -880,70 +863,73 @@ class OrderMixin:
                 except (ValueError, TypeError):
                     size_matched = 0.0
 
+                # Treat a size_matched=0 "status-only" event as noise.
+                # The prior fallback to order["shares"] silently promoted
+                # ambiguous events into full fills, losing unfilled shares.
                 if size_matched <= 0:
-                    size_matched = order["shares"]
+                    if status == "MATCHED":
+                        # Fully filled per exchange but size missing —
+                        # assume full original_size.
+                        size_matched = float(order["shares"])
+                    else:
+                        # Not a fill, just a status update — skip.
+                        continue
 
-                # Account for shares already recorded from prior partial fills
-                prev_matched = order.get("_last_matched", 0)
+                prev_matched = float(order.get("_last_matched", 0) or 0)
                 new_fill_shares = size_matched - prev_matched
-                if new_fill_shares < 0.001:
-                    # Already fully accounted for
-                    processed_ids.add(order_id)
-                    continue
 
-                new_fill_cost = new_fill_shares * order["price"]
-                fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
-                new_fill_cost += fee
-                self.total_fees += fee
-                drift = order["cost_est"] - new_fill_cost
-                self.bankroll += drift
-                self.signal.bankroll = self.bankroll
-
-                self.pending_fills.append({
-                    "market_slug": order["market_slug"],
-                    "side": order["side"],
-                    "cost_usd": new_fill_cost,
-                    "shares": new_fill_shares,
-                    "fee": fee,
-                    "order_id": order_id,
-                    "entry_ts": order["placed_ts"],
-                    "fill_ts_unix": _time.time(),
-                    "time_remaining_s": order["time_remaining_s"],
-                    "chainlink_price": order["chainlink_price"],
-                    "window_start_price": order["window_start_price"],
-                    "model_snapshot": order.get("model_snapshot"),
-                })
-                self.last_fill_ts_ms = snapshot.ts_ms
-                self.window_trade_count += 1
-                self.position_count += 1
-                self._record_window_fill_side(order["side"])
-
-                entry_px = order["price"]
-                self._event(
-                    f"[WS FILL] {order['side']} {new_fill_shares:.1f}sh "
-                    f"@ {entry_px:.4f} (${new_fill_cost:.2f})"
-                    + self._model_fill_line(order)
+                is_full = (
+                    status == "MATCHED"
+                    or size_matched >= float(order["shares"]) - 0.001
                 )
-                self._log({
-                    "type": "ws_fill",
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "order_id": order_id,
-                    "side": order["side"],
-                    "shares": round(new_fill_shares, 2),
-                    "price": order["price"],
-                    "cost_usd": round(new_fill_cost, 2),
-                    "fee": round(fee, 4),
-                    **self._model_log_fields(order),
-                })
-                processed_ids.add(order_id)
+
+                if new_fill_shares >= 0.001:
+                    new_fill_cost = new_fill_shares * order["price"]
+                    fee, _ = self._fee_for_fill(order["price"], new_fill_shares)
+                    new_fill_cost += fee
+                    self._record_partial_fill(
+                        order, new_fill_shares, new_fill_cost, fee, size_matched,
+                    )
+                    self.last_fill_ts_ms = snapshot.ts_ms
+
+                    entry_px = order["price"]
+                    tag = "WS FILL" if is_full else "WS PARTIAL"
+                    self._event(
+                        f"[{tag}] {order['side']} {new_fill_shares:.1f}sh "
+                        f"@ {entry_px:.4f} (${new_fill_cost:.2f})"
+                        + self._model_fill_line(order)
+                    )
+                    self._log({
+                        "type": "ws_fill" if is_full else "ws_partial_fill",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "order_id": order_id,
+                        "side": order["side"],
+                        "shares": round(new_fill_shares, 2),
+                        "price": order["price"],
+                        "cost_usd": round(new_fill_cost, 2),
+                        "fee": round(fee, 4),
+                        **self._model_log_fields(order),
+                    })
+
+                if is_full:
+                    # Terminal: refund unused reservation and mark for removal.
+                    refund = self._terminal_refund(order)
+                    self.bankroll += refund
+                    self.signal.bankroll = self.bankroll
+                    processed_ids.add(order_id)
+                # Otherwise: order stays in open_orders for the next
+                # partial/full event.
 
             elif status in ("CANCELLED", "EXPIRED"):
-                self.bankroll += order["cost_est"]
+                refund = self._terminal_refund(order)
+                self.bankroll += refund
                 self.signal.bankroll = self.bankroll
+                already_filled = float(order.get("_cumulative_filled_cost", 0.0))
                 self._event(
                     f"[WS {status}] {order['side']} "
                     f"{order['shares']:.1f}sh @ {order['price']:.4f} "
-                    f"— refunded ${order['cost_est']:.2f}"
+                    f"— refunded ${refund:.2f}"
+                    + (f" (kept ${already_filled:.2f} of partials)" if already_filled > 0 else "")
                 )
                 self._log({
                     "type": "ws_cancel",
@@ -951,7 +937,8 @@ class OrderMixin:
                     "order_id": order_id,
                     "side": order["side"],
                     "status": status,
-                    "refund": round(order["cost_est"], 2),
+                    "refund": round(refund, 2),
+                    "filled_before_cancel": round(already_filled, 2),
                 })
                 processed_ids.add(order_id)
 

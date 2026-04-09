@@ -852,10 +852,57 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                     f"final=${final_price:,.2f}) -> {'UP' if outcome_up else 'DOWN'}"
                 )
             else:
-                print(f"  ERROR: Cannot resolve window (final_price={final_price}, start={window_start_price})")
-                for fill in self.pending_fills:
-                    self.bankroll += fill["cost_usd"]
-                self.pending_fills = []
+                # CRITICAL: do NOT silently refund and drop the fills here.
+                # The old fallback `bankroll += fill["cost_usd"]; pending_fills = []`
+                # produced a phantom bankroll credit for a position that is
+                # still alive on-chain. A winning position would then go
+                # unredeemed (scan_unredeemed_wins only finds positions
+                # with a `redemption_enqueued` log entry, which we haven't
+                # written at this point).
+                #
+                # Instead: leave pending_fills in place, write a warning
+                # log entry with the conditionId and slug so a human can
+                # recover the positions manually (or an automated scanner
+                # can pick them up), and enqueue for redemption if we
+                # have a conditionId — better to attempt redemption on an
+                # unknown outcome and let the on-chain call no-op than to
+                # silently forfeit a real position.
+                print(
+                    f"  ERROR: Cannot resolve window "
+                    f"(final_price={final_price}, start={window_start_price}). "
+                    f"pending_fills PRESERVED for manual reconciliation."
+                )
+                self._log({
+                    "type": "resolve_failed",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "market_slug": slug,
+                    "condition_id": cond_id,
+                    "pending_fills": [
+                        {
+                            "side": f["side"],
+                            "shares": round(f["shares"], 2),
+                            "cost_usd": round(f["cost_usd"], 2),
+                            "order_id": f.get("order_id", ""),
+                        }
+                        for f in self.pending_fills
+                    ],
+                    "warning": "positions_alive_on_chain_unredeemed",
+                })
+                if not self.dry_run and cond_id:
+                    # Enqueue so scan_unredeemed_wins and periodic redeem
+                    # loop get a chance to reconcile the on-chain state.
+                    try:
+                        self._log({
+                            "type": "redemption_enqueued",
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "condition_id": cond_id,
+                            "market_slug": slug,
+                            "note": "enqueued_from_resolve_failed_fallback",
+                        })
+                        self.redemption_queue.enqueue(cond_id, slug)
+                    except Exception as exc:
+                        print(f"  [RESOLVE] redemption enqueue error: "
+                              f"{type(exc).__name__}: {exc}")
                 return 0.0
 
         self.windows_traded += 1
@@ -1158,7 +1205,18 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
     # ── Diagnostics & logging ──────────────────────────────────────────────
 
     def _log_diagnostic(self, snapshot: Snapshot, decision: Decision):
-        """Log a signal diagnostic snapshot every 60s."""
+        """Log a signal diagnostic snapshot.
+
+        2026-04-09 rewrite: read sigma/p_model/edges from ctx (the values
+        the model actually used during the LAST decision) instead of
+        recomputing from scratch. The previous version recomputed sigma
+        and p_model on its own, but its validation block (`sigma_per_s > 0
+        and tau > 0 and cl_price > 0 and ws_price > 0`) failed silently
+        for ~97% of diagnostic snapshots, defaulting p_model to 0.0.
+        Result: the dashboard kept showing p_model=0.0 even when the model
+        was actively trading. The new version trusts ctx and only falls
+        back to recomputation when ctx hasn't been populated yet (warmup).
+        """
         # None-safe rounder: dict.get(key, default) only substitutes the
         # default when the key is MISSING, not when the value is None.
         # Several ctx fields (_book_age_ms, _chainlink_age_ms, etc.) are
@@ -1171,12 +1229,6 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             return round(v, ndigits)
 
         hist = self.ctx.get("price_history", [])
-        ts_hist = self.ctx.get("ts_history", [])
-        raw_sigma = self.signal._compute_vol(
-            hist[-self.signal.vol_lookback_s:],
-            ts_hist[-self.signal.vol_lookback_s:] if ts_hist else None,
-        ) if len(hist) >= self.signal.vol_lookback_s else 0.0
-        sigma_per_s = self.signal._smoothed_sigma(raw_sigma, self.ctx) if raw_sigma > 0 else 0.0
         tau = snapshot.time_remaining_s
         dyn_threshold = self.signal.edge_threshold * (
             1.0 + self.signal.early_edge_mult * math.sqrt(tau / self.signal.window_duration)
@@ -1186,27 +1238,32 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         ask_down = snapshot.best_ask_down
         bid_up = snapshot.best_bid_up
         bid_down = snapshot.best_bid_down
-        edge_up = edge_down = p_model = 0.0
-        spread_up = spread_down = 0.0
 
         # Snapshot fields can be None during warmup / missing book. Use
         # safe defaults so we can still emit a diagnostic row.
         cl_price = snapshot.chainlink_price if snapshot.chainlink_price is not None else 0.0
         ws_price = snapshot.window_start_price if snapshot.window_start_price is not None else 0.0
 
-        if (ask_up and ask_down and bid_up and bid_down
-                and 0 < ask_up < 1 and 0 < ask_down < 1
-                and sigma_per_s > 0 and tau > 0
-                and cl_price > 0 and ws_price > 0):
-            spread_up = ask_up - bid_up
-            spread_down = ask_down - bid_down
-            delta = (cl_price - ws_price) / ws_price
-            z_raw = delta / (sigma_per_s * math.sqrt(tau))
-            z = max(-self.signal.max_z, min(self.signal.max_z, z_raw))
-            p_model = self.signal._p_model(z, tau, self.ctx)
-            # Maker mode: edge at bid, 0% fee
-            edge_up = p_model - bid_up - self.signal.spread_edge_penalty * spread_up
-            edge_down = (1.0 - p_model) - bid_down - self.signal.spread_edge_penalty * spread_down
+        # Read the values the model ACTUALLY used during its last decision.
+        # decide_both_sides populates these in ctx after every successful
+        # eval. _p_model_trade is the post-blend value (what the trade
+        # decision was based on), _p_model_raw is the pre-blend GBM output.
+        sigma_per_s = self.ctx.get("_sigma_per_s", 0.0) or 0.0
+        p_model = self.ctx.get("_p_model_trade",
+                               self.ctx.get("_p_model_raw", 0.0)) or 0.0
+        edge_up = self.ctx.get("_edge_up", 0.0) or 0.0
+        edge_down = self.ctx.get("_edge_down", 0.0) or 0.0
+        # Use the model's effective price (Binance) for delta if available;
+        # only fall back to chainlink for display when Binance is missing.
+        # The previous version used cl_price exclusively, which lagged the
+        # model's actual delta by up to 1.22s during fast moves.
+        eff_price = self.ctx.get("_binance_mid")
+        if eff_price is None or eff_price <= 0:
+            eff_price = cl_price
+        delta_dollar = (eff_price - ws_price) if (eff_price > 0 and ws_price > 0) else 0.0
+
+        spread_up = (ask_up - bid_up) if (ask_up and bid_up) else 0.0
+        spread_down = (ask_down - bid_down) if (ask_down and bid_down) else 0.0
 
         self._log({
             "type": "diagnostic",
@@ -1215,7 +1272,10 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "tau": round(tau, 0),
             "chainlink_price": round(cl_price, 2),
             "window_start_price": round(ws_price, 2),
-            "delta": round(cl_price - ws_price, 2),
+            # delta from EFFECTIVE price (Binance, what the model uses).
+            # Previously used chainlink which lags by ~1.22s.
+            "delta": round(delta_dollar, 2),
+            "delta_chainlink": round(cl_price - ws_price, 2),
             "sigma_per_s": f"{sigma_per_s:.2e}",
             "p_model": round(p_model, 4),
             "ask_up": ask_up,

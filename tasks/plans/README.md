@@ -12,7 +12,7 @@ live in `tasks/findings/` — check there before re-running anything.
 | F1 | Feed latency instrumentation campaign | low | unlocks everything else | **phase 0 done** — see [findings](../findings/feed_latency_2026-04-08.md) | [feeds-instrumentation.md](feeds-instrumentation.md) |
 | F2 | Direct Chainlink Data Streams subscription | medium | huge if rebroadcast tax >200ms | **CONFIRMED HIGH** (1.23s tax measured) | [direct-chainlink.md](direct-chainlink.md) |
 | F3 | Event-time staleness (not local-recv) | low | correctness | not started | [feeds-instrumentation.md](feeds-instrumentation.md) |
-| F4 | Oracle lead-lag as profit signal | medium | confirmed predictable (1.2s lead window) | not started | [oracle-lead-lag.md](oracle-lead-lag.md) |
+| F4 | Oracle lead-lag as profit signal | medium | **negative in backtest**, infra ON | shipped default-off; live A/B pending; see [findings](../findings/f4_oracle_lead_lag_2026-04-08.md) | [oracle-lead-lag.md](oracle-lead-lag.md) |
 
 ## Tier 2 — incremental improvements
 

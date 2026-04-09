@@ -1128,6 +1128,12 @@ def _build_tracker(
     signal_kw["min_entry_z"] = args.min_z if args.min_z > 0 else config.min_entry_z
     signal_kw["min_entry_price"] = args.min_entry_price if args.min_entry_price != 0.10 else config.min_entry_price
     signal_kw["edge_threshold"] = config.edge_threshold
+    # Edge persistence: require edge to hold for N seconds before firing.
+    # Defends against fast-spike chasing where the model briefly crosses
+    # the edge threshold and then mean-reverts. Hardcoded per timeframe
+    # for now: 5s for 5m markets, 10s for 15m markets. See 2026-04-09
+    # debugging session — the 00:35:50 BTC fill that motivated this gate.
+    signal_kw["edge_persistence_s"] = 5.0 if is_5m else 10.0
 
     # A-S quoting params
     signal_kw["as_mode"] = args.as_mode

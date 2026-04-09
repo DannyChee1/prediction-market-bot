@@ -76,10 +76,22 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # Bounds chosen from empirical 90s realized-σ distribution on
         # ~106k BTC 15m observations: p5≈9.2e-6, p50≈3.9e-5, p99≈4.1e-4.
         # Old [3e-5, 8e-5] band clamped 37% of obs UP and 19% DOWN — over
-        # half the data was being capped. New bounds [1e-5, 4e-4] let
-        # realized vol drive the model instead of being floored to a near
-        # constant.
-        min_sigma=1e-05,
+        # half the data was being capped. Post-Kou-fix bounds [1e-5, 4e-4]
+        # let realized vol drive the model.
+        #
+        # 2026-04-09: BUMP min_sigma 1e-5 → 2e-5 after live overconfidence
+        # cluster. Live evidence: 13 fills in one session at sigma ≤ 1.2e-5
+        # produced p_model 0.84-0.9987 on 15m UP, all losers. The hard
+        # floor 1e-5 sits at ~p5; sigma_baseline (used by adaptive floor
+        # MIN_SIGMA_RATIO * baseline) is also tiny in quiet windows so
+        # the relative defense never lifts above the absolute floor.
+        # New 2e-5 sits at ~p25-30 of empirical distribution — clamps
+        # the bottom quartile (the dangerous quiet-period tail) without
+        # touching the median. At sigma=2e-5 with τ=200s, a $20 BTC move
+        # gives p_model ≈ 0.84 instead of 0.98. Still high, but no longer
+        # extreme. Tune downward to 1.5e-5 if this over-clamps after a
+        # few sessions of evidence.
+        min_sigma=2e-05,
         max_sigma=4e-04,
         binance_symbol="btcusdt",
         tail_mode="kou",
@@ -99,13 +111,18 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # downstream consumer reads _hawkes_intensity (e.g. retrained
         # filtration model with hawkes feature).
         hawkes_params=(0.011611, 0.0300, 0.0500, 3.0),
-        # User asked to allow 2 trades per 15m window when the signal
-        # persists in the same direction (averaging in). The 15m window
-        # has more elapsed time for the signal to evolve and same-side
-        # confirmation is the trend-following case we want to capture;
-        # opposite-direction in-window would be a hedge that fights
-        # itself. Default same_direction_stacking_only=True enforces.
-        max_trades_per_window=2,
+        # 2026-04-09: reverted from 2 → 1 after live evidence that
+        # stacking AMPLIFIES sigma-collapse losses. In the failure mode
+        # we care about (sigma at floor → p_model pinned at 0.84-0.99),
+        # the signal "persists" trivially because the model is locked,
+        # so the second trade is just doubling down on a broken output.
+        # Live session 2026-04-08 had two simultaneous 15m UP fills in
+        # the same window, both losers (-$4.99 + -$4.66). Original
+        # rationale (averaging in when signal evolves over a long
+        # window) is sound in theory but fails when the model itself
+        # is the failure point. Re-enable only after sigma-floor fix
+        # is verified to remove the overconfidence cluster.
+        max_trades_per_window=1,
         # Market-blend: post-fix 50-day backfill (14k BTC 5m / 4.7k BTC 15m
         # REST + live windows) sweep showed BTC 15m Sharpe climbs from 0.61
         # @ blend=0.0 to 1.36 @ blend=0.5 (+123%), max drawdown drops from

@@ -23,8 +23,16 @@ pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 /// High-performance order client wrapping polyfill-rs ClobClient.
 ///
 /// All methods are synchronous from Python's perspective — they block on
-/// the internal tokio runtime. This is safe because the Python callers
-/// run these in asyncio.to_thread(), so blocking doesn't stall the event loop.
+/// the internal tokio runtime. The hot-path methods (place_order,
+/// place_market_order, cancel, cancel_all, get_order) wrap the
+/// `RUNTIME.block_on(...)` call in `py.allow_threads(...)` so the Python
+/// GIL is released during the HTTP roundtrip. Without this, even calling
+/// these from `asyncio.to_thread` would still block other Python coroutines
+/// because the worker thread holds the GIL throughout the network IO.
+///
+/// 2026-04-09 fix: previously the GIL was held during ~200-500ms HTTP
+/// posts, causing the OTHER market's signal loop to freeze every time a
+/// trade was placed. py.allow_threads decouples them.
 #[pyclass]
 pub struct OrderClient {
     inner: Arc<ClobClient>,
@@ -143,12 +151,17 @@ impl OrderClient {
         };
 
         let client = self.inner.clone();
-        let resp = RUNTIME
-            .block_on(async move {
-                let signed = client
-                    .create_order(&args, None, extras, None)
-                    .await?;
-                client.post_order(signed, ot).await
+        // Release the GIL during the HTTP roundtrip so other Python
+        // coroutines can run while we wait. Without this, asyncio.to_thread
+        // would still block the event loop.
+        let resp = py
+            .allow_threads(|| {
+                RUNTIME.block_on(async move {
+                    let signed = client
+                        .create_order(&args, None, extras, None)
+                        .await?;
+                    client.post_order(signed, ot).await
+                })
             })
             .map_err(map_err)?;
 
@@ -183,12 +196,14 @@ impl OrderClient {
         };
 
         let client = self.inner.clone();
-        let resp = RUNTIME
-            .block_on(async move {
-                let signed = client
-                    .create_market_order(&args, extras, None)
-                    .await?;
-                client.post_order(signed, PolyfillOrderType::FOK).await
+        let resp = py
+            .allow_threads(|| {
+                RUNTIME.block_on(async move {
+                    let signed = client
+                        .create_market_order(&args, extras, None)
+                        .await?;
+                    client.post_order(signed, PolyfillOrderType::FOK).await
+                })
             })
             .map_err(map_err)?;
 
@@ -201,8 +216,10 @@ impl OrderClient {
     fn cancel(&self, py: Python<'_>, order_id: &str) -> PyResult<PyObject> {
         let client = self.inner.clone();
         let oid = order_id.to_string();
-        let resp = RUNTIME
-            .block_on(async move { client.cancel(&oid).await })
+        let resp = py
+            .allow_threads(|| {
+                RUNTIME.block_on(async move { client.cancel(&oid).await })
+            })
             .map_err(map_err)?;
 
         types::serialize_to_py(py, &resp)
@@ -213,8 +230,10 @@ impl OrderClient {
     /// Returns a dict with cancel response.
     fn cancel_all(&self, py: Python<'_>) -> PyResult<PyObject> {
         let client = self.inner.clone();
-        let resp = RUNTIME
-            .block_on(async move { client.cancel_all().await })
+        let resp = py
+            .allow_threads(|| {
+                RUNTIME.block_on(async move { client.cancel_all().await })
+            })
             .map_err(map_err)?;
 
         types::serialize_to_py(py, &resp)
@@ -226,8 +245,10 @@ impl OrderClient {
     fn get_order(&self, py: Python<'_>, order_id: &str) -> PyResult<PyObject> {
         let client = self.inner.clone();
         let oid = order_id.to_string();
-        let order = RUNTIME
-            .block_on(async move { client.get_order(&oid).await })
+        let order = py
+            .allow_threads(|| {
+                RUNTIME.block_on(async move { client.get_order(&oid).await })
+            })
             .map_err(map_err)?;
 
         types::serialize_to_py(py, &order)
@@ -237,15 +258,18 @@ impl OrderClient {
     ///
     /// Returns balance as float. Handles the wei-to-USD conversion if needed
     /// (same logic as the existing query_usdc_balance Python function).
-    fn get_balance(&self) -> PyResult<f64> {
+    /// Releases the GIL during the HTTP roundtrip.
+    fn get_balance(&self, py: Python<'_>) -> PyResult<f64> {
         let client = self.inner.clone();
         let params = BalanceAllowanceParams {
             asset_type: Some(AssetType::COLLATERAL),
             token_id: None,
             signature_type: None,
         };
-        let resp = RUNTIME
-            .block_on(async move { client.get_balance_allowance(Some(params)).await })
+        let resp = py
+            .allow_threads(|| {
+                RUNTIME.block_on(async move { client.get_balance_allowance(Some(params)).await })
+            })
             .map_err(map_err)?;
 
         let raw: f64 = resp

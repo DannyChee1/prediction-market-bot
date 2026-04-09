@@ -1331,12 +1331,31 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "reasons": summary,
         })
 
+    # Event types where a crash mid-write can lose money or positions.
+    # These get an fsync after each write to ensure the data hits disk
+    # before we continue. The cost is ~1-2ms per fsync; at 5s diagnostic
+    # cadence plus fill events this is <20 calls/sec — acceptable.
+    _CRITICAL_LOG_TYPES = frozenset({
+        "limit_fill", "ws_fill", "ws_partial_fill", "partial_fill",
+        "resolution", "redemption_enqueued", "redemption",
+        "redemption_batch", "resolve_failed",
+    })
+
     def _log(self, record: dict):
+        import os as _os
         try:
             with open(self.trades_log, "a") as f:
                 f.write(json.dumps(record) + "\n")
-        except Exception:
-            pass
+                if record.get("type") in self._CRITICAL_LOG_TYPES:
+                    f.flush()
+                    _os.fsync(f.fileno())
+        except OSError as exc:
+            # Don't silently swallow — a full disk or permission error
+            # on a critical log means redemption_enqueued records can be
+            # lost, which forfeits winning positions on restart.
+            import sys
+            print(f"  [LOG ERROR] {type(exc).__name__}: {exc} "
+                  f"(type={record.get('type')})", file=sys.stderr)
 
     def save_state(self):
         wins = [r for r in self.all_results if r.pnl > 0]
@@ -1371,6 +1390,32 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             }
             for r in self.all_results[-5000:]
         ]
+        # Persist pending_fills and open_orders so a crash between fill
+        # and resolve doesn't silently lose on-chain positions. On
+        # restart, the load path should reconcile open_orders against
+        # the exchange (cancel stale resting orders, record fills that
+        # landed while we were down).
+        pending_fills_serialized = [
+            {k: v for k, v in f.items() if k != "model_snapshot"}
+            for f in self.pending_fills
+        ]
+        open_orders_serialized = [
+            {
+                "order_id": o["order_id"],
+                "market_slug": o.get("market_slug", ""),
+                "side": o["side"],
+                "price": o["price"],
+                "shares": o["shares"],
+                "cost_est": o["cost_est"],
+                "_cumulative_filled_cost": o.get("_cumulative_filled_cost", 0.0),
+                "_cumulative_filled_shares": o.get("_cumulative_filled_shares", 0.0),
+                "_last_matched": o.get("_last_matched", 0.0),
+                "_verify_pending": o.get("_verify_pending", False),
+                "_counted": o.get("_counted", False),
+            }
+            for o in self.open_orders
+        ]
+
         data = {
             "bankroll": round(self.bankroll, 2),
             "initial_bankroll": round(self.initial_bankroll, 2),
@@ -1399,6 +1444,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             "circuit_breaker": self.circuit_breaker_tripped,
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "all_results": results_serialized,
+            "pending_fills": pending_fills_serialized,
+            "open_orders": open_orders_serialized,
         }
         # Atomic write: dump to temp file, fsync, rename. Without
         # tmp+rename, a crash mid-write leaves a partial JSON file that

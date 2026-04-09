@@ -1337,6 +1337,35 @@ def _build_tracker(
             tracker.all_results = LiveTradeTracker._restore_results(saved_results)
             print(f"  [{config.display_name}] Restored {len(tracker.all_results)} prior trades from state")
 
+        # Restore pending_fills so positions aren't silently lost on
+        # crash-between-fill-and-resolve. On-chain CTF tokens still
+        # exist; without restoring them the bot forgets and the
+        # position goes unredeemed. On restart, we log a warning for
+        # each restored fill so the operator knows they're being
+        # carried forward; the next resolve_window call will handle
+        # them normally.
+        saved_fills = saved.get("pending_fills", [])
+        if saved_fills:
+            tracker.pending_fills = list(saved_fills)
+            print(f"  [{config.display_name}] Restored {len(saved_fills)} "
+                  f"pending fills from state — will resolve in next window")
+            for f in saved_fills:
+                print(f"    {f.get('side', '?')} {f.get('shares', 0):.1f}sh "
+                      f"${f.get('cost_usd', 0):.2f}")
+
+        # Restore open_orders so the bot can cancel stale resting
+        # orders from a prior session. On startup, all restored orders
+        # should be cancelled immediately (they belong to a dead
+        # window). The caller should invoke _cancel_open_orders after
+        # building the tracker if there are restored orders. We set
+        # a flag so the caller knows to do this.
+        saved_orders = saved.get("open_orders", [])
+        if saved_orders:
+            tracker.open_orders = list(saved_orders)
+            tracker._has_restored_orders = True
+            print(f"  [{config.display_name}] Restored {len(saved_orders)} "
+                  f"open orders — will cancel on next window start")
+
     return tracker
 
 

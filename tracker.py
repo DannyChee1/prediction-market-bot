@@ -594,29 +594,24 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                     self._cancel_single_order(existing, f"edge_gone ({current_edge:.4f} < {self.edge_cancel_threshold})")
                     continue
 
-                if order_age > self.max_order_age_s:
-                    cancelled = self._cancel_single_order(
-                        existing, f"age={order_age:.0f}s > {self.max_order_age_s:.0f}s")
-                    if cancelled and dec.action != "FLAT" and dec.size_usd > 0:
-                        if effective_positions < self.max_positions:
-                            self._place_limit_order(snapshot, dec, token, side_label)
-                    continue
-
-                # Queue priority: require minimum tick improvement AND edge increase
-                min_improve = self.min_requote_ticks * self.tick_size
-                edge_at_place = existing.get("edge_at_place", 0.0)
-                if (current_bid is not None
-                        and current_bid >= existing["price"] + min_improve
-                        and current_edge > edge_at_place
-                        and now - self.last_requote_ts.get(side_label, 0) >= self.requote_cooldown_s):
-                    old_price = existing["price"]
-                    cancelled = self._cancel_single_order(
-                        existing, f"requote_{old_price:.2f}->{current_bid:.2f}")
-                    if cancelled and dec.action != "FLAT" and dec.size_usd > 0:
-                        if effective_positions < self.max_positions:
-                            self._place_limit_order(snapshot, dec, token, side_label)
-                            self.last_requote_ts[side_label] = now
-                    continue
+                # 2026-04-09: REMOVED age-based requote and bid-improvement
+                # requote. Each cancel creates a ~200ms race window where
+                # the order can fill at a stale price (adverse selection).
+                # With requote_cooldown_s=3.0, the bot was requoting up to
+                # 100x per 5m window — chasing the bid upward and getting
+                # adversely filled on cancel races.
+                #
+                # New policy: post once, leave it. Cancel ONLY on:
+                #   - bid_dropped (above): defensive, prevents pick-off
+                #   - edge_gone (above): model changed its mind
+                #   - window end: maker_withdraw handles this
+                #
+                # If the bid improves after we posted, our order sits below
+                # the new best bid. We fill only if price comes back to our
+                # level — which is fine, that's the price the model liked.
+                # If it never comes back, we don't fill (tracked as unfilled
+                # at window end).
+                pass  # no requote — order stays at posted price
 
             else:
                 if (dec.action != "FLAT" and dec.size_usd > 0

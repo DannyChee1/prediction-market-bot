@@ -324,6 +324,31 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         max_sigma=1.2e-04,
         binance_symbol="xrpusdt",
     ),
+    "btc_1h": MarketConfig(
+        slug_prefix="bitcoin-up-or-down",
+        chainlink_symbol="btc/usd",
+        data_subdir="btc_1h",
+        display_name="BTC 1h",
+        window_duration_s=3600.0,
+        window_align_m=60,
+        # Same as btc 15m — longer window means sigma has more time to
+        # stabilize so the same floor is appropriate.
+        min_sigma=2e-05,
+        max_sigma=4e-04,
+        binance_symbol="btcusdt",
+        tail_mode="kou",
+        min_entry_z=0.15,
+        market_blend=0.5,
+        max_model_market_disagreement=0.30,
+        max_trades_per_window=1,
+        edge_threshold=0.06,
+        # More lenient staleness gates for 1h — book changes are less
+        # critical over a longer window, and quiet periods are expected.
+        max_book_age_ms=10_000.0,
+        max_chainlink_age_ms=60_000.0,
+        max_binance_age_ms=5_000.0,
+        max_trade_tape_age_ms=15_000.0,
+    ),
 }
 
 DEFAULT_MARKET = "btc"
@@ -334,6 +359,7 @@ _PAIRED = {
     "eth": ("eth", "eth_5m"),
     "sol": ("sol", "sol_5m"),
     "xrp": ("xrp", "xrp_5m"),
+    "btc_1h": ("btc_1h",),  # standalone, not paired with 5m/15m yet
 }
 
 

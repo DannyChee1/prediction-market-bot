@@ -1734,8 +1734,15 @@ class DiffusionSignal(Signal):
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
-        # Vol
-        raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
+        # Vol — reuse the display vol from the early computation above
+        # (line ~1625) if it was computed on the same history. The display
+        # path calls _compute_vol with identical arguments (same lookback,
+        # same hist slice); recomputing is pure waste (~100-200us saved).
+        _cached_display_sigma = ctx.get("_sigma_per_s")
+        if _cached_display_sigma is not None and _cached_display_sigma > 0:
+            raw_sigma = _cached_display_sigma
+        else:
+            raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
 
         # Vol regime filter
         sigma_baseline = 0.0

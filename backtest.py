@@ -840,7 +840,8 @@ def build_diffusion_signal(
     oracle_lead_bias: float = 0.0,
     cross_asset_lookup: dict | None = None,
     cross_asset_min_z: float = 0.3,
-    min_z: float = 0.0,
+    min_z: float | None = None,
+    edge_persistence_s: float = 0.0,
     maker: bool = False,
     use_regime_classifier: bool = True,
     use_filtration: bool = True,
@@ -895,7 +896,8 @@ def build_diffusion_signal(
             max_bet_fraction=0.02,
             momentum_majority=0.0,
             spread_edge_penalty=0.0,
-            window_duration=config.window_duration_s,
+            # window_duration is now always passed from config (below),
+            # so no need to include it in maker_overrides.
         )
 
     # VAMP mode (per base asset)
@@ -957,13 +959,18 @@ def build_diffusion_signal(
         except (ImportError, FileNotFoundError):
             filtration_model = None
 
-    # market_blend: pull from config by default, allow explicit override for A/B
+    # Override resolution: CLI value if explicitly provided, else config.
     effective_blend = (market_blend_override
                        if market_blend_override is not None
                        else config.market_blend)
     effective_tail_mode = (tail_mode_override
                            if tail_mode_override is not None
                            else config.tail_mode)
+    # min_entry_z: CLI None → config default. Backtest CLI used to
+    # default to 0.0 which silently overrode the config's per-market
+    # min_entry_z (e.g. btc 15m config says 0.15, but backtest ran at
+    # 0.0 — every parameter tuned on that backtest is wrong).
+    effective_min_z = min_z if min_z is not None else config.min_entry_z
 
     return DiffusionSignal(
         bankroll=bankroll,
@@ -981,7 +988,7 @@ def build_diffusion_signal(
         oracle_lead_bias=oracle_lead_bias,
         cross_asset_z_lookup=cross_asset_lookup,
         cross_asset_min_z=cross_asset_min_z,
-        min_entry_z=min_z,
+        min_entry_z=effective_min_z,
         tail_mode=effective_tail_mode,
         tail_nu_default=config.tail_nu_default,
         kou_lambda=config.kou_lambda,
@@ -1004,6 +1011,12 @@ def build_diffusion_signal(
         filtration_ev_full=filtration_ev_full,
         hawkes_params=config.hawkes_params,
         data_subdir=config.data_subdir,
+        # Always pass window_duration from config. Previously this was
+        # only in maker_overrides, so FOK backtests on 5m markets used
+        # the class default (900s), which broke dyn_threshold by ~42%
+        # and miscomputed inventory_skew and maker_warmup throughout.
+        window_duration=config.window_duration_s,
+        edge_persistence_s=edge_persistence_s,
         **{**eth_overrides, **maker_overrides, **vamp_kw},
     )
 
@@ -1046,9 +1059,11 @@ def main():
                              "(e.g. 'eth_15m').")
     parser.add_argument("--cross-asset-min-z", type=float, default=0.3,
                         help="Minimum |z| threshold for cross-asset veto (default 0.3)")
-    parser.add_argument("--min-z", type=float, default=0.0,
-                        help="Minimum |z-score| to enter a trade (default 0.0 = disabled, "
-                             "recommended 0.7 based on walk-forward analysis)")
+    parser.add_argument("--min-z", type=float, default=None,
+                        help="Minimum |z-score| to enter a trade (default: from market_config; "
+                             "pass 0.0 to disable, 0.7 for strict filtering)")
+    parser.add_argument("--edge-persistence-s", type=float, default=0.0,
+                        help="Edge must persist for N seconds before firing (default: 0 = disabled in backtest)")
     parser.add_argument("--market-blend", type=float, default=None,
                         help="Override market_blend from config (0.0 = pure model, "
                              "0.5 = 50/50, 1.0 = pure market consensus). "
@@ -1125,6 +1140,7 @@ def main():
             filtration_model_path=args.filtration_model_path,
             market_blend_override=args.market_blend,
             tail_mode_override=args.tail_mode,
+            edge_persistence_s=args.edge_persistence_s,
         ),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

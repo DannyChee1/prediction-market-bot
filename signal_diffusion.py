@@ -76,7 +76,16 @@ class DiffusionSignal(Signal):
         maker_warmup_s: float = 100.0,
         min_entry_price: float = 0.10,
         cal_prior_strength: float = 500.0,
-        cal_max_weight: float = 0.40,
+        # 2026-04-09: disabled calibration fusion by default. With
+        # Z_BIN_WIDTH=0.5, all post-fix z values (typically 0.03-0.31)
+        # round to z_bin=0.0 and look up the same calibration cell,
+        # which returns p≈0.50 by symmetry. The fusion then pulls every
+        # p_model toward 0.5 — the same direction as market_blend —
+        # producing a double-shrinkage that adds negative value. Setting
+        # cal_max_weight=0.0 makes the fusion return pure p_gbm. The
+        # calibration infrastructure stays for future use with a finer
+        # bin grid or an empirical quantile map (see audit P3.2).
+        cal_max_weight: float = 0.0,
         inventory_skew: float = 0.02,
         maker_withdraw_s: float = 60.0,
         sigma_ema_alpha: float = 0.30,
@@ -1451,13 +1460,17 @@ class DiffusionSignal(Signal):
         if eff_price >= 1.0:
             return Decision("FLAT", 0.0, 0.0, "eff price >= 1")
 
-        # Half-Kelly with optional regime-conditional sizing.
-        # Filtration confidence acts as an additional Kelly multiplier in
-        # size_mult mode (no-op in gate mode — the gate already filtered).
+        # Half-Kelly with filtration-based sizing modifier.
+        # Note: the regime classifier (_maybe_compute_regime) is
+        # intentionally NOT called here — it always returns 1.0 on real
+        # data (high_acc state), and decide_both_sides (the live path)
+        # never called it either. Removing it normalizes the two code
+        # paths. If the HMM is retrained with aggressive multipliers
+        # in the future, wire it into _size_decision (shared by both
+        # paths) instead of calling it in decide() alone.
         kelly_f = max(0.0, (p_side - eff_price) / (1.0 - eff_price))
-        regime_mult = self._maybe_compute_regime(ctx, tau, hist, ts_hist)
         filt_mult = self._filtration_size_multiplier(ctx)
-        kelly_fraction_adj = self.kelly_fraction * regime_mult * filt_mult
+        kelly_fraction_adj = self.kelly_fraction * filt_mult
         frac = min(kelly_fraction_adj * kelly_f, self.max_bet_fraction)
         if frac <= 0:
             return Decision("FLAT", 0.0, 0.0,
@@ -1531,6 +1544,16 @@ class DiffusionSignal(Signal):
         size_usd = self.bankroll * frac
         min_usd = self.min_order_shares * eff_price
         if size_usd < min_usd:
+            # When filtration downsized the trade (filt_mult < 1), don't
+            # silently bump back up to the floor — that defeats the
+            # graduated moderation. Return FLAT instead. This means
+            # filtration only fires trades at full or near-full sizing on
+            # small bankrolls, which is the correct behavior: "not confident
+            # enough to trade at the minimum size" = skip.
+            if filt_mult < 1.0:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"filtration size below min order "
+                    f"(${size_usd:.2f} < ${min_usd:.2f}, filt_mult={filt_mult:.2f})")
             if self.bankroll >= min_usd:
                 size_usd = min_usd
             else:

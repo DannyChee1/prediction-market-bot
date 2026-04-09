@@ -166,6 +166,27 @@ def find_market(config: MarketConfig):
 def poll_market_resolution(slug: str, max_attempts: int = 12,
                            delay: float = 5.0,
                            debug: bool = False) -> int | None:
+    """Poll Gamma API until the market is FULLY RESOLVED (not just closed).
+
+    2026-04-09 fix: previously this checked only `closed=True` and read
+    `outcomePrices` as a winner indicator (`up_price > 0.5`). But the API
+    sets `closed=True` BEFORE the on-chain resolution finalizes, and during
+    that gap `outcomePrices` shows the LAST TRADE PRICES (not the
+    settlement prices). A market that traded UP at 0.51 just before
+    closing would be reported as "UP wins" by the old code, even when the
+    actual Chainlink resolution was DOWN. Real loss documented:
+    btc-updown-5m-1775709300 (window 04:35-04:40 UTC, 2026-04-09) — bot
+    bet DOWN, recorded as UP loss, actual API state now shows DOWN won
+    (outcomePrices=["0","1"], umaResolutionStatus="resolved"). Cost: $9.30
+    in unredeemed winnings.
+
+    The fix requires THREE conditions before trusting the outcome:
+    1. `closed == True`
+    2. `umaResolutionStatus == "resolved"` (UMA optimistic oracle confirmed)
+    3. `outcomePrices` is exactly one "1" and one "0" (settlement prices)
+
+    If any condition fails, keep polling (up to max_attempts).
+    """
     for attempt in range(max_attempts):
         try:
             resp = requests.get(
@@ -173,6 +194,7 @@ def poll_market_resolution(slug: str, max_attempts: int = 12,
             )
             data = resp.json()
             if not data:
+                _time.sleep(delay)
                 continue
             market = data[0]["markets"][0]
             if not market.get("closed"):
@@ -180,11 +202,48 @@ def poll_market_resolution(slug: str, max_attempts: int = 12,
                     print(f"  [RESOLVE] attempt {attempt + 1}: not closed yet")
                 _time.sleep(delay)
                 continue
+
+            # NEW: require UMA resolution before trusting outcomePrices.
+            uma_status = market.get("umaResolutionStatus", "")
+            if uma_status != "resolved":
+                if debug:
+                    print(f"  [RESOLVE] attempt {attempt + 1}: closed but uma_status={uma_status!r} (waiting for finalization)")
+                _time.sleep(delay)
+                continue
+
             outcomes = _ensure_list(market["outcomes"])
             outcome_prices = _ensure_list(market["outcomePrices"])
+            if len(outcomes) != 2 or len(outcome_prices) != 2:
+                if debug:
+                    print(f"  [RESOLVE] attempt {attempt + 1}: malformed outcomes/prices")
+                _time.sleep(delay)
+                continue
+
+            # NEW: require settlement prices to be exactly 0/1.
+            # If the market is showing intermediate prices like 0.51/0.49,
+            # the on-chain resolution hasn't been applied yet — keep polling.
+            try:
+                price_strs = [str(p).strip() for p in outcome_prices]
+                price_floats = [float(p) for p in outcome_prices]
+            except (ValueError, TypeError):
+                if debug:
+                    print(f"  [RESOLVE] attempt {attempt + 1}: price parse fail: {outcome_prices}")
+                _time.sleep(delay)
+                continue
+
+            settled = (
+                {price_strs[0], price_strs[1]} == {"0", "1"}
+                or sorted(price_floats) == [0.0, 1.0]
+            )
+            if not settled:
+                if debug:
+                    print(f"  [RESOLVE] attempt {attempt + 1}: prices not settled yet: {outcome_prices}")
+                _time.sleep(delay)
+                continue
+
             up_idx = outcomes.index("Up")
             up_price = float(outcome_prices[up_idx])
-            return 1 if up_price > 0.5 else 0
+            return 1 if up_price >= 1.0 else 0
         except Exception as exc:
             if debug:
                 print(f"  [RESOLVE] attempt {attempt + 1} error: {exc}")

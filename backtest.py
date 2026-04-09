@@ -1032,6 +1032,7 @@ def build_diffusion_signal(
     cross_asset_min_z: float = 0.3,
     min_z: float | None = None,
     edge_persistence_s: float = 0.0,
+    vol_regime_mult: float = 3.0,
     maker: bool = False,
     use_regime_classifier: bool = True,
     use_filtration: bool = True,
@@ -1207,6 +1208,7 @@ def build_diffusion_signal(
         # and miscomputed inventory_skew and maker_warmup throughout.
         window_duration=config.window_duration_s,
         edge_persistence_s=edge_persistence_s,
+        vol_regime_mult=vol_regime_mult,
         **{**eth_overrides, **maker_overrides, **vamp_kw},
     )
 
@@ -1254,6 +1256,9 @@ def main():
                              "pass 0.0 to disable, 0.7 for strict filtering)")
     parser.add_argument("--edge-persistence-s", type=float, default=0.0,
                         help="Edge must persist for N seconds before firing (default: 0 = disabled in backtest)")
+    parser.add_argument("--vol-regime-mult", type=float, default=3.0,
+                        help="Vol spike gate multiplier (default: 3.0 = skip when short vol > 3x baseline; "
+                             "set higher to loosen, 999 to disable)")
     parser.add_argument("--market-blend", type=float, default=None,
                         help="Override market_blend from config (0.0 = pure model, "
                              "0.5 = 50/50, 1.0 = pure market consensus). "
@@ -1338,6 +1343,7 @@ def main():
             market_blend_override=args.market_blend,
             tail_mode_override=args.tail_mode,
             edge_persistence_s=args.edge_persistence_s,
+            vol_regime_mult=args.vol_regime_mult,
         ),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),

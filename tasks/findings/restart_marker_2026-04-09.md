@@ -2,27 +2,29 @@
 
 ## Restart timestamp
 
-**~2026-04-09T01:54:25Z** (UTC)
+**Clean restart: 2026-04-09T02:58Z** (UTC) — fresh state, fresh log, fresh $100 bankroll
 
-This is the moment we restarted the bot after applying four targeted fixes.
+(Earlier restart attempts at 01:54 / 02:33 were not clean. Old state and log
+were preserved in `live_state_btc.20260409T025838Z.bak.json` and
+`live_trades_btc.20260409T025838Z.bak.jsonl` for historical reference.)
+
 Use this as the cutoff for "post-fix" PnL/PF analysis:
 
 ```bash
-uv run python scripts/show_pf.py --since 2026-04-09T01:54
+uv run python scripts/show_pf.py --since 2026-04-09T02:58
 ```
 
-## State at restart
+## State at clean restart (2026-04-09T02:58)
 
-From `live_state_btc.json` (saved 2026-04-09T00:01):
-- Bankroll: **$80.84**
-- Initial bankroll (this run): $104.54
-- Lifetime PnL: -$27.89
-- Lifetime trades: 29
-- Wins: 13, Losses: 16
+- Old state file backed up to `live_state_btc.20260409T025838Z.bak.json`
+- Old trade log backed up to `live_trades_btc.20260409T025838Z.bak.jsonl`
+- Fresh start: $100 bankroll, 0 trades, 0 PnL, 0 drawdown
+
+For historical context, the backed-up state had:
+- Final bankroll: $79.81
+- Lifetime PnL: -$28.92 (over 34 lifetime trades)
 - Peak bankroll: $111.23
-- Max drawdown: $30.39 (27.3%)
-
-(Restarting with `--resume` continues this state.)
+- Max drawdown: $33.34 (30%)
 
 ## What changed in this restart
 
@@ -34,16 +36,18 @@ From `live_state_btc.json` (saved 2026-04-09T00:01):
 | `signal_diffusion.py` | New `edge_persistence_s` parameter (5s for 5m, 10s for 15m) | Edge must persist for N seconds before firing. Defends against fast-spike chasing where the model briefly crosses the edge threshold and then mean-reverts. Motivated by 00:35:50 fill investigation showing the bot fired ~10s after a sharp price move that the dashboard couldn't even see yet. |
 | `live_trader.py:1131` | Pass `edge_persistence_s` per market | Activates the gate per timeframe. |
 
-## Restart command
+## Restart command (clean)
 
 ```bash
-uv run python live_trader.py --market btc_5m --resume
+caffeinate -i uv run python live_trader.py --market btc --bankroll 100
 ```
 
-**Note**: deliberately running `btc_5m` only (no 15m) for first session post-fix.
-The 15m market lost -$27.18 (-50% ROI) in the previous session. Even with the
-fixes targeted at 15m's failure mode, isolating to 5m gives a cleaner test of
-whether the underlying strategy + my changes can produce a positive session.
+**Notes**:
+- NO `--resume` flag → fresh state, fresh PnL tracking, $100 starts honored.
+- `--market btc` runs BOTH 5m and 15m → tests all 4 fixes simultaneously.
+- `caffeinate -i` keeps the Mac awake while the bot runs.
+- Both new gates are active: edge persistence (5s for 5m, 10s for 15m) +
+  diagnostic cadence 5s (so dashboard stays in near-real-time).
 
 ## What to watch for
 

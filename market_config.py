@@ -131,6 +131,19 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # is the failure point. Re-enable only after sigma-floor fix
         # is verified to remove the overconfidence cluster.
         max_trades_per_window=1,
+        # 2026-04-09: lowered from default 0.5 → 0.15 after live evidence
+        # that the min_sigma=2e-5 floor (just shipped) reduces typical |z|
+        # from "frequently above 0.5" to "almost always 0.03-0.31 range".
+        # The 0.5 default was calibrated against the OLD broken sigma values
+        # where z routinely hit the ±1.0 cap. Post-fix it filters basically
+        # every legitimate setup. Empirical evidence: 49,774 evals on a
+        # single 15m window post-fix produced 0 trades — the top FLAT
+        # reasons were min_z gates at z=0.030, 0.042, 0.110, 0.111, 0.112,
+        # 0.113, 0.309 — none above 0.5. The new 0.15 threshold still
+        # filters true noise (z near 0) but lets meaningful directional
+        # signals through. Defended by the new edge persistence gate
+        # (10s for 15m) and max_model_market_disagreement=0.30 above.
+        min_entry_z=0.15,
         # Model-vs-market disagreement gate. Backtest A/B at 0.30:
         # btc 15m Sharpe 1.65 → 2.11 (+0.46), DD 2.3% → 1.5% (-0.8pp),
         # win rate 57.7% → 62.0%. Catches the cases where σ collapses
@@ -187,7 +200,11 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # workaround for the Kou risk-neutral drift bug, which has now
         # been fixed in `_model_cdf` (drift_z ∝ 1/σ blew up at the floor).
         # New bounds [1e-5, 2e-4] cover ~p10..p99.5.
-        min_sigma=1e-05,
+        # 2026-04-09: raised 1e-5 → 2e-5 to match btc 15m. Live evidence:
+        # 33 trades at PF=0.39 with the old floor, while 15m (with 2e-5
+        # floor + disagreement gate) went 3/3 wins. Same BTC, same feeds,
+        # same model — only difference was the defensive stack. Mirroring.
+        min_sigma=2e-05,
         max_sigma=2e-04,
         binance_symbol="btcusdt",
         tail_mode="kou",
@@ -210,7 +227,10 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # downstream consumer reads _hawkes_intensity (e.g. retrained
         # filtration model with hawkes feature).
         hawkes_params=(0.023712, 0.0200, 0.0500, 3.0),
-        min_entry_z=0.0,            # blend filters disagreement (was 0.7)
+        # 2026-04-09: raised 0.0 → 0.15 to match btc 15m. With min_sigma
+        # now at 2e-5, typical |z| is in 0.03-0.30 range; 0.15 filters
+        # the noise while letting meaningful setups through.
+        min_entry_z=0.15,
         min_entry_price=0.20,       # avoid deep OTM tail (was 0.10)
         # NOTE on edge_threshold: user asked to halve trade frequency
         # for better Sharpe. Backtest A/B showed this is the WRONG lever:
@@ -224,7 +244,23 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # max_spread (selectivity by liquidity), not edge_threshold.
         edge_threshold=0.06,
         market_blend=0.3,           # pull p_model toward market mid
-        max_book_age_ms=1000.0,     # skip trades during book WS disconnects
+        # 2026-04-09: mirroring 15m's disagreement gate. Live data:
+        # 15m with this gate at 0.30 went 3/3 wins; 5m without it went
+        # 10/33 wins (PF=0.39). When |p_model_raw - mid_up| > 0.30,
+        # the model is probably overconfident from sigma collapse.
+        max_model_market_disagreement=0.30,
+        # 2026-04-09: bumped 1000 → 5000 after live evidence that calm
+        # markets trigger false stale-book FLATs. The Polymarket book WS
+        # only sends updates when the book CHANGES — during quiet periods
+        # the bot was seeing book_age 4-9 SECONDS even though the WS was
+        # alive (PINGs were going through). The 1s threshold was meant
+        # to detect WS disconnects, but in practice it was firing on
+        # calm-market silence. 5s still catches real disconnects (the
+        # Rust feed reconnects after 30s of no data anyway) but stops
+        # false-firing during normal calm periods. The Binance freshness
+        # gate (max_binance_age_ms=1500) provides the actual fast-market
+        # protection — Binance updates ~10ms even in calm markets.
+        max_book_age_ms=5000.0,
         # σ estimator: see note on btc 15m above. EWMA wins on σ
         # forecasting but hurts PnL by $360 in ablation
         # (validation_runs/ablation_btc_5m.json). Opt in only after

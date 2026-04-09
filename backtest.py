@@ -125,6 +125,8 @@ class BacktestEngine:
         max_trades_per_window: int = 1,
         same_direction_stacking_only: bool = True,
         window_duration_s: float | None = None,
+        as_haircut: float = 0.0,
+        queue_model: bool = False,
     ):
         self.signal = signal
         self.data_dir = data_dir
@@ -149,6 +151,35 @@ class BacktestEngine:
             self.windows_per_day = 86400.0 / window_duration_s
         else:
             self.windows_per_day = 96.0  # 15m legacy default
+
+        # ── Adverse selection / queue model ──────────────────────────
+        # as_haircut: fraction of spread added to entry price (maker
+        # only). 0 = off (legacy instant-fill), 0.5 = half-spread
+        # penalty, 1.0 = full spread. Models the fact that maker fills
+        # are adversely selected — you only get filled when informed
+        # flow walks through you.
+        self.as_haircut = as_haircut
+        # queue_model: when True, maker fills are deferred until
+        # cumulative opposing volume eats through the queue ahead of
+        # us. When False (default), instant fill at bid (legacy).
+        self.queue_model = queue_model
+
+        # ── Maker fill tracking counters ─────────────────────────────
+        self.maker_attempts = 0
+        self.maker_fills = 0
+        self.maker_unfilled = 0
+        self.maker_cancelled = 0
+        self.total_queue_time_s = 0.0
+        self.total_haircut_paid = 0.0
+
+    def _reset_maker_counters(self):
+        """Reset maker fill tracking counters (e.g. between train/test passes)."""
+        self.maker_attempts = 0
+        self.maker_fills = 0
+        self.maker_unfilled = 0
+        self.maker_cancelled = 0
+        self.total_queue_time_s = 0.0
+        self.total_haircut_paid = 0.0
 
     def load_data(self) -> pd.DataFrame:
         if not self.data_dir.exists() or not any(self.data_dir.glob("*.parquet")):
@@ -217,10 +248,19 @@ class BacktestEngine:
         if not ask_levels or best_ask is None or best_ask <= 0:
             return None
 
-        # Maker mode: fill at bid with 0% fee
+        # Maker mode: fill at bid with 0% fee, optional adverse-selection haircut
         maker_mode = getattr(self.signal, "maker_mode", False)
         if maker_mode and best_bid is not None and best_bid > 0:
-            entry_price = best_bid  # maker fills at bid: 0% fee
+            entry_price = best_bid
+            fee_avg = 0.0
+            # Adverse selection haircut: shift entry price by fraction of spread.
+            # A haircut of 0.5 means we pay half the spread on top of best_bid,
+            # modeling the fact that we only get filled when price moves through us.
+            haircut_amount = 0.0
+            if self.as_haircut > 0:
+                spread = (best_ask - best_bid) if (best_ask and best_bid) else 0.01
+                haircut_amount = self.as_haircut * spread
+                entry_price = best_bid + haircut_amount
             if entry_price <= 0 or entry_price >= 1.0:
                 return None
             desired_shares = decision.size_usd / entry_price
@@ -230,7 +270,8 @@ class BacktestEngine:
             total_cost = filled * entry_price
             if total_cost > self.bankroll:
                 return None  # can't afford
-            fee_avg = 0.0
+            # Track haircut cost for reporting
+            self.total_haircut_paid += haircut_amount * filled
         else:
             eff_est = best_ask + poly_fee(best_ask) + self.slippage
             if eff_est <= 0 or eff_est >= 1.0:
@@ -293,6 +334,21 @@ class BacktestEngine:
 
         has_binance = "binance_mid" in window_df.columns
 
+        # ── Queue model state (maker mode only) ──────────────────────
+        # When queue_model=True, maker fills are deferred: we store a
+        # pending maker order and only fill when cumulative opposing
+        # volume eats through the queue ahead of us.
+        #
+        # pending_maker: dict with keys:
+        #   decision, post_ts_ms, depth_ahead, shares, cum_volume,
+        #   side_label ("UP"/"DOWN"), ctx_snapshot (for _execute_fill)
+        pending_maker: Optional[dict] = None
+
+        # Check for trade tape columns (some REST-backfill parquets
+        # have NaN in these; degrade gracefully).
+        has_trade_tape = ("last_trade_side_up" in window_df.columns
+                          and "last_trade_sz_up" in window_df.columns)
+
         for _, row in window_df.iterrows():
             snap = Snapshot.from_row(row)
             if snap is None:
@@ -302,7 +358,57 @@ class BacktestEngine:
             if has_binance and pd.notna(row.get("binance_mid")) and row["binance_mid"] > 0:
                 ctx["_binance_mid"] = float(row["binance_mid"])
 
-            # Execute pending order after latency
+            # ── Queue model: check pending maker order for fill ──────
+            if pending_maker is not None and self.queue_model:
+                pm = pending_maker
+                # Read opposing trade volume from this tick's tape.
+                # For BUY_UP: we're on the bid side of the UP contract,
+                # so we need SELL-side trades (taker sells into our bid).
+                # For BUY_DOWN: same logic on the DOWN contract.
+                if pm["side_label"] == "UP":
+                    trade_side_col = "last_trade_side_up"
+                    trade_sz_col = "last_trade_sz_up"
+                else:
+                    trade_side_col = "last_trade_side_down"
+                    trade_sz_col = "last_trade_sz_down"
+
+                if has_trade_tape:
+                    trade_side = row.get(trade_side_col)
+                    trade_sz = row.get(trade_sz_col)
+                    # Opposing flow = SELL (taker sells into our bid)
+                    if (trade_side == "SELL"
+                            and trade_sz is not None
+                            and not pd.isna(trade_sz)
+                            and float(trade_sz) > 0):
+                        pm["cum_volume"] += float(trade_sz)
+
+                # Fill condition: opposing volume ate through queue + our order
+                fill_threshold = pm["depth_ahead"] + pm["shares"]
+                if pm["cum_volume"] >= fill_threshold:
+                    # Fill at CURRENT tick's snapshot (price may have moved)
+                    fill = self._execute_fill(snap, pm["decision"], ctx)
+                    if fill is not None:
+                        self.maker_fills += 1
+                        queue_time_s = (snap.ts_ms - pm["post_ts_ms"]) / 1000.0
+                        self.total_queue_time_s += queue_time_s
+                        filled_sides.add(pm["side_label"])
+                        results.append(self._resolve_fill(fill, outcome_up, final_btc))
+                        self.bankroll += results[-1].pnl
+                        if hasattr(self.signal, "bankroll"):
+                            self.signal.bankroll = self.bankroll
+                        last_fill_ts = snap.ts_ms
+                        ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
+                        if "UP" in pm["decision"].action:
+                            ctx["inventory_up"] = ctx.get("inventory_up", 0) + fill.shares
+                        elif "DOWN" in pm["decision"].action:
+                            ctx["inventory_down"] = ctx.get("inventory_down", 0) + fill.shares
+                    else:
+                        # Volume arrived but fill rejected (price moved
+                        # too far, bankroll insufficient, etc.)
+                        self.maker_unfilled += 1
+                    pending_maker = None
+
+            # Execute pending order after latency (FOK path only)
             if pending is not None:
                 exec_ts, decision = pending
                 if snap.ts_ms >= exec_ts:
@@ -344,9 +450,25 @@ class BacktestEngine:
                     continue
                 # Enforce maker withdraw
                 if snap.time_remaining_s < getattr(self.signal, "maker_withdraw_s", 60.0):
+                    # If we have a pending maker order and we're past
+                    # withdraw, cancel it — no more time to fill.
+                    if pending_maker is not None:
+                        self.maker_cancelled += 1
+                        pending_maker = None
                     continue
 
                 up_dec, down_dec = self.signal.decide_both_sides(snap, ctx)
+
+                # Queue model: cancel pending maker if signal goes FLAT
+                # for the pending side. The loop below only processes
+                # non-FLAT decisions, so we check explicitly here.
+                if self.queue_model and pending_maker is not None:
+                    pm_side = pending_maker["side_label"]
+                    pm_dec = up_dec if pm_side == "UP" else down_dec
+                    if pm_dec.action == "FLAT":
+                        self.maker_cancelled += 1
+                        pending_maker = None
+
                 for decision in [up_dec, down_dec]:
                     if decision.action != "FLAT" and decision.size_usd > 0:
                         if self.max_trades_per_window is not None and len(results) >= self.max_trades_per_window:
@@ -356,6 +478,46 @@ class BacktestEngine:
                         opposite = "DOWN" if side_label == "UP" else "UP"
                         if opposite in filled_sides:
                             continue
+
+                        # ── Queue model: post maker order instead of instant fill
+                        if self.queue_model:
+                            # Cancel any existing pending maker if signal flips
+                            if pending_maker is not None:
+                                if pending_maker["side_label"] != side_label:
+                                    self.maker_cancelled += 1
+                                    pending_maker = None
+                                elif pending_maker["decision"].action == decision.action:
+                                    # Same direction already pending, skip
+                                    continue
+
+                            if pending_maker is None:
+                                self.maker_attempts += 1
+                                # Compute depth ahead from L2 snapshot
+                                if side_label == "UP":
+                                    bid_levels = snap.bid_levels_up
+                                else:
+                                    bid_levels = snap.bid_levels_down
+                                # Size at best bid = queue depth ahead of us
+                                depth_ahead = (bid_levels[0][1]
+                                               if bid_levels else 100.0)
+                                # Estimate our order size (shares)
+                                best_bid = (snap.best_bid_up if side_label == "UP"
+                                            else snap.best_bid_down)
+                                if best_bid and best_bid > 0:
+                                    our_shares = decision.size_usd / best_bid
+                                else:
+                                    our_shares = decision.size_usd  # fallback
+                                pending_maker = {
+                                    "decision": decision,
+                                    "post_ts_ms": snap.ts_ms,
+                                    "depth_ahead": depth_ahead,
+                                    "shares": round(our_shares, 1),
+                                    "cum_volume": 0.0,
+                                    "side_label": side_label,
+                                }
+                            continue
+
+                        # ── Instant fill (legacy, queue_model=False)
                         fill = self._execute_fill(snap, decision, ctx)
                         if fill is not None:
                             filled_sides.add(side_label)
@@ -400,6 +562,11 @@ class BacktestEngine:
                             ctx["inventory_down"] = ctx.get("inventory_down", 0) + fill.shares
                 else:
                     pending = (snap.ts_ms + self.latency_ms, decision)
+
+        # ── End-of-window: handle unfilled pending maker orders ──────
+        if pending_maker is not None:
+            self.maker_unfilled += 1
+            pending_maker = None
 
         return results
 
@@ -573,6 +740,9 @@ class BacktestEngine:
         self.bankroll = self.initial_bankroll
         if hasattr(self.signal, "bankroll"):
             self.signal.bankroll = self.initial_bankroll
+        # Reset maker counters so test metrics are clean (not cumulative
+        # with train pass).
+        self._reset_maker_counters()
         test_results, test_bk_hist = self._run_slug_list(
             df, test_slugs, verbose=verbose_test
         )
@@ -683,6 +853,18 @@ class BacktestEngine:
             sharpe_deflated=round(sharpe_deflated, 2),
             n_trials=n_trials,
         )
+
+        # ── Maker fill metrics (only meaningful in maker mode) ───────
+        if getattr(self.signal, "maker_mode", False):
+            base["maker_fill_rate"] = round(
+                self.maker_fills / max(1, self.maker_attempts), 4)
+            base["maker_unfilled"] = self.maker_unfilled
+            base["maker_cancelled"] = self.maker_cancelled
+            base["avg_queue_time_s"] = round(
+                self.total_queue_time_s / max(1, self.maker_fills), 1)
+            base["avg_haircut"] = round(
+                self.total_haircut_paid / max(1, self.maker_fills), 4)
+
         return base
 
 
@@ -767,6 +949,14 @@ def print_summary(metrics: dict, trades_df: pd.DataFrame):
     if metrics.get("n_trials", 1) > 1:
         print(f"  Sharpe (defl.): {metrics['sharpe_deflated']:.2f}  "
               f"(N={metrics['n_trials']} trials)")
+    # Maker fill metrics (only present when maker mode is active)
+    if "maker_fill_rate" in metrics:
+        print(f"  --- Maker fill model ---")
+        print(f"  Fill rate:      {metrics['maker_fill_rate']:.1%}")
+        print(f"  Unfilled:       {metrics['maker_unfilled']}")
+        print(f"  Cancelled:      {metrics['maker_cancelled']}")
+        print(f"  Avg queue time: {metrics['avg_queue_time_s']:.1f}s")
+        print(f"  Avg haircut:    {metrics['avg_haircut']:.4f}")
     print(f"{'='*62}")
 
 
@@ -1096,6 +1286,13 @@ def main():
                         help="Path to filtration model pkl. Defaults to "
                              "filtration_model.pkl. Use filtration_model_pnl.pkl for "
                              "the regression model trained with --target regression.")
+    parser.add_argument("--as-haircut", type=float, default=0.0,
+                        help="Adverse selection haircut as fraction of spread "
+                             "(0=off, 0.5=half-spread, 1.0=full spread). "
+                             "Only applies in maker mode.")
+    parser.add_argument("--queue-model", action="store_true", default=False,
+                        help="Enable queue-position fill model for maker mode "
+                             "(fills only when sell volume exceeds queue depth)")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -1151,6 +1348,10 @@ def main():
         if args.signal == "all" else [args.signal]
 
     mode_str = "MAKER" if args.maker else "FOK"
+    if args.maker and args.queue_model:
+        mode_str += "+QUEUE"
+    if args.maker and args.as_haircut > 0:
+        mode_str += f"+AS{args.as_haircut:.0%}"
     train_frac = args.train_frac
     use_split = train_frac < 1.0
 
@@ -1167,6 +1368,8 @@ def main():
             max_trades_per_window=config.max_trades_per_window,
             same_direction_stacking_only=config.same_direction_stacking_only,
             window_duration_s=config.window_duration_s,
+            as_haircut=args.as_haircut,
+            queue_model=args.queue_model,
         )
         print(f"\n{'='*62}")
         print(f"  Running: {signal.name} ({config.display_name}) [{mode_str}]")

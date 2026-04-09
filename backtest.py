@@ -967,6 +967,7 @@ def build_diffusion_signal(
         max_sigma=config.max_sigma,
         min_sigma=config.min_sigma,
         edge_threshold=config.edge_threshold,
+        max_model_market_disagreement=config.max_model_market_disagreement,
         oracle_cancel_threshold=oracle_cancel_threshold,
         oracle_lead_bias=oracle_lead_bias,
         cross_asset_z_lookup=cross_asset_lookup,

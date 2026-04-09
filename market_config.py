@@ -47,6 +47,14 @@ class MarketConfig:
     # the SAME direction as the first. Prevents the bot from hedging
     # against itself when the signal whipsaws within a window.
     same_direction_stacking_only: bool = True
+    # Model-vs-market disagreement gate. When |p_model_raw - mid_up|
+    # exceeds this, skip the trade — the diffusion model is probably
+    # overconfident from a sigma collapse, not detecting real edge.
+    # 1.0 = disabled (default). btc 15m sets 0.30 because backtest
+    # showed +0.46 Sharpe and -0.8pp DD at that threshold paired
+    # with the min_sigma=2e-5 upstream defense. btc_5m leaves it off
+    # because the marginal trades it filters are profitable.
+    max_model_market_disagreement: float = 1.0
     # σ estimator selector for _compute_vol. Options:
     #   "yz"   — Yang-Zhang on 5s OHLC bars (legacy default; suboptimal
     #            on continuously-traded feeds because the var_oc term
@@ -123,6 +131,13 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # is the failure point. Re-enable only after sigma-floor fix
         # is verified to remove the overconfidence cluster.
         max_trades_per_window=1,
+        # Model-vs-market disagreement gate. Backtest A/B at 0.30:
+        # btc 15m Sharpe 1.65 → 2.11 (+0.46), DD 2.3% → 1.5% (-0.8pp),
+        # win rate 57.7% → 62.0%. Catches the cases where σ collapses
+        # below the min_sigma=2e-5 floor (e.g. via the sigma_baseline
+        # adaptive path) and the model becomes confidently wrong vs
+        # the contract mid. Backstop to the upstream min_sigma fix.
+        max_model_market_disagreement=0.30,
         # Market-blend: post-fix 50-day backfill (14k BTC 5m / 4.7k BTC 15m
         # REST + live windows) sweep showed BTC 15m Sharpe climbs from 0.61
         # @ blend=0.0 to 1.36 @ blend=0.5 (+123%), max drawdown drops from

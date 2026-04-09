@@ -833,6 +833,7 @@ def build_diffusion_signal(
     cal_prior_strength: float = 100.0,
     maker_withdraw: float = 60.0,
     oracle_cancel_threshold: float = 0.0,
+    oracle_lead_bias: float = 0.0,
     cross_asset_lookup: dict | None = None,
     cross_asset_min_z: float = 0.3,
     min_z: float = 0.0,
@@ -967,6 +968,7 @@ def build_diffusion_signal(
         min_sigma=config.min_sigma,
         edge_threshold=config.edge_threshold,
         oracle_cancel_threshold=oracle_cancel_threshold,
+        oracle_lead_bias=oracle_lead_bias,
         cross_asset_z_lookup=cross_asset_lookup,
         cross_asset_min_z=cross_asset_min_z,
         min_entry_z=min_z,
@@ -1023,6 +1025,12 @@ def main():
                         help="Stop new orders when tau < N seconds (default 60)")
     parser.add_argument("--oracle-cancel-threshold", type=float, default=0.0,
                         help="Hard-cancel when Binance-Chainlink gap exceeds this fraction.")
+    parser.add_argument("--oracle-lead-bias", type=float, default=0.0,
+                        help="F4: bias on p_model from Binance→Chainlink lead-lag. "
+                             "When binance_mid > chainlink, the next chainlink update will "
+                             "likely move UP (rebroadcast tax = ~1.2s). At gap = "
+                             "oracle_lag_threshold, bias = oracle_lead_bias (e.g. 0.05 = +5pp). "
+                             "Default 0.0 = disabled. Recommended starting value: 0.05.")
     parser.add_argument("--cross-asset-dir", type=str, default=None,
                         help="Secondary asset data subdir for cross-asset disagreement veto "
                              "(e.g. 'eth_15m').")
@@ -1094,6 +1102,7 @@ def main():
             cal_prior_strength=args.cal_prior_strength,
             maker_withdraw=args.maker_withdraw,
             oracle_cancel_threshold=args.oracle_cancel_threshold,
+            oracle_lead_bias=args.oracle_lead_bias,
             cross_asset_lookup=cross_asset_lookup,
             cross_asset_min_z=args.cross_asset_min_z,
             min_z=args.min_z,

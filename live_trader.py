@@ -1075,6 +1075,8 @@ def _build_tracker(
     signal_kw["edge_threshold"] = signal_kw.get("edge_threshold", config.edge_threshold)
     signal_kw["momentum_majority"] = 0.0
     signal_kw["spread_edge_penalty"] = signal_kw.get("spread_edge_penalty", 0.0)
+    # F4: oracle lead-lag bias (default 0.0 = disabled, opt-in via flag)
+    signal_kw["oracle_lead_bias"] = args.oracle_lead_bias
     cooldown_ms = 30_000
     stale_timeout = 60.0
 
@@ -1291,7 +1293,14 @@ def _build_tracker(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Live trading bot for Polymarket Up/Down markets"
+        description="Live trading bot for Polymarket Up/Down markets",
+        epilog=(
+            "Tip: the Rust feed extension prints WebSocket reconnect "
+            "events to stderr (e.g. '[BookFeed] read error: ...'). These "
+            "are auto-recovered by the 30s stale watchdog and are not a "
+            "concern. To keep the display clean, redirect stderr to a "
+            "file: `uv run python live_trader.py --market btc 2>err.log`"
+        ),
     )
     parser.add_argument(
         "--market", default=DEFAULT_MARKET,
@@ -1396,6 +1405,11 @@ def main():
                         help="Kelly fraction for sizing (0.25 = quarter-Kelly, default: 0.25)")
     parser.add_argument("--max-bet-fraction", type=float, default=0.05,
                         help="Max fraction of bankroll per trade (default: 0.05)")
+    parser.add_argument("--oracle-lead-bias", type=float, default=0.0,
+                        help="F4: bias on p_model from Binance→Chainlink lead-lag. "
+                             "When binance_mid > chainlink, bias p_up upward by up to "
+                             "this amount (e.g. 0.05 = +5pp at gap = oracle_lag_threshold). "
+                             "Default 0.0 = disabled. Recommended: 0.05 after backtest A/B.")
     parser.add_argument("--tail-mode", choices=["student_t", "normal", "kou"],
                         default=None,
                         help="CDF for z→probability (default: from market config)")

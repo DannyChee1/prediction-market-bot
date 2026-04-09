@@ -15,6 +15,14 @@ uv run python backtest.py --market btc_5m --signal diffusion --train-frac 0.7
 uv run python recorder.py --market btc
 ```
 
+The Rust feed extension prints WebSocket reconnect events to stderr
+(e.g. `[BookFeed] read error: ...`). These are auto-recovered by the
+30-second stale watchdog and aren't a concern. To keep the display
+clean, redirect stderr to a file:
+```bash
+uv run python live_trader.py --market btc 2>err.log
+```
+
 ## Repo Layout
 
 | File / Dir | Purpose |

@@ -21,4 +21,7 @@ dashboard_paper_trades.jsonl
 dashboard_lag_history.jsonl
 filtration_model.pkl.*
 filtration_model_pnl.pkl
+# F1 measurement campaign output (potentially large rotating logs)
+feed_latency*.jsonl
+feed_latency*.png
 

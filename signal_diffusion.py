@@ -103,6 +103,24 @@ class DiffusionSignal(Signal):
         # Oracle lag detection (Binance vs Chainlink discrepancy)
         oracle_lag_threshold: float = 0.002,
         oracle_lag_mult: float = 2.0,
+        # F4: oracle lead-lag as a profit signal. The Polymarket RTDS
+        # rebroadcasts Chainlink with ~1.2s of constant delay (verified
+        # via scripts/measure_feed_latency.py). When Binance has moved
+        # but Chainlink hasn't propagated yet, the next Chainlink update
+        # will likely close the gap toward Binance — that's how the
+        # rebroadcast pipeline works, not a model assumption. Bias
+        # p_model in the direction of the gap so we trade as if we
+        # already saw the next Chainlink update.
+        #
+        # Formula:
+        #   gap = (binance_mid - chainlink_price) / chainlink_price
+        #   bias = oracle_lead_bias * clip(gap / oracle_lag_threshold, -1, 1)
+        #   p_model_biased = clip(p_model + bias, 0.01, 0.99)
+        #
+        # At gap=threshold (0.2%), bias = oracle_lead_bias (default
+        # 0.05 = 5pp). The clip prevents huge biases from extreme gaps.
+        # Set to 0.0 to disable.
+        oracle_lead_bias: float = 0.05,
         # Order book imbalance alpha: shift p_model by obi_weight * OBI
         obi_weight: float = 0.03,
         # Chainlink blend: seconds before expiry to start blending
@@ -281,6 +299,7 @@ class DiffusionSignal(Signal):
         self.vpin_bar_s = vpin_bar_s
         self.oracle_lag_threshold = oracle_lag_threshold
         self.oracle_lag_mult = oracle_lag_mult
+        self.oracle_lead_bias = float(oracle_lead_bias)
         self.obi_weight = obi_weight
         self.chainlink_blend_s = chainlink_blend_s
         self.tail_mode = tail_mode
@@ -908,6 +927,32 @@ class DiffusionSignal(Signal):
             return 0.0
         return abs(binance_mid - chainlink_price) / chainlink_price
 
+    def _oracle_lead_bias(self, chainlink_price: float, binance_mid) -> float:
+        """Signed bias on p_model from Binance vs Chainlink lead-lag.
+
+        F4: when binance_mid > chainlink_price, the next chainlink
+        update will likely move UP (rebroadcast tax = ~1.2s, so
+        Binance is reading the future Chainlink). Bias p_model
+        toward UP. Inverse for negative gap.
+
+        Returns a value in [-oracle_lead_bias, +oracle_lead_bias],
+        scaled by gap / oracle_lag_threshold and clipped to ±1.
+        Returns 0.0 when:
+          - oracle_lead_bias parameter is 0 (disabled)
+          - binance_mid is None (graceful degradation)
+          - chainlink_price <= 0
+        """
+        if (self.oracle_lead_bias == 0.0
+                or binance_mid is None
+                or chainlink_price <= 0):
+            return 0.0
+        gap = (binance_mid - chainlink_price) / chainlink_price
+        if self.oracle_lag_threshold <= 0:
+            return 0.0
+        scaled = gap / self.oracle_lag_threshold
+        scaled = max(-1.0, min(1.0, scaled))
+        return self.oracle_lead_bias * scaled
+
     def _check_stale_features(self, ctx: dict) -> str | None:
         """Return a reason string if any input feed is stale, else None.
 
@@ -1240,6 +1285,14 @@ class DiffusionSignal(Signal):
         ctx["_p_model_raw"] = p_model
         ctx["_p_display"] = norm_cdf(z)
         ctx["_sigma_per_s"] = sigma_per_s
+
+        # F4: oracle lead-lag bias. Apply BEFORE filtration so the
+        # filtration model's z/p features see the bias-adjusted view.
+        # No-op when oracle_lead_bias=0 or binance_mid is unavailable.
+        lead_bias = self._oracle_lead_bias(snapshot.chainlink_price, binance_mid)
+        if lead_bias != 0.0:
+            p_model = max(0.01, min(0.99, p_model + lead_bias))
+            ctx["_oracle_lead_bias"] = lead_bias
 
         # Filtration gate: XGBoost confidence check
         if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx):
@@ -1746,6 +1799,14 @@ class DiffusionSignal(Signal):
                         Decision("FLAT", 0.0, 0.0, reason))
 
         p_model = self._p_model(z, tau, ctx)
+
+        # F4: oracle lead-lag bias. Apply BEFORE filtration so the
+        # filtration model's z/p features see the bias-adjusted view.
+        # No-op when oracle_lead_bias=0 or binance_mid is unavailable.
+        lead_bias = self._oracle_lead_bias(snapshot.chainlink_price, binance_mid)
+        if lead_bias != 0.0:
+            p_model = max(0.01, min(0.99, p_model + lead_bias))
+            ctx["_oracle_lead_bias"] = lead_bias
 
         # Filtration gate: XGBoost confidence check
         if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx):

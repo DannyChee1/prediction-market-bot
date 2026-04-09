@@ -128,9 +128,16 @@ async def signal_ticker(
             cl_ts = float(price_state.get("last_update_ts", 0.0) or 0.0)
             bn_ts = float(binance_state.get("last_update_ts", 0.0) or 0.0) if binance_state is not None else 0.0
             bk_ts = float(book_state.get("last_update_ts", 0.0) or 0.0) if book_state is not None else 0.0
+            tt_ts = float(trade_state.get("last_trade_ts", 0.0) or 0.0) if trade_state is not None else 0.0
             tracker.ctx["_chainlink_age_ms"] = max(0.0, eval_start_ms - cl_ts * 1000.0) if cl_ts > 0 else None
             tracker.ctx["_binance_age_ms"] = max(0.0, eval_start_ms - bn_ts * 1000.0) if bn_ts > 0 else None
             tracker.ctx["_book_age_ms"] = max(0.0, eval_start_ms - bk_ts * 1000.0) if bk_ts > 0 else None
+            # Trade-tape freshness: None until the first trade of the
+            # session is seen (so the gate doesn't false-fire during
+            # warmup before any trades have arrived).
+            tracker.ctx["_trade_tape_age_ms"] = (
+                max(0.0, eval_start_ms - tt_ts * 1000.0) if tt_ts > 0 else None
+            )
 
             # Inject Binance mid into ctx only if fresh (< 10s old).
             # Stale Binance data (WS dropped) would poison vol/z/oracle-lag.
@@ -141,21 +148,28 @@ async def signal_ticker(
                 else:
                     tracker.ctx.pop("_binance_mid", None)
 
-            # Accumulate price history on EVERY tick — this must never be
-            # gated by snapshot, skip_trading, stale price, or any guard.
+            # Accumulate price history — but only when the effective
+            # price actually changed. On calm markets the signal_ticker
+            # wakes every 10ms via `wake_event` timeout even when no
+            # feeds ticked; falling through and appending 100 duplicate
+            # prices per second used to bias Yang-Zhang σ downward
+            # (zero-range OHLC bars contribute zero vol). _compute_vol_deduped
+            # filters consecutive duplicates already, but the 5s-bar
+            # YZ path does not.
             eff_px = tracker.ctx.get("_binance_mid") or price_state.get("price")
             if eff_px is not None:
                 hist = tracker.ctx.setdefault("price_history", [])
                 ts_hist = tracker.ctx.setdefault("ts_history", [])
-                hist.append(eff_px)
-                ts_hist.append(int(_time.time() * 1000))
-                tracker.ctx["_live_history_appended"] = True
-                # Cap history to prevent unbounded growth if a window
-                # runs longer than expected or new_window() isn't called.
-                _MAX_HIST = 2000
-                if len(hist) > _MAX_HIST:
-                    del hist[:-_MAX_HIST]
-                    del ts_hist[:-_MAX_HIST]
+                if not hist or hist[-1] != eff_px:
+                    hist.append(eff_px)
+                    ts_hist.append(int(_time.time() * 1000))
+                    tracker.ctx["_live_history_appended"] = True
+                    # Cap history to prevent unbounded growth if a window
+                    # runs longer than expected or new_window() isn't called.
+                    _MAX_HIST = 2000
+                    if len(hist) > _MAX_HIST:
+                        del hist[:-_MAX_HIST]
+                        del ts_hist[:-_MAX_HIST]
 
             snap = snapshot_from_book_feed(
                 book_feed, up_token, down_token,
@@ -334,7 +348,16 @@ async def _poll_binance_feed(binance_feed: BinanceFeed, binance_state: dict,
                 age = _time.time() - _last_ts
                 if age > _STALE_RESTART_S and symbol:
                     print(f"  [BinanceFeed] stale for {age:.0f}s — restarting WS")
-                    binance_feed = BinanceFeed(symbol)
+                    # Route through _make_binance_feed so SBE mode and the
+                    # API-key env var are honored on reconnect (otherwise
+                    # the feed silently downgrades to JSON on every restart).
+                    try:
+                        binance_feed, mode = _make_binance_feed(symbol)
+                        print(f"  [BinanceFeed] restarted in {mode} mode")
+                    except Exception as mk_exc:
+                        print(f"  [BinanceFeed] restart failed: {mk_exc}; "
+                              f"falling back to JSON")
+                        binance_feed = BinanceFeed(symbol)
                     _last_ts = 0.0
         except Exception:
             pass
@@ -374,14 +397,15 @@ async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
 
             # Drain trade events for VPIN bar accumulation
             if trade_state is not None:
+                now_ts = _time.time()
                 for size, trade_side in book_feed.drain_trades():
                     changed = True
                     trade_changed = True
+                    trade_state["last_trade_ts"] = now_ts
                     sides = trade_state.get("sides")
                     if sides is not None and trade_side in ("BUY", "SELL"):
                         sides.append(trade_side)
                     bar = trade_state["current_bar"]
-                    now_ts = _time.time()
                     if bar["start_ts"] == 0:
                         bar["start_ts"] = now_ts
                     if trade_side == "BUY":
@@ -399,6 +423,22 @@ async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
                         bar["buy_vol"] = 0.0
                         bar["sell_vol"] = 0.0
                         bar["start_ts"] = now_ts
+                # Time-based bar rotation: close an empty/stale bar even
+                # when no trades are arriving, so VPIN doesn't end up with
+                # a single 20-minute "bar" masquerading as a 60s one in
+                # quiet markets.
+                bar = trade_state["current_bar"]
+                bar_dur = trade_state.get("bar_duration_s", 60.0)
+                if bar["start_ts"] != 0 and (now_ts - bar["start_ts"]) >= bar_dur:
+                    trade_state["bars"].append(
+                        (bar["buy_vol"], bar["sell_vol"])
+                    )
+                    trade_state["total_bars"] = (
+                        trade_state.get("total_bars", 0) + 1
+                    )
+                    bar["buy_vol"] = 0.0
+                    bar["sell_vol"] = 0.0
+                    bar["start_ts"] = now_ts
             if book_state is not None:
                 prev_ts = float(book_state.get("last_update_ts", 0.0) or 0.0)
                 prev_bbo = book_state.get("last_bbo", {})
@@ -813,6 +853,11 @@ async def _window_loop(
         "current_bar": {"buy_vol": 0.0, "sell_vol": 0.0, "start_ts": 0},
         "bar_duration_s": vpin_bar_s,
         "total_bars": 0,
+        # Wall-clock seconds of the most recent trade seen on the tape.
+        # Used by signal_ticker to populate ctx["_trade_tape_age_ms"] so
+        # the `max_trade_tape_age_ms` gate in signal_diffusion._check_stale_features
+        # actually fires in live (it was silently inoperative for months).
+        "last_trade_ts": 0.0,
     }
 
     pending_resolve: asyncio.Task | None = None

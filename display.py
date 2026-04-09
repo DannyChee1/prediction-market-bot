@@ -130,16 +130,30 @@ def _render_section(
             delta_str = f"  (delta: ${delta:+,.2f})"
         lines.append(f"  Start: ${window_start_price:>12,.2f}{delta_str}")
 
-    # Book BBO (compact single line)
+    # Book BBO (compact single line) — tag with STALE indicator if the
+    # book WS hasn't updated in >2s. The bot's max_book_age_ms gate may
+    # be set higher (e.g. 5s for calm-market tolerance) but for the
+    # operator's eye, anything >2s should be visually flagged.
     up_bid = _fp(flat_state, "up_best_bid")
     up_ask = _fp(flat_state, "up_best_ask")
     dn_bid = _fp(flat_state, "down_best_bid")
     dn_ask = _fp(flat_state, "down_best_ask")
-    lines.append(f"  Book:  Up {up_bid}/{up_ask}  |  Down {dn_bid}/{dn_ask}")
+    book_age_ms = tracker.ctx.get("_book_age_ms")
+    book_stale_tag = ""
+    if book_age_ms is not None and book_age_ms > 2000:
+        book_stale_tag = f"  [BOOK STALE {book_age_ms/1000:.1f}s]"
+    lines.append(f"  Book:  Up {up_bid}/{up_ask}  |  Down {dn_bid}/{dn_ask}{book_stale_tag}")
 
     # Signal status
     dec = tracker.last_decision
+    # 2026-04-09: render p_up as "---" when the model couldn't compute
+    # this tick (vol collapse, warmup, or window boundary). Previously
+    # the dashboard kept showing the LAST successful p_model value
+    # indefinitely during stale-book episodes, making it appear frozen.
+    p_display_fresh = tracker.ctx.get("_p_display_fresh", False)
     p_model = tracker.ctx.get("_p_display") or tracker.ctx.get("_p_model_raw")
+    if not p_display_fresh:
+        p_model = None  # render as "---"
     edge_up = tracker.ctx.get("_edge_up")
     edge_dn = tracker.ctx.get("_edge_down")
 
@@ -157,11 +171,20 @@ def _render_section(
         else:
             sig_parts.append(active)
     else:
-        reason = dec.reason[:30] if dec.reason else "no_edge"
+        # 2026-04-09: bumped 30 → 60 chars after WARM-UP message was being
+        # truncated mid-word ("...into windo" missing "w"). Most reasons are
+        # under 50 chars so 60 leaves comfortable headroom.
+        reason = dec.reason[:60] if dec.reason else "no_edge"
         sig_parts.append(f"FLAT ({reason})")
 
     if p_model is not None:
         sig_parts.append(f"p_up={p_model:.4f}")
+    else:
+        # Model couldn't compute this tick (vol collapse, warmup, or
+        # both feeds briefly stuck). Show "---" so the operator knows
+        # the value isn't being updated, instead of seeing a frozen
+        # last-known value.
+        sig_parts.append("p_up=---")
     lines.append(f"  Signal: {'  |  '.join(sig_parts)}")
 
     lat_samples = _safe_list(getattr(tracker, "latency_samples", []))
@@ -311,12 +334,17 @@ def render_display(
     price = price_state.get("price")
     price_label = f"Chainlink {base_config.chainlink_symbol.upper()}"
 
-    # Use first tracker's price update timestamp for staleness check
+    # Use first tracker's price update timestamp for staleness check.
+    # Guard on `last_price_update_ts > 0` so a warmup state (timestamp 0)
+    # doesn't render as "STALE 1700000000s".
     first_tracker = sections[0]["tracker"] if sections else None
-    if price is not None and first_tracker is not None:
+    if (price is not None and first_tracker is not None
+            and first_tracker.last_price_update_ts > 0):
         age = _time.time() - first_tracker.last_price_update_ts
         stale_tag = f"  STALE {age:.0f}s" if age > first_tracker.stale_price_timeout_s else ""
         lines.append(f"  {price_label}:  ${price:>12,.2f}{stale_tag}")
+    elif price is not None:
+        lines.append(f"  {price_label}:  ${price:>12,.2f}")
     else:
         lines.append(f"  {price_label}:     waiting...")
 

@@ -472,6 +472,16 @@ class DiffusionSignal(Signal):
 
         When live vol is above the calibration regime, shrink z.
         When live vol is below the calibration regime, amplify z.
+
+        WARNING (2026-04-09): this is NOT the textbook calibration-space
+        transformation. The correct transform to look up a calibration-table
+        probability from live z would be ``z_live * sigma_per_s / sigma_cal``
+        (multiply — not divide — by the ratio). The current factor of
+        ``sigma_cal / sigma_per_s`` is a heuristic that double-shrinks in
+        high-vol regimes (because z_raw already has sigma_per_s in its
+        denominator) and double-amplifies in quiet regimes — up to 4x at
+        the [0.5, 2.0] clamp bounds. This path is gated off by default
+        (``regime_z_scale=False``); revisit before ever enabling.
         """
         factor = 1.0
         if (
@@ -1272,10 +1282,12 @@ class DiffusionSignal(Signal):
             ctx["_sigma_continuous_per_s"] = bipower_variation_per_s(
                 hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
             )
-        dur_s = ctx.get("_window_duration_s", tau + 1.0)
-        if "_window_duration_s" not in ctx:
-            ctx["_window_duration_s"] = snapshot.time_remaining_s  # first call ≈ full duration
-        ctx["_elapsed_frac"] = 1.0 - tau / dur_s if dur_s > 0 else 0.5
+        # Window duration — use self.window_duration (config-wired), not
+        # snapshot.time_remaining_s, to avoid baking the "late-join" value
+        # when the bot wakes mid-window. See decide_both_sides for rationale.
+        dur_s = self.window_duration if self.window_duration > 0 else (tau + 1.0)
+        ctx["_window_duration_s"] = dur_s
+        ctx["_elapsed_frac"] = max(0.0, min(1.0, 1.0 - tau / dur_s)) if dur_s > 0 else 0.5
         ctx["_market_mid"] = getattr(snapshot, "mid_up", 0.5) or 0.5
         # choppiness: track zero-crossings of delta
         _prev_sign = ctx.get("_prev_delta_sign", 0)
@@ -1570,6 +1582,21 @@ class DiffusionSignal(Signal):
         # Require enough history for a reliable vol estimate — too few
         # samples give a tiny sigma that sends z to the ±max_z cap,
         # making every market show the same p_up/p_down.
+        #
+        # 2026-04-09 fix: explicitly clear stale display values at the
+        # top so a vol-collapse / warmup tick doesn't leave the OLD
+        # _p_display value in ctx for the dashboard to read. Previously
+        # the user reported "p_up stays frozen during stale book" — root
+        # cause was this block silently NOT updating when _raw == 0
+        # (which happens when hist contains many identical prices, e.g.
+        # both feeds briefly stuck), and the dashboard kept reading the
+        # last successful value indefinitely. Now we always set
+        # _p_display (None when we can't compute) and _p_display_ts so
+        # the dashboard can render "---" or "[stale]" when appropriate.
+        ctx.pop("_p_display", None)
+        ctx.pop("_p_model_raw", None)
+        ctx["_p_display_ts"] = snapshot.ts_ms
+
         _min_hist_display = max(10, self.vol_lookback_s // 3)
         if len(hist) >= _min_hist_display and snapshot.time_remaining_s > 0 and snapshot.window_start_price:
             _raw = self._compute_vol(
@@ -1583,6 +1610,13 @@ class DiffusionSignal(Signal):
                 ctx["_p_display"] = norm_cdf(_z)
                 ctx["_p_model_raw"] = self._p_model(_z, _tau, ctx)
                 ctx["_sigma_per_s"] = _raw
+                ctx["_p_display_fresh"] = True
+            else:
+                # Vol collapsed — flag the display as unfresh so the
+                # dashboard knows the model couldn't compute this tick.
+                ctx["_p_display_fresh"] = False
+        else:
+            ctx["_p_display_fresh"] = False
 
         # NOTE: maker warmup and end-of-window withdrawal are handled by
         # _evaluate_maker() in tracker.py.  We must NOT early-return here
@@ -1803,10 +1837,14 @@ class DiffusionSignal(Signal):
             ctx["_sigma_continuous_per_s"] = bipower_variation_per_s(
                 hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
             )
-        dur_s = ctx.get("_window_duration_s", tau + 1.0)
-        if "_window_duration_s" not in ctx:
-            ctx["_window_duration_s"] = snapshot.time_remaining_s
-        ctx["_elapsed_frac"] = 1.0 - tau / dur_s if dur_s > 0 else 0.5
+        # Window duration — always use the config value (self.window_duration)
+        # as the stable reference. The previous implementation used
+        # `snapshot.time_remaining_s` on the first tick, which baked a wrong
+        # "duration" into ctx if the bot joined mid-window (e.g. 400s into a
+        # 900s window stored dur_s=400 forever, and elapsed_frac went negative).
+        dur_s = self.window_duration if self.window_duration > 0 else (tau + 1.0)
+        ctx["_window_duration_s"] = dur_s
+        ctx["_elapsed_frac"] = max(0.0, min(1.0, 1.0 - tau / dur_s)) if dur_s > 0 else 0.5
         ctx["_market_mid"] = getattr(snapshot, "mid_up", 0.5) or 0.5
         _prev_sign = ctx.get("_prev_delta_sign", 0)
         _cur_sign = 1 if delta > 0 else (-1 if delta < 0 else 0)

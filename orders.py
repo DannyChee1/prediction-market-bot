@@ -436,6 +436,20 @@ class OrderMixin:
             })
             return
 
+        # 2026-04-09: API 425 "service not ready" backoff. After a 425
+        # response Polymarket needs ~5-10s before accepting more orders.
+        # Without backoff the bot was firing 4+ identical orders in the
+        # same second, all rejected. self._service_unavailable_until is
+        # a unix timestamp; if now < that ts, skip this placement entirely.
+        now_ts = _time.time()
+        backoff_until = getattr(self, "_service_unavailable_until", 0.0)
+        if now_ts < backoff_until:
+            remaining = backoff_until - now_ts
+            trade_record["status"] = "skipped_backoff"
+            trade_record["error"] = f"service backoff ({remaining:.1f}s remaining)"
+            self._log(trade_record)
+            return
+
         # Place GTC limit order via Rust OrderClient (single call: sign + HTTP/2 POST)
         try:
             post_start_ms = int(_time.time() * 1000)
@@ -446,6 +460,11 @@ class OrderMixin:
             trade_record["error"] = str(exc)
             self._log(trade_record)
             self._event(f"[LIMIT ORDER ERROR] {exc}")
+            # Detect "service not ready" / 425 in error message and arm backoff
+            err_str = str(exc).lower()
+            if "service not ready" in err_str or "425" in err_str:
+                self._service_unavailable_until = _time.time() + 10.0
+                self._event(f"[LIMIT] Service not ready — backoff 10s")
             return
 
         success = resp.get("success", False)
@@ -943,12 +962,24 @@ class OrderMixin:
             ]
 
     def _cancel_open_orders(self: "LiveTradeTracker"):
-        """Cancel all open limit orders and refund reserved bankroll."""
+        """Cancel all open limit orders and refund reserved bankroll.
+
+        Preserves verify-pending orders: ``_cancel_single_order`` sets
+        ``_verify_pending=True`` on any order whose cancel API call
+        succeeded but whose state we couldn't confirm via ``get_order``.
+        Those orders must stay in ``open_orders`` so the next poll can
+        reconcile them (CANCELLED → refund; MATCHED → add to
+        pending_fills). Clobbering the list here silently leaked the
+        bankroll reservation AND the on-chain position.
+        """
         if not self.open_orders:
             return
         for order in list(self.open_orders):
             self._cancel_single_order(order, "end_of_window")
-        self.open_orders = []
+        # Keep verify-pending orders for later reconciliation; drop the rest.
+        self.open_orders = [
+            o for o in self.open_orders if o.get("_verify_pending")
+        ]
 
     def cancel_all_orders(self: "LiveTradeTracker"):
         """Cancel all open orders — called on shutdown."""

@@ -546,9 +546,13 @@ class BacktestEngine:
         for r in train_results:
             z_str = r.fill.decision_reason
             # extract z from "p=X sig=X z=Z tau=Ts ..."
+            # Note: `str.rstrip("(cap)")` strips any trailing character
+            # in "()cap", which silently corrupts `"1.0a"` → `"1."`.
+            # Use removesuffix for a literal-suffix strip.
             try:
                 z_part = [p for p in z_str.split() if p.startswith("z=")][0]
-                z_val = float(z_part.split("=")[1].rstrip("(cap)"))
+                z_raw = z_part.split("=", 1)[1].removesuffix("(cap)")
+                z_val = float(z_raw)
             except (IndexError, ValueError):
                 continue
             obs.append((
@@ -877,13 +881,18 @@ def build_diffusion_signal(
             spread_edge_penalty=0.2,
         )
 
-    # Maker mode overrides
+    # Maker mode overrides.
+    # 2026-04-09: removed `edge_threshold=0.08` — it collided with the
+    # explicit `edge_threshold=config.edge_threshold` kwarg in the
+    # DiffusionSignal constructor (TypeError: multiple values). The
+    # per-market config's edge_threshold is the tuned value and should
+    # flow through unchanged. See btc_5m config comment at
+    # market_config.py:229-235 which explicitly warns not to raise it.
     maker_overrides = {}
     if maker:
         maker_overrides = dict(
             maker_mode=True,
             max_bet_fraction=0.02,
-            edge_threshold=0.08,
             momentum_majority=0.0,
             spread_edge_penalty=0.0,
             window_duration=config.window_duration_s,

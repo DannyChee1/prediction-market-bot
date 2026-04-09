@@ -7,6 +7,28 @@ use tokio::sync::RwLock;
 use crate::book::BookSnapshot;
 use crate::RUNTIME;
 
+// ── Reconnect log rate-limiter ─────────────────────────────────────────────
+// Prevents spamming stderr when multiple feeds reconnect in quick succession.
+// Real errors (read error, connect error) are always logged.
+static LAST_RECONNECT_LOG_TS: AtomicU64 = AtomicU64::new(0);
+
+fn should_log_reconnect() -> bool {
+    let now = now_s();
+    let last = f64::from_bits(LAST_RECONNECT_LOG_TS.load(Ordering::Relaxed));
+    if now - last < 60.0 {
+        return false;
+    }
+    LAST_RECONNECT_LOG_TS.store(now.to_bits(), Ordering::Relaxed);
+    true
+}
+
+fn now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 // ── BookFeed ────────────────────────────────────────────────────────────────
 
 /// CLOB order book WebSocket feed wrapping polyfill-rs streaming.
@@ -34,6 +56,7 @@ struct BookState {
 struct SimpleBook {
     bids: std::collections::BTreeMap<ordered_float::OrderedFloat<f64>, f64>,
     asks: std::collections::BTreeMap<ordered_float::OrderedFloat<f64>, f64>,
+    last_update_ts: f64,
 }
 
 // We use a simple ordered-float wrapper since we can't depend on the crate.
@@ -99,50 +122,65 @@ impl BookFeed {
     ///
     /// Returns list of (size, side_str) tuples and clears the buffer.
     /// Call this periodically from Python to feed VPIN bar accumulation.
-    fn drain_trades(&self) -> Vec<(f64, String)> {
-        let mut state = RUNTIME.block_on(async { self.books.write().await });
-        state.trade_buffer.drain(..).collect()
+    /// Releases the GIL during the async write-lock acquisition.
+    fn drain_trades(&self, py: Python<'_>) -> Vec<(f64, String)> {
+        let books = self.books.clone();
+        py.allow_threads(move || {
+            let mut state = RUNTIME.block_on(async { books.write().await });
+            state.trade_buffer.drain(..).collect()
+        })
     }
 
     /// Read the current order book snapshot for a token.
     ///
     /// Returns a BookSnapshot with best_bid, best_ask, top bids/asks.
-    /// This is a fast read-lock operation (~1µs).
-    fn snapshot(&self, token_id: &str) -> BookSnapshot {
-        let state = RUNTIME.block_on(async { self.books.read().await });
+    /// Releases the GIL during the async read-lock acquisition.
+    fn snapshot(&self, py: Python<'_>, token_id: &str) -> BookSnapshot {
+        let books = self.books.clone();
+        let tid = token_id.to_string();
+        py.allow_threads(move || {
+            let state = RUNTIME.block_on(async { books.read().await });
 
-        if let Some(book) = state.books.get(token_id) {
-            let bids: Vec<(f64, f64)> = book
-                .bids
-                .iter()
-                .rev() // highest price first
-                .take(10)
-                .map(|(p, s)| (p.0, *s))
-                .collect();
+            if let Some(book) = state.books.get(&tid) {
+                let bids: Vec<(f64, f64)> = book
+                    .bids
+                    .iter()
+                    .rev() // highest price first
+                    .take(10)
+                    .map(|(p, s)| (p.0, *s))
+                    .collect();
 
-            let asks: Vec<(f64, f64)> = book
-                .asks
-                .iter() // lowest price first
-                .take(10)
-                .map(|(p, s)| (p.0, *s))
-                .collect();
+                let asks: Vec<(f64, f64)> = book
+                    .asks
+                    .iter() // lowest price first
+                    .take(10)
+                    .map(|(p, s)| (p.0, *s))
+                    .collect();
 
-            BookSnapshot {
-                best_bid: bids.first().map(|(p, _)| *p),
-                best_ask: asks.first().map(|(p, _)| *p),
-                bids,
-                asks,
-                timestamp: state.last_update_ts,
+                // Per-token timestamp with global fallback
+                let ts = if book.last_update_ts > 0.0 {
+                    book.last_update_ts
+                } else {
+                    state.last_update_ts
+                };
+
+                BookSnapshot {
+                    best_bid: bids.first().map(|(p, _)| *p),
+                    best_ask: asks.first().map(|(p, _)| *p),
+                    bids,
+                    asks,
+                    timestamp: ts,
+                }
+            } else {
+                BookSnapshot {
+                    best_bid: None,
+                    best_ask: None,
+                    bids: Vec::new(),
+                    asks: Vec::new(),
+                    timestamp: 0.0,
+                }
             }
-        } else {
-            BookSnapshot {
-                best_bid: None,
-                best_ask: None,
-                bids: Vec::new(),
-                asks: Vec::new(),
-                timestamp: 0.0,
-            }
-        }
+        })
     }
 }
 
@@ -216,7 +254,9 @@ async fn book_feed_task(
                 Ok(Some(msg)) => msg,
                 Ok(None) => break,
                 Err(_) => {
-                    eprintln!("[BookFeed] no data for 30s, reconnecting");
+                    if should_log_reconnect() {
+                        eprintln!("[BookFeed] no data for 30s, reconnecting");
+                    }
                     break;
                 }
             };
@@ -231,6 +271,14 @@ async fn book_feed_task(
             };
 
             if text == "PONG" || text.is_empty() {
+                // Bump timestamp so the Python staleness gate sees "WS is alive"
+                // even during calm markets where no book changes arrive.
+                let mut state = books.write().await;
+                let now = now_s();
+                state.last_update_ts = now;
+                for book in state.books.values_mut() {
+                    book.last_update_ts = now;
+                }
                 continue;
             }
 
@@ -246,10 +294,7 @@ async fn book_feed_task(
                 };
 
                 let mut state = books.write().await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64();
+                let now = now_s();
                 state.last_update_ts = now;
 
                 for msg in msgs {
@@ -303,6 +348,7 @@ async fn book_feed_task(
                                         }
                                     }
                                 }
+                                book.last_update_ts = now;
                             }
                         }
                         Some("price_change") => {
@@ -336,11 +382,14 @@ async fn book_feed_task(
                                                 &mut tb.asks
                                             };
                                             let key = ordered_float::OrderedFloat(p);
-                                            if s == 0.0 {
-                                                levels.remove(&key);
-                                            } else {
+                                            // Guard: treat both s==0 (removal) and s<0 (invalid)
+                                            // as level removal.
+                                            if s > 0.0 {
                                                 levels.insert(key, s);
+                                            } else {
+                                                levels.remove(&key);
                                             }
+                                            tb.last_update_ts = now;
                                         }
                                     }
                                 }
@@ -374,7 +423,21 @@ async fn book_feed_task(
             }
         }
 
-        // Reconnect
+        // Clear stale book data before reconnecting — prevents the Python
+        // staleness gate from reading outdated levels during the backoff.
+        {
+            let mut state = books.write().await;
+            for book in state.books.values_mut() {
+                book.bids.clear();
+                book.asks.clear();
+                book.last_update_ts = 0.0;
+            }
+            state.last_update_ts = 0.0;
+        }
+
+        // Abort the heartbeat task so hb.await returns immediately.
+        // Without abort(), hb.await hangs forever because cancel is never fired.
+        hb.abort();
         let _ = hb.await;
         tokio::time::sleep(std::time::Duration::from_secs(backoff.min(30))).await;
         backoff = (backoff * 2).min(60);
@@ -514,7 +577,9 @@ async fn price_feed_task(
                 Ok(Some(msg)) => msg,
                 Ok(None) => break,         // stream ended
                 Err(_) => {
-                    eprintln!("[PriceFeed] no data for 30s, reconnecting");
+                    if should_log_reconnect() {
+                        eprintln!("[PriceFeed] no data for 30s, reconnecting");
+                    }
                     break;                 // timeout → reconnect
                 }
             };
@@ -558,15 +623,12 @@ async fn price_feed_task(
 
                 if let Some(px) = p {
                     store_f64(&price, px);
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
-                    store_f64(&last_update_ts, now);
+                    store_f64(&last_update_ts, now_s());
                 }
             }
         }
 
+        hb.abort();
         let _ = hb.await;
         tokio::time::sleep(std::time::Duration::from_secs(backoff.min(30))).await;
         backoff = (backoff * 2).min(60);
@@ -681,13 +743,6 @@ async fn binance_feed_task(
     }
 }
 
-fn now_s() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-}
-
 fn decode_sbe_decimal(mantissa: i64, exponent: i8) -> f64 {
     (mantissa as f64) * 10_f64.powi(exponent as i32)
 }
@@ -761,7 +816,9 @@ async fn binance_json_feed_task(
                 Ok(Some(msg)) => msg,
                 Ok(None) => break,
                 Err(_) => {
-                    eprintln!("[BinanceFeed] no data for 30s, reconnecting");
+                    if should_log_reconnect() {
+                        eprintln!("[BinanceFeed] no data for 30s, reconnecting");
+                    }
                     break;
                 }
             };
@@ -860,7 +917,9 @@ async fn binance_sbe_feed_task(
                 Ok(Some(msg)) => msg,
                 Ok(None) => break,
                 Err(_) => {
-                    eprintln!("[BinanceFeed:SBE] no data for 30s, reconnecting");
+                    if should_log_reconnect() {
+                        eprintln!("[BinanceFeed:SBE] no data for 30s, reconnecting");
+                    }
                     break;
                 }
             };
@@ -943,9 +1002,13 @@ impl UserFeed {
     /// Returns list of dicts with string keys/values (event_type, order_id,
     /// status, size_matched, price, asset_id, side, etc.).
     /// Call each tick from Python — events are removed from the buffer.
-    fn drain_events(&self) -> Vec<std::collections::HashMap<String, String>> {
-        let mut buf = RUNTIME.block_on(async { self.events.write().await });
-        buf.drain(..).collect()
+    /// Releases the GIL during the async write-lock acquisition.
+    fn drain_events(&self, py: Python<'_>) -> Vec<std::collections::HashMap<String, String>> {
+        let events = self.events.clone();
+        py.allow_threads(move || {
+            let mut buf = RUNTIME.block_on(async { events.write().await });
+            buf.drain(..).collect()
+        })
     }
 }
 
@@ -1045,7 +1108,9 @@ async fn user_feed_task(
                 Ok(Some(msg)) => msg,
                 Ok(None) => break,
                 Err(_) => {
-                    eprintln!("[UserFeed] no data for 60s, reconnecting");
+                    if should_log_reconnect() {
+                        eprintln!("[UserFeed] no data for 60s, reconnecting");
+                    }
                     break;
                 }
             };
@@ -1086,6 +1151,7 @@ async fn user_feed_task(
             }
         }
 
+        hb.abort();
         let _ = hb.await;
         tokio::time::sleep(std::time::Duration::from_secs(backoff.min(30))).await;
         backoff = (backoff * 2).min(60);

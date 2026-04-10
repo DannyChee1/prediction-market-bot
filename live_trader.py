@@ -1260,7 +1260,12 @@ def _build_tracker(
     # the edge threshold and then mean-reverts. Hardcoded per timeframe
     # for now: 5s for 5m markets, 10s for 15m markets. See 2026-04-09
     # debugging session — the 00:35:50 BTC fill that motivated this gate.
-    signal_kw["edge_persistence_s"] = 5.0 if is_5m else 10.0
+    if is_1h:
+        signal_kw["edge_persistence_s"] = 0.0   # no spike gate needed on 1h
+    elif is_5m:
+        signal_kw["edge_persistence_s"] = 5.0
+    else:
+        signal_kw["edge_persistence_s"] = 10.0  # 15m
 
     # A-S quoting params
     signal_kw["as_mode"] = args.as_mode

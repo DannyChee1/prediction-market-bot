@@ -527,7 +527,12 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             (up_dec, up_token, "UP"),
             (down_dec, down_token, "DOWN"),
         ]:
-            if side_label in self.exited_sides:
+            # Allow re-entry after exit when exit_enabled is on.
+            # Without this, exited_sides permanently blocks the side for
+            # the rest of the window — fine for hold-to-resolution, but
+            # wrong for the buy/sell/rebuy strategy where we want to
+            # re-enter if the edge reappears after an exit.
+            if side_label in self.exited_sides and not self.exit_enabled:
                 continue
 
             opposite = "DOWN" if side_label == "UP" else "UP"

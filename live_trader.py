@@ -1248,11 +1248,16 @@ def _build_tracker(
         signal_kw["vamp_mode"] = "filter"
         signal_kw["vamp_filter_threshold"] = 0.07
 
-    # 15m: withdraw 60s before end; 5m: withdraw 20s before end
-    if not is_5m:
-        maker_withdraw_override = 60.0
+    # Withdraw timing: stop placing new buys near window end.
+    # Polymarket can be buggy near resolution — prices spike, spreads
+    # blow out, and the oracle hasn't finalized yet.
+    is_1h = config.window_duration_s >= 3600
+    if is_1h:
+        maker_withdraw_override = 120.0   # 2 min buffer for 1h
+    elif is_5m:
+        maker_withdraw_override = 20.0    # 20s for 5m
     else:
-        maker_withdraw_override = 20.0
+        maker_withdraw_override = 60.0    # 60s for 15m
 
     # 5m overrides
     maker_warmup = args.maker_warmup

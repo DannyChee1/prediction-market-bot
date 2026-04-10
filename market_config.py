@@ -346,10 +346,11 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         min_entry_price=0.40,
         market_blend=0.5,
         max_model_market_disagreement=0.30,
-        # 1h has room for multiple buy/sell cycles when early-exit is on.
-        # Each cycle = 1 buy + 1 sell. With 6 max trades, up to 3 full
-        # round-trips per window.
-        max_trades_per_window=6,
+        # 1h has room for many buy/sell cycles when early-exit is on.
+        # Each cycle = 1 buy + 1 sell. With 20 max, up to 10 round-trips.
+        # Only 1 position held at any time — the cap is on total orders
+        # placed, not concurrent positions.
+        max_trades_per_window=20,
         # Lower edge threshold for 1h — the early_edge_mult inflates
         # the dynamic threshold by sqrt(tau/3600), which at mid-window
         # pushes it to ~0.11 at edge_threshold=0.06. With 0.04 the

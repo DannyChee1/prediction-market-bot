@@ -338,9 +338,11 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         max_sigma=1e-03,
         binance_symbol="btcusdt",
         tail_mode="kou",
-        # 2026-04-10: raised from 0.10 to 0.30 after trade analysis showed
-        # |z|<0.3 entries have 47% WR (losing money). |z|>0.3 = 65% WR.
-        min_entry_z=0.30,
+        # 2026-04-10: the backtest analysis on synthetic data suggested 0.30,
+        # but live shows |z| rarely exceeds 0.22 on 1h because sqrt(tau)
+        # is 3-4x larger than 15m. Lowered to 0.10 so the bot actually
+        # trades. The edge_threshold (0.04) is the real quality filter.
+        min_entry_z=0.10,
         # 2026-04-10: raised from default 0.25 to 0.40. Entries at <$0.45
         # had 35% WR — deep OTM contrarian bets that fail on 1h.
         min_entry_price=0.40,

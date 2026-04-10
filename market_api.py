@@ -119,28 +119,76 @@ def _try_slug(slug: str):
     return None
 
 
+def _generate_hourly_slug(config: MarketConfig, target_utc: datetime) -> str:
+    """Generate a human-readable slug for 1-hour markets.
+
+    Hourly markets use ET-based slugs like:
+      bitcoin-up-or-down-april-9-2026-4pm-et
+
+    The slug_prefix for 1h configs is the asset name part
+    (e.g. "bitcoin-up-or-down"), and we append the date + hour in ET.
+    """
+    from zoneinfo import ZoneInfo
+    et = target_utc.astimezone(ZoneInfo("America/New_York"))
+    month = et.strftime("%B").lower()  # "april"
+    day = et.day
+    year = et.year
+    hour = et.hour
+    if hour == 0:
+        time_str = "12am"
+    elif hour < 12:
+        time_str = f"{hour}am"
+    elif hour == 12:
+        time_str = "12pm"
+    else:
+        time_str = f"{hour - 12}pm"
+    return f"{config.slug_prefix}-{month}-{day}-{year}-{time_str}-et"
+
+
 def find_market(config: MarketConfig):
     now = datetime.now(timezone.utc)
     align = config.window_align_m
-    minute = (now.minute // align) * align
-    window_start = now.replace(minute=minute, second=0, microsecond=0)
 
-    for offset in [0, -align, align, -2 * align, 2 * align]:
-        candidate = window_start + timedelta(minutes=offset)
-        ts = int(candidate.timestamp())
-        result = _try_slug(f"{config.slug_prefix}-{ts}")
-        if result:
-            event, market = result
-            end = datetime.fromisoformat(
-                market["endDate"].replace("Z", "+00:00")
-            )
-            start = datetime.fromisoformat(
-                market["eventStartTime"].replace("Z", "+00:00")
-            )
-            if now < end or start > now:
-                return event, market
+    # Hourly markets use human-readable ET-based slugs instead of
+    # timestamp-based slugs. Detect by window duration.
+    is_hourly = config.window_duration_s >= 3600
 
-    # Broad fallback
+    if is_hourly:
+        # Try current hour, then next, then previous (in case we're
+        # near a boundary and the current window just closed).
+        hour_start = now.replace(minute=0, second=0, microsecond=0)
+        for offset_h in [0, 1, -1, 2]:
+            candidate = hour_start + timedelta(hours=offset_h)
+            slug = _generate_hourly_slug(config, candidate)
+            result = _try_slug(slug)
+            if result:
+                event, market = result
+                end = datetime.fromisoformat(
+                    market["endDate"].replace("Z", "+00:00")
+                )
+                if now < end:
+                    return event, market
+    else:
+        # Original timestamp-based slug search for 5m/15m markets
+        minute = (now.minute // align) * align
+        window_start = now.replace(minute=minute, second=0, microsecond=0)
+
+        for offset in [0, -align, align, -2 * align, 2 * align]:
+            candidate = window_start + timedelta(minutes=offset)
+            ts = int(candidate.timestamp())
+            result = _try_slug(f"{config.slug_prefix}-{ts}")
+            if result:
+                event, market = result
+                end = datetime.fromisoformat(
+                    market["endDate"].replace("Z", "+00:00")
+                )
+                start = datetime.fromisoformat(
+                    market["eventStartTime"].replace("Z", "+00:00")
+                )
+                if now < end or start > now:
+                    return event, market
+
+    # Broad fallback: search active up-or-down markets
     try:
         resp = requests.get(
             f"{GAMMA_API}/events",

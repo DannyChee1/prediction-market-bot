@@ -331,19 +331,24 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         display_name="BTC 1h",
         window_duration_s=3600.0,
         window_align_m=60,
-        # Same as btc 15m — longer window means sigma has more time to
-        # stabilize so the same floor is appropriate.
         min_sigma=2e-05,
-        max_sigma=4e-04,
+        # 1h windows accumulate more vol samples → per-second sigma can
+        # be higher than 15m. The 4e-4 ceiling was hitting on ~30% of
+        # windows, clipping the signal. 1e-3 covers p99.9 of 1h sigma.
+        max_sigma=1e-03,
         binance_symbol="btcusdt",
         tail_mode="kou",
-        min_entry_z=0.15,
+        min_entry_z=0.10,           # slightly looser than 15m — more time to recover
         market_blend=0.5,
         max_model_market_disagreement=0.30,
-        max_trades_per_window=1,
-        edge_threshold=0.06,
-        # More lenient staleness gates for 1h — book changes are less
-        # critical over a longer window, and quiet periods are expected.
+        max_trades_per_window=2,    # 1h has room for 2 entries
+        # Lower edge threshold for 1h — the early_edge_mult inflates
+        # the dynamic threshold by sqrt(tau/3600), which at mid-window
+        # pushes it to ~0.11 at edge_threshold=0.06. With 0.04 the
+        # mid-window threshold is ~0.074, which lets legitimate setups
+        # through. The 1h window gives more time for the edge to
+        # materialize vs 5m/15m where a quick threshold is defensive.
+        edge_threshold=0.04,
         max_book_age_ms=10_000.0,
         max_chainlink_age_ms=60_000.0,
         max_binance_age_ms=5_000.0,

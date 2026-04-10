@@ -661,10 +661,19 @@ async def run_window(
 
     tracker.new_window(end)
 
-    # Detect if we're joining mid-window on startup
+    # Detect if we're joining mid-window on startup.
+    # For short windows (5m/15m), skip trading on a late join because
+    # the vol estimator needs time to warm up. For 1h windows, we
+    # pre-populate price history from Binance (below), so we can
+    # trade immediately even on a mid-window join.
     now_check = datetime.now(timezone.utc)
     elapsed_since_start = (now_check - start).total_seconds()
-    skip_trading = (tracker.windows_seen == 1 and elapsed_since_start > 10)
+    is_1h_window = config.window_duration_s >= 3600
+    skip_trading = (
+        tracker.windows_seen == 1
+        and elapsed_since_start > 10
+        and not is_1h_window  # 1h windows pre-load history, no skip needed
+    )
     if skip_trading:
         tracker.last_decision = Decision(
             "FLAT", 0.0, 0.0,
@@ -672,6 +681,44 @@ async def run_window(
         )
         print(f"  [{config.display_name}] WARM-UP: joined {elapsed_since_start:.0f}s in — "
               f"skipping trading")
+
+    # Mid-window join: pre-populate price history from Binance so the vol
+    # estimator can compute sigma immediately (no 2-min live warmup needed).
+    vol_lookback = getattr(tracker.signal, "vol_lookback_s", 90)
+    if elapsed_since_start > 30 and config.binance_symbol and is_1h_window:
+        lookback = min(int(elapsed_since_start), vol_lookback * 2)
+        fetch_start_ms = int((now_check.timestamp() - lookback) * 1000)
+        fetch_end_ms = int(now_check.timestamp() * 1000)
+        try:
+            import requests as _req
+            all_klines = []
+            cursor = fetch_start_ms
+            while cursor < fetch_end_ms:
+                url = (
+                    f"https://api.binance.com/api/v3/klines"
+                    f"?symbol={config.binance_symbol.upper()}"
+                    f"&interval=1s&startTime={cursor}&limit=1000"
+                )
+                batch = _req.get(url, timeout=10).json()
+                if not batch:
+                    break
+                all_klines.extend(batch)
+                cursor = int(batch[-1][0]) + 1000
+                if len(batch) < 1000:
+                    break
+            if all_klines:
+                hist = tracker.ctx.setdefault("price_history", [])
+                ts_hist = tracker.ctx.setdefault("ts_history", [])
+                for k in all_klines:
+                    px = float(k[4])  # close price
+                    ts_ms = int(k[0])
+                    if not hist or hist[-1] != px:
+                        hist.append(px)
+                        ts_hist.append(ts_ms)
+                print(f"  [{config.display_name}] Pre-loaded {len(hist)} price ticks "
+                      f"from Binance ({lookback}s lookback) — ready to trade")
+        except Exception as exc:
+            print(f"  [{config.display_name}] Historical price fetch failed: {exc}")
 
     mode = "DRY RUN" if tracker.dry_run else "LIVE"
     print(f"  [{config.display_name}] [{mode}] {title}")

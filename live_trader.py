@@ -585,7 +585,8 @@ async def run_window(
     else:
         tracker.user_feed = None
 
-    # Wait until eventStartTime + 5s so the RTDS buffer has the start price
+    # Wait until eventStartTime + 5s so the RTDS buffer has the start price.
+    # Skip the wait if we're joining mid-window (start already passed).
     now = datetime.now(timezone.utc)
     target = start + timedelta(seconds=5)
     wait_s = (target - now).total_seconds()
@@ -594,6 +595,9 @@ async def run_window(
         section["market_title"] = f"Waiting {wait_s:.0f}s for start..."
         print(f"  [{config.display_name}] Waiting {wait_s:.0f}s for start price...")
         await asyncio.sleep(wait_s)
+    elif wait_s < 0:
+        elapsed = -wait_s
+        print(f"  [{config.display_name}] Joining mid-window ({elapsed:.0f}s after start)")
 
     # Look up exact Chainlink price at eventStartTime from RTDS buffer.
     # We want the LAST update at-or-before eventStartTime — that's the
@@ -617,11 +621,32 @@ async def run_window(
         print(f"  [{config.display_name}] Start: ${start_price_exact:,.2f} "
               f"(Chainlink @ eventStart{offset_ms:+d}ms)")
     else:
-        window_start_price = price_state.get("price")
-        if window_start_price:
-            print(f"  [{config.display_name}] Start: ${window_start_price:,.2f} (RTDS fallback)")
-        else:
-            print(f"  [{config.display_name}] Start: waiting for RTDS...")
+        # Mid-window join: we don't have the Chainlink price from window
+        # start in our buffer. Fetch the historical BTC price from Binance
+        # at the exact start timestamp (1s kline).
+        window_start_price = None
+        if config.binance_symbol:
+            try:
+                import requests as _req
+                kline_url = (
+                    f"https://api.binance.com/api/v3/klines"
+                    f"?symbol={config.binance_symbol.upper()}"
+                    f"&interval=1s&startTime={start_ts_ms}&limit=1"
+                )
+                kline_resp = _req.get(kline_url, timeout=5).json()
+                if kline_resp and len(kline_resp) > 0:
+                    # kline[4] = close price of that 1-second bar
+                    window_start_price = float(kline_resp[0][4])
+                    print(f"  [{config.display_name}] Start: ${window_start_price:,.2f} "
+                          f"(Binance historical, mid-window join)")
+            except Exception as exc:
+                print(f"  [{config.display_name}] Binance start price lookup failed: {exc}")
+        if window_start_price is None:
+            window_start_price = price_state.get("price")
+            if window_start_price:
+                print(f"  [{config.display_name}] Start: ${window_start_price:,.2f} (RTDS fallback — INACCURATE)")
+            else:
+                print(f"  [{config.display_name}] Start: waiting for RTDS...")
 
     flat_state = {
         "up_best_bid": None, "up_best_ask": None,

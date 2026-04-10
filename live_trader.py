@@ -1155,8 +1155,9 @@ def _build_tracker(
     saved: dict | None,
 ) -> LiveTradeTracker:
     """Build a LiveTradeTracker for one timeframe config."""
-    base_market = config_key.replace("_5m", "")
+    base_market = config_key.replace("_5m", "").replace("_1h", "")
     is_5m = "_5m" in config_key
+    is_1h = "_1h" in config_key or config.window_duration_s >= 3600
 
     # Per-market signal overrides
     # BTC: max_z=0.5 (prevent overconfidence), reversion_discount=0.30

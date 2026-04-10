@@ -1267,7 +1267,19 @@ def _build_tracker(
     exit_min_hold = args.exit_min_hold
     exit_min_remaining = args.exit_min_remaining
 
-    if is_5m:
+    if is_1h:
+        # 1h windows: the early_edge_mult inflates the dynamic threshold
+        # too aggressively. At tau=1800 (mid-window), default 1.2 pushes
+        # thresh from 0.04 to 0.071, filtering legitimate setups.
+        # 0.5 gives thresh=0.04*(1+0.5*0.7)=0.054 at mid-window.
+        signal_kw["early_edge_mult"] = 0.5
+        signal_kw["maker_warmup_s"] = 120.0    # 2 min warmup for vol
+        signal_kw["maker_withdraw_s"] = maker_withdraw
+        signal_kw["vol_lookback_s"] = 120      # 2 min vol lookback (more data for 1h)
+        cooldown_ms = 30_000                    # 30s cooldown between trades
+        exit_min_hold = 60.0
+        exit_min_remaining = 120.0
+    elif is_5m:
         signal_kw["vol_lookback_s"] = 30
         maker_warmup = 30.0
         if base_market in ("eth", "sol", "xrp"):

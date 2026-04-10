@@ -1402,7 +1402,9 @@ def _build_tracker(
         exit_threshold=args.exit_threshold,
         exit_min_hold_s=exit_min_hold,
         exit_min_remaining_s=exit_min_remaining,
-        max_positions=args.max_positions,
+        # 1h: force 1 position at a time for buy/sell/rebuy cycles.
+        # Multiple concurrent positions on a $100 bankroll = over-exposure.
+        max_positions=1 if is_1h else args.max_positions,
         exit_sell_buffer=args.exit_sell_buffer,
         debug=args.debug,
         dry_run=args.dry_run,

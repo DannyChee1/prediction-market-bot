@@ -245,11 +245,12 @@ class BacktestEngine:
         else:
             return None
 
-        if not ask_levels or best_ask is None or best_ask <= 0:
-            return None
-
-        # Maker mode: fill at bid with 0% fee, optional adverse-selection haircut
+        # Maker mode: fill at bid with 0% fee, optional adverse-selection haircut.
+        # Check maker path FIRST so it doesn't require ask_levels (which may
+        # be empty in REST-backfilled data that only has best bid/ask).
         maker_mode = getattr(self.signal, "maker_mode", False)
+        if not maker_mode and (not ask_levels or best_ask is None or best_ask <= 0):
+            return None
         if maker_mode and best_bid is not None and best_bid > 0:
             entry_price = best_bid
             fee_avg = 0.0

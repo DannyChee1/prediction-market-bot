@@ -770,15 +770,12 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             if existing is None:
                 # No existing sell → place new one
                 self._place_limit_sell(fill, snapshot, token_id, side, sell_price)
-            elif abs(existing["price"] - sell_price) >= 0.01:
-                # Price changed → requote (with cooldown)
-                if now - self.last_exit_requote_ts.get(side, 0) >= self.exit_sell_requote_cooldown_s:
-                    old_price = existing["price"]
-                    cancelled = self._cancel_single_sell_order(existing, f"requote_{old_price:.2f}->{sell_price:.2f}")
-                    # If cancel returned False, order filled during cancel race — don't re-sell
-                    if cancelled:
-                        self._place_limit_sell(fill, snapshot, token_id, side, sell_price)
-                    self.last_exit_requote_ts[side] = now
+            # 2026-04-10: removed sell-side requoting for the same reason
+            # we removed buy-side requoting — each cancel+repost creates a
+            # race window where we get adversely filled at the old price.
+            # Post the sell once and let it sit. If it fills, great. If the
+            # market moves away, the position holds to resolution (which is
+            # the fallback behavior anyway).
 
     def _record_exit_result(self, fill: dict, proceeds: float, exit_pnl: float):
         """Record an early exit as a TradeResult for session stats."""

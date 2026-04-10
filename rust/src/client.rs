@@ -333,6 +333,90 @@ impl OrderClient {
         types::serialize_to_py(py, &resp)
     }
 
+    /// Batch cancel multiple orders in a single HTTP call.
+    ///
+    /// Returns a dict with cancel response. Up to ~100 order IDs per call.
+    /// Saves one HTTP round-trip vs cancelling individually.
+    fn cancel_orders(&self, py: Python<'_>, order_ids: Vec<String>) -> PyResult<PyObject> {
+        let client = self.inner.clone();
+        let resp = py
+            .allow_threads(move || {
+                RUNTIME.block_on(async move { client.cancel_orders(&order_ids).await })
+            })
+            .map_err(map_err)?;
+
+        types::serialize_to_py(py, &resp)
+    }
+
+    /// Batch place multiple signed orders in a single HTTP call.
+    ///
+    /// Takes a list of (token_id, price, size, side) tuples.
+    /// Signs all orders, then POSTs them as one batch (up to 15 per call).
+    /// Returns a list of response dicts.
+    #[pyo3(signature = (orders, order_type="GTC", fee_rate_bps=0))]
+    fn place_orders(
+        &self,
+        py: Python<'_>,
+        orders: Vec<(String, f64, f64, String)>,  // [(token_id, price, size, side), ...]
+        order_type: &str,
+        fee_rate_bps: u32,
+    ) -> PyResult<PyObject> {
+        if orders.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err("orders list is empty"));
+        }
+        if orders.len() > 15 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max 15 orders per batch (Polymarket limit)"
+            ));
+        }
+
+        let ot = parse_order_type(order_type);
+        let extras = if fee_rate_bps > 0 {
+            Some(ExtraOrderArgs { fee_rate_bps, ..ExtraOrderArgs::default() })
+        } else {
+            None
+        };
+
+        // Pre-resolve OrderOptions from cache for each unique token_id
+        let cache = self.options_cache.lock().unwrap();
+        let mut order_args_list = Vec::with_capacity(orders.len());
+        for (token_id, price, size, side) in &orders {
+            let side_enum = parse_side(side)?;
+            let price_dec = types::f64_to_decimal(*price)?;
+            let size_dec = types::f64_to_decimal(*size)?;
+            let args = OrderArgs::new(token_id, price_dec, size_dec, side_enum);
+            let opts = cache.get(token_id.as_str()).cloned();
+            order_args_list.push((args, opts, extras.clone()));
+        }
+        drop(cache);
+
+        let client = self.inner.clone();
+        let responses = py
+            .allow_threads(move || {
+                RUNTIME.block_on(async move {
+                    // Sign all orders
+                    let mut signed = Vec::with_capacity(order_args_list.len());
+                    for (args, opts, ext) in &order_args_list {
+                        let s = client
+                            .create_order(args, None, ext.clone(), opts.as_ref())
+                            .await?;
+                        signed.push(s);
+                    }
+                    // Post as a single batch
+                    client.post_orders(signed, ot).await
+                })
+            })
+            .map_err(map_err)?;
+
+        // Convert Vec<PostOrderResponse> to a Python list of dicts
+        let py_list = pyo3::types::PyList::empty(py);
+        for resp in &responses {
+            let py_dict = types::post_response_to_py(py, resp)?;
+            py_list.append(py_dict)?;
+        }
+        Ok(py_list.into_any().unbind())
+    }
+
     /// Get order status by ID.
     ///
     /// Returns a dict with fields: status, size_matched, original_size, etc.

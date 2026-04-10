@@ -338,7 +338,12 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         max_sigma=1e-03,
         binance_symbol="btcusdt",
         tail_mode="kou",
-        min_entry_z=0.10,           # slightly looser than 15m — more time to recover
+        # 2026-04-10: raised from 0.10 to 0.30 after trade analysis showed
+        # |z|<0.3 entries have 47% WR (losing money). |z|>0.3 = 65% WR.
+        min_entry_z=0.30,
+        # 2026-04-10: raised from default 0.25 to 0.40. Entries at <$0.45
+        # had 35% WR — deep OTM contrarian bets that fail on 1h.
+        min_entry_price=0.40,
         market_blend=0.5,
         max_model_market_disagreement=0.30,
         max_trades_per_window=2,    # 1h has room for 2 entries

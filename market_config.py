@@ -15,6 +15,29 @@ class MarketConfig:
     window_align_m: int = 15           # minute alignment for find_market
     max_sigma: float = 8e-05           # per-second sigma ceiling
     min_sigma: float = 1e-6            # per-second sigma floor
+    # Z-score cap before norm_cdf. max_z=3.0 lets p_model reach
+    # [Φ(-3), Φ(+3)] = [0.00135, 0.99865]. max_z=1.0 caps it at
+    # [0.16, 0.84]. Default 3.0 matches the 2026-04-11 BTC/ETH decision
+    # in live_trader.py:1163-1166 ("Overconfidence should come from
+    # accurate sigma, not z-capping"). SOL/XRP/btc_1h override to 1.0
+    # to preserve their live behavior (which relied on the class default).
+    # Previously this field only existed on DiffusionSignal and was set
+    # via per-market signal_kw overrides in live_trader.py; backtest.py
+    # fell through to the class default 1.0, silently running a DIFFERENT
+    # model than live. See tasks/findings/live_pmodel_divergence_root_cause_2026-04-11.md.
+    max_z: float = 3.0
+    # Calm-market filter: refuse to trade when raw Yang-Zhang σ is below
+    # this absolute threshold. When σ is very small, the model's z-score
+    # blows up on even tiny deltas, producing extreme-but-wrong p_models.
+    # The calibration audit (tasks/findings/live_vs_backtest_calibration_2026-04-11.md)
+    # showed this regime is where the bot fires its worst trades: claimed
+    # 15% edge, realized -0.7%. Empirical 90s σ distribution for btc_5m/15m:
+    # p25 ≈ 2.1e-5, p50 ≈ 3.5e-5, p75 ≈ 5.3e-5. Setting this to 2.5e-5 for
+    # BTC markets filters roughly the bottom ~30% of vol regimes — i.e. the
+    # calm periods where the GBM sigma estimate is most unreliable as a
+    # forward-looking vol forecast. 0.0 = disabled (default).
+    # See 2026-04-11 calibration audit, Test #3.
+    min_trade_sigma: float = 0.0
     binance_symbol: str = ""           # e.g. "btcusdt" for Binance bookTicker
     tail_mode: str = "normal"          # "normal", "student_t", or "kou"
     tail_nu_default: float = 20.0      # Student-t degrees of freedom (ignored for normal)
@@ -157,7 +180,19 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # below the min_sigma=2e-5 floor (e.g. via the sigma_baseline
         # adaptive path) and the model becomes confidently wrong vs
         # the contract mid. Backstop to the upstream min_sigma fix.
+        #
+        # 2026-04-11 Test #5 result: REVERTED to 0.30. Tightening to 0.15
+        # killed 99.6% of trades on the 455-sample calibration replay
+        # (only 2 trades survived). At 0.20 → 10 trades with 70% WR but
+        # negligible PnL ($28). At 0.25 → 20 trades but realized edge
+        # only +6%. None of these are better than Test #3 alone (calm
+        # filter at 2.5e-5: 56 trades, 71.4% WR, +20.9% realized, +$293
+        # PnL). The disagreement gate is REDUNDANT with the calm filter
+        # because the cases it catches are already caught by σ collapse.
+        # Test #3 keeps min_trade_sigma=2.5e-5 below this line.
         max_model_market_disagreement=0.30,
+        # 2026-04-11 Test #3: calm-market σ floor. See dataclass comment.
+        min_trade_sigma=2.5e-5,
         # Market-blend: post-fix 50-day backfill (14k BTC 5m / 4.7k BTC 15m
         # REST + live windows) sweep showed BTC 15m Sharpe climbs from 0.61
         # @ blend=0.0 to 1.36 @ blend=0.5 (+123%), max drawdown drops from
@@ -255,7 +290,13 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         # 15m with this gate at 0.30 went 3/3 wins; 5m without it went
         # 10/33 wins (PF=0.39). When |p_model_raw - mid_up| > 0.30,
         # the model is probably overconfident from sigma collapse.
+        #
+        # 2026-04-11 Test #5: REVERTED to 0.30. See btc 15m block above
+        # for full rationale (the tighter gate killed 99% of trades and
+        # offered no improvement over Test #3 alone).
         max_model_market_disagreement=0.30,
+        # 2026-04-11 Test #3: calm-market σ floor. See dataclass comment.
+        min_trade_sigma=2.5e-5,
         # 2026-04-09: bumped 1000 → 5000 after live evidence that calm
         # markets trigger false stale-book FLATs. The Polymarket book WS
         # only sends updates when the book CHANGES — during quiet periods
@@ -300,6 +341,9 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=15,
         max_sigma=1.2e-04,
         binance_symbol="solusdt",
+        # Live runs SOL with no max_z override → class default 1.0.
+        # Pinned here so backtest matches live. Revisit if SOL is re-tuned.
+        max_z=1.0,
     ),
     "sol_5m": MarketConfig(
         slug_prefix="sol-updown-5m",
@@ -310,6 +354,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=5,
         max_sigma=1.2e-04,
         binance_symbol="solusdt",
+        max_z=1.0,
     ),
     "xrp": MarketConfig(
         slug_prefix="xrp-updown-15m",
@@ -320,6 +365,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=15,
         max_sigma=1.2e-04,
         binance_symbol="xrpusdt",
+        max_z=1.0,
     ),
     "xrp_5m": MarketConfig(
         slug_prefix="xrp-updown-5m",
@@ -330,6 +376,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_align_m=5,
         max_sigma=1.2e-04,
         binance_symbol="xrpusdt",
+        max_z=1.0,
     ),
     "btc_1h": MarketConfig(
         slug_prefix="bitcoin-up-or-down",
@@ -339,6 +386,12 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         window_duration_s=3600.0,
         window_align_m=60,
         min_sigma=2e-05,
+        # btc_1h live uses base_market="btc_1h", which does NOT match
+        # the "btc" branch in live_trader.py:1168 → no max_z override →
+        # class default 1.0. Pinned here for backtest parity. If this
+        # should be 3.0 (matching btc_5m/btc_15m), the live override
+        # chain also needs updating — don't silently change one side.
+        max_z=1.0,
         # 1h windows accumulate more vol samples → per-second sigma can
         # be higher than 15m. The 4e-4 ceiling was hitting on ~30% of
         # windows, clipping the signal. 1e-3 covers p99.9 of 1h sigma.

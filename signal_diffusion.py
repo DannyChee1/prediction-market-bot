@@ -283,6 +283,14 @@ class DiffusionSignal(Signal):
         # markets, ~10s for 15m markets. Tracks per-side first-edge
         # timestamps in ctx; resets when edge drops back below threshold.
         edge_persistence_s: float = 0.0,
+        # Calm-market filter. When raw Yang-Zhang σ is below this absolute
+        # threshold, FLAT. 0.0 = disabled. Set per-market in MarketConfig
+        # (btc/btc_5m use 2.5e-5 per 2026-04-11 Test #3). Rationale: when
+        # σ is tiny the GBM z blows up on small deltas, producing
+        # extreme-but-wrong p_model. This filter refuses to trade in that
+        # regime. Empirical 90s σ: p25≈2.1e-5, p50≈3.5e-5, p75≈5.3e-5 —
+        # 2.5e-5 is around p27, filtering the bottom quartile of vol.
+        min_trade_sigma: float = 0.0,
         # Stale-quote sniper mode: opt-in taker strategy that buys when
         # the Polymarket CLOB ask is stale relative to Binance fair value.
         # See decide_stale_quote() for the logic.
@@ -395,6 +403,7 @@ class DiffusionSignal(Signal):
         self.cross_asset_min_z = cross_asset_min_z
         self.min_entry_z = min_entry_z
         self.edge_persistence_s = edge_persistence_s
+        self.min_trade_sigma = float(min_trade_sigma)
         self.stale_quote_mode = stale_quote_mode
         self.stale_threshold = stale_threshold
 
@@ -500,15 +509,17 @@ class DiffusionSignal(Signal):
         (``regime_z_scale=False``); revisit before ever enabling.
         """
         factor = 1.0
-        if (
-            self.regime_z_scale
-            and self.sigma_calibration
-            and self.sigma_calibration > 0
-            and sigma_per_s > 0
-        ):
-            factor = self.sigma_calibration / sigma_per_s
-            factor = max(0.5, min(2.0, factor))
-            z_raw *= factor
+        # === DISABLED 2026-04-11 (START) — regime_z_scale=False in btc_5m/btc_15m production path ===
+        # if (
+        #     self.regime_z_scale
+        #     and self.sigma_calibration
+        #     and self.sigma_calibration > 0
+        #     and sigma_per_s > 0
+        # ):
+        #     factor = self.sigma_calibration / sigma_per_s
+        #     factor = max(0.5, min(2.0, factor))
+        #     z_raw *= factor
+        # === DISABLED 2026-04-11 (END) ===
         ctx["_regime_z_factor"] = factor
         return z_raw, factor
 
@@ -585,6 +596,17 @@ class DiffusionSignal(Signal):
         ctx["_kalman_P"] = P_new
         ctx["_kalman_gain"] = K  # expose for diagnostics
 
+        # 2026-04-11: a 1s throttle on Kalman updates was attempted here
+        # to align live's per-tick cadence with backtest's 1Hz cadence.
+        # It was REVERTED after live testing showed it locked in the
+        # cold-start raw_sigma (often tiny when history is thin) for the
+        # entire first second of each window, producing extreme p_models
+        # across most windows. The per-tick update behaviour below is
+        # the proven working baseline. If the live-vs-replay sigma
+        # divergence is worth fixing, do it at the data-rate level (e.g.
+        # record live ticks at higher cadence and run replay against
+        # that) rather than throttling the filter.
+
         if self.max_sigma is not None:
             x_new = min(x_new, self.max_sigma)
         return max(x_new, self.min_sigma)
@@ -600,35 +622,37 @@ class DiffusionSignal(Signal):
         feed new ticks as they arrive. The "jump" definition is
         |z| > k_sigma using the current realized sigma.
         """
-        if self.hawkes_params is None or sigma_per_s <= 0 or len(hist) < 2:
-            return
-        try:
-            from scripts.hawkes import HawkesIntensity
-        except ImportError:
-            return
-        mu, alpha, beta, k_sigma = self.hawkes_params
-        h = ctx.get("_hawkes_state")
-        if h is None:
-            h = HawkesIntensity(mu=mu, alpha=alpha, beta=beta)
-            ctx["_hawkes_state"] = h
-            # Seed: scan the existing history for jumps
-            from scripts.hawkes import detect_jumps
-            jump_times = detect_jumps(hist, ts_hist, sigma_per_s, k_sigma)
-            for t in jump_times:
-                h.add_event(t)
-        else:
-            # Incremental: only check the most recent tick (i.e. compare
-            # the last two prices). This is a tiny per-tick cost and
-            # avoids re-scanning the whole history.
-            if len(hist) >= 2 and hist[-1] > 0 and hist[-2] > 0:
-                dt = (ts_hist[-1] - ts_hist[-2]) / 1000.0
-                if dt > 0:
-                    r = math.log(hist[-1] / hist[-2])
-                    z = r / (sigma_per_s * math.sqrt(dt))
-                    if abs(z) > k_sigma:
-                        h.add_event(ts_hist[-1] / 1000.0)
-        ctx["_hawkes_intensity"] = h.intensity_at(ts_hist[-1] / 1000.0)
-        ctx["_hawkes_n_events"] = h.n_events
+        # === DISABLED 2026-04-11 (START) — Hawkes inert: live_trader doesn't pass hawkes_params, and the live filtration_model.pkl is a 29-feature model that does NOT read hawkes_intensity/hawkes_n_events (see filtration_model.py L45-49). Body disabled so the call sites in decide()/decide_both_sides() (also disabled below) are no-ops on the btc_5m/btc_15m production path. ===
+        # if self.hawkes_params is None or sigma_per_s <= 0 or len(hist) < 2:
+        #     return
+        # try:
+        #     from scripts.hawkes import HawkesIntensity
+        # except ImportError:
+        #     return
+        # mu, alpha, beta, k_sigma = self.hawkes_params
+        # h = ctx.get("_hawkes_state")
+        # if h is None:
+        #     h = HawkesIntensity(mu=mu, alpha=alpha, beta=beta)
+        #     ctx["_hawkes_state"] = h
+        #     # Seed: scan the existing history for jumps
+        #     from scripts.hawkes import detect_jumps
+        #     jump_times = detect_jumps(hist, ts_hist, sigma_per_s, k_sigma)
+        #     for t in jump_times:
+        #         h.add_event(t)
+        # else:
+        #     # Incremental: only check the most recent tick (i.e. compare
+        #     # the last two prices). This is a tiny per-tick cost and
+        #     # avoids re-scanning the whole history.
+        #     if len(hist) >= 2 and hist[-1] > 0 and hist[-2] > 0:
+        #         dt = (ts_hist[-1] - ts_hist[-2]) / 1000.0
+        #         if dt > 0:
+        #             r = math.log(hist[-1] / hist[-2])
+        #             z = r / (sigma_per_s * math.sqrt(dt))
+        #             if abs(z) > k_sigma:
+        #                 h.add_event(ts_hist[-1] / 1000.0)
+        # ctx["_hawkes_intensity"] = h.intensity_at(ts_hist[-1] / 1000.0)
+        # ctx["_hawkes_n_events"] = h.n_events
+        # === DISABLED 2026-04-11 (END) ===
 
     def _maybe_compute_regime(self, ctx: dict, tau: float,
                               hist: list[float],
@@ -644,38 +668,41 @@ class DiffusionSignal(Signal):
         result for this window, AND (b) the current tau is past the
         early-tau threshold (we have enough ticks for stable features).
         """
-        if self.regime_classifier is None:
-            return 1.0
-        cached = ctx.get("_regime_kelly_mult")
-        if cached is not None:
-            return float(cached)
-        # Wait until we are past the early-tau threshold before classifying.
-        # Note: tau decreases over the window, so "past" means tau < threshold.
-        if tau > self.regime_early_tau_s:
-            return 1.0
-        if not hist or not ts_hist or len(hist) < 30:
-            return 1.0
-        try:
-            from regime_classifier import compute_window_regime_features
-            features = compute_window_regime_features(
-                hist, ts_hist,
-                early_tau_target=self.regime_early_tau_s,
-            )
-            if features is None:
-                return 1.0
-            state_idx, label, kelly_mult = self.regime_classifier.classify_window(
-                features
-            )
-            ctx["_regime_state"] = state_idx
-            ctx["_regime_label"] = label
-            ctx["_regime_kelly_mult"] = float(kelly_mult)
-            return float(kelly_mult)
-        except Exception as exc:
-            # Never let a regime-classifier failure block trading. Log
-            # via ctx so the dashboard can surface it; fall through to 1.0.
-            ctx["_regime_error"] = f"{type(exc).__name__}: {exc}"
-            ctx["_regime_kelly_mult"] = 1.0
-            return 1.0
+        # === DISABLED 2026-04-11 (START) — _maybe_compute_regime is NEVER called from decide() or decide_both_sides() on the btc_5m/btc_15m production path (see comment at decide() line ~1482: "the regime classifier is intentionally NOT called here"). Although backtest loads regime_classifier_btc_{5m,15m}.pkl and passes it to the constructor, nothing consumes self.regime_classifier at runtime. Body disabled. ===
+        return 1.0
+        # if self.regime_classifier is None:
+        #     return 1.0
+        # cached = ctx.get("_regime_kelly_mult")
+        # if cached is not None:
+        #     return float(cached)
+        # # Wait until we are past the early-tau threshold before classifying.
+        # # Note: tau decreases over the window, so "past" means tau < threshold.
+        # if tau > self.regime_early_tau_s:
+        #     return 1.0
+        # if not hist or not ts_hist or len(hist) < 30:
+        #     return 1.0
+        # try:
+        #     from regime_classifier import compute_window_regime_features
+        #     features = compute_window_regime_features(
+        #         hist, ts_hist,
+        #         early_tau_target=self.regime_early_tau_s,
+        #     )
+        #     if features is None:
+        #         return 1.0
+        #     state_idx, label, kelly_mult = self.regime_classifier.classify_window(
+        #         features
+        #     )
+        #     ctx["_regime_state"] = state_idx
+        #     ctx["_regime_label"] = label
+        #     ctx["_regime_kelly_mult"] = float(kelly_mult)
+        #     return float(kelly_mult)
+        # except Exception as exc:
+        #     # Never let a regime-classifier failure block trading. Log
+        #     # via ctx so the dashboard can surface it; fall through to 1.0.
+        #     ctx["_regime_error"] = f"{type(exc).__name__}: {exc}"
+        #     ctx["_regime_kelly_mult"] = 1.0
+        #     return 1.0
+        # === DISABLED 2026-04-11 (END) ===
 
     def _kalman_obi_update(
         self,
@@ -697,25 +724,28 @@ class DiffusionSignal(Signal):
         Two independent state slots are kept in ctx (one per side)
         keyed by `state_key`. Returns the posterior mean.
         """
-        beta = 0.95
-        Q = 0.001    # small state noise — true imbalance changes slowly
-        R = 0.05     # observation noise — raw OBI flickers a lot
-
-        state = ctx.get(state_key)
-        if state is None:
-            x = float(raw_obi)
-            P = 1.0
-        else:
-            x, P = state
-            # Predict
-            x = beta * x
-            P = beta * beta * P + Q
-            # Update
-            K = P / (P + R)
-            x = x + K * (float(raw_obi) - x)
-            P = (1.0 - K) * P
-        ctx[state_key] = (x, P)
-        return x
+        # === DISABLED 2026-04-11 (START) — use_kalman_obi=False default; live_trader.py never sets it; function is unreachable on the btc_5m/btc_15m production path. The decide() caller at ~line 1450 is gated by `if self.use_kalman_obi:` which is False. ===
+        return float(raw_obi)
+        # beta = 0.95
+        # Q = 0.001    # small state noise — true imbalance changes slowly
+        # R = 0.05     # observation noise — raw OBI flickers a lot
+        #
+        # state = ctx.get(state_key)
+        # if state is None:
+        #     x = float(raw_obi)
+        #     P = 1.0
+        # else:
+        #     x, P = state
+        #     # Predict
+        #     x = beta * x
+        #     P = beta * beta * P + Q
+        #     # Update
+        #     K = P / (P + R)
+        #     x = x + K * (float(raw_obi) - x)
+        #     P = (1.0 - K) * P
+        # ctx[state_key] = (x, P)
+        # return x
+        # === DISABLED 2026-04-11 (END) ===
 
     def _check_filtration(
         self,
@@ -879,15 +909,18 @@ class DiffusionSignal(Signal):
 
     def _smoothed_sigma_p(self, raw: float, ctx: dict) -> float:
         """EMA smoothing for contract mid vol (separate state from BTC sigma)."""
-        if raw == 0.0:
-            return 0.0
-        ema = ctx.get("_sigma_p_ema")
-        if ema is None:
-            ema = raw
-        else:
-            ema = self.sigma_ema_alpha * raw + (1 - self.sigma_ema_alpha) * ema
-        ctx["_sigma_p_ema"] = ema
-        return ema
+        # === DISABLED 2026-04-11 (START) — A-S only helper; as_mode=False on btc_5m/btc_15m production path; only called by _contract_sigma_p which itself is only called inside `if self.as_mode:` in decide_both_sides. ===
+        return 0.0
+        # if raw == 0.0:
+        #     return 0.0
+        # ema = ctx.get("_sigma_p_ema")
+        # if ema is None:
+        #     ema = raw
+        # else:
+        #     ema = self.sigma_ema_alpha * raw + (1 - self.sigma_ema_alpha) * ema
+        # ctx["_sigma_p_ema"] = ema
+        # return ema
+        # === DISABLED 2026-04-11 (END) ===
 
     def _contract_sigma_p(self, ctx: dict) -> float:
         """Realized vol of contract mid price (sigma_p per second).
@@ -895,14 +928,17 @@ class DiffusionSignal(Signal):
         Uses the same Yang-Zhang estimator as BTC vol but on the UP
         contract mid = (best_bid + best_ask) / 2 over a rolling window.
         """
-        mids = ctx.get("_contract_mids", [])
-        ts = ctx.get("_contract_mid_ts", [])
-        if len(mids) < 10:
-            return 0.0  # insufficient data — min_edge floor covers warmup
-        cutoff = ts[-1] - self.contract_vol_lookback_s * 1000
-        start = next((i for i, t in enumerate(ts) if t >= cutoff), 0)
-        raw = _compute_vol_deduped(mids[start:], ts[start:])
-        return self._smoothed_sigma_p(raw, ctx)
+        # === DISABLED 2026-04-11 (START) — A-S only helper; as_mode=False on btc_5m/btc_15m production path; only called inside `if self.as_mode:` branch of decide_both_sides. ===
+        return 0.0
+        # mids = ctx.get("_contract_mids", [])
+        # ts = ctx.get("_contract_mid_ts", [])
+        # if len(mids) < 10:
+        #     return 0.0  # insufficient data — min_edge floor covers warmup
+        # cutoff = ts[-1] - self.contract_vol_lookback_s * 1000
+        # start = next((i for i, t in enumerate(ts) if t >= cutoff), 0)
+        # raw = _compute_vol_deduped(mids[start:], ts[start:])
+        # return self._smoothed_sigma_p(raw, ctx)
+        # === DISABLED 2026-04-11 (END) ===
 
     @staticmethod
     def _compute_toxicity(snapshot: "Snapshot", max_spread: float) -> float:
@@ -1056,56 +1092,60 @@ class DiffusionSignal(Signal):
             # double-counting, use tail_mode="kou_full" (below), which
             # uses bipower variation for the continuous σ component.
             return norm_cdf(z)
-        if self.tail_mode == "kou_full":
-            # Proper Kou jump-diffusion under physical measure.
-            #
-            # σ input to kou_cdf must be the CONTINUOUS-component σ
-            # (bipower variation), so the function's internal
-            # `lam_tau*ej2` jump-variance addition doesn't double-count
-            # what our total-σ already absorbs.
-            #
-            # `mu_override=0.0` = physical-measure drift (short-horizon
-            # crypto has ~zero expected log-return per second). The
-            # kou_cdf default is the Q-measure martingale correction
-            # which would reintroduce the -1.7% to -7% p_UP bias we
-            # fought to remove from the plain "kou" path.
-            sigma_cont = ctx.get("_sigma_continuous_per_s", 0.0)
-            tau = ctx.get("_tau", 300.0)
-            if sigma_cont <= 0 or tau <= 0:
-                return norm_cdf(z)  # graceful fallback
-            delta_log = ctx.get("_delta_log", 0.0)
-            # P(UP) = P(log(S_T/S_0) > 0 | observed log(S_t/S_0) = delta_log)
-            #       = P(log(S_T/S_t) > -delta_log)   (future increment)
-            #       = 1 - kou_cdf(-delta_log, σ_cont, λ, p_up, η1, η2, τ)
-            p_down = kou_cdf(
-                -delta_log, sigma_cont,
-                self.kou_lambda, self.kou_p_up,
-                self.kou_eta1, self.kou_eta2, tau,
-                mu_override=0.0,
-            )
-            return 1.0 - p_down
-        if self.tail_mode == "market_adaptive":
-            p_gbm = norm_cdf(z)
-            market_mid = ctx.get("_market_mid", 0.5)
-            choppiness = ctx.get("_choppiness", 1.0)
-            elapsed_frac = ctx.get("_elapsed_frac", 0.5)
-
-            # 1. Blend GBM with market price
-            alpha = self.market_blend_alpha
-            p_blend = alpha * p_gbm + (1.0 - alpha) * market_mid
-
-            # 2. Choppiness discount: pull toward 0.5 when choppy
-            # choppiness = actual_crossovers / expected_crossovers
-            # >1 means choppier than GBM predicts → less confident
-            chop_factor = min(1.0, 1.0 / max(choppiness, 0.3))
-            p_chop = chop_factor * p_blend + (1.0 - chop_factor) * 0.5
-
-            # 3. Time-confidence: S-curve, low at 0-25%, rises through 50%+
-            # Logistic: f(t) = 1 / (1 + exp(-k*(t - t0)))
-            t_conf = 1.0 / (1.0 + math.exp(-8.0 * (elapsed_frac - 0.35)))
-            p_final = t_conf * p_chop + (1.0 - t_conf) * 0.5
-            return p_final
-        # student_t fallback
+        # === DISABLED 2026-04-11 (START) — tail_mode="kou_full" NOT used by btc_5m/btc_15m (both use "kou" which returns norm_cdf above). No market in market_config.py sets tail_mode="kou_full". ===
+        # if self.tail_mode == "kou_full":
+        #     # Proper Kou jump-diffusion under physical measure.
+        #     #
+        #     # σ input to kou_cdf must be the CONTINUOUS-component σ
+        #     # (bipower variation), so the function's internal
+        #     # `lam_tau*ej2` jump-variance addition doesn't double-count
+        #     # what our total-σ already absorbs.
+        #     #
+        #     # `mu_override=0.0` = physical-measure drift (short-horizon
+        #     # crypto has ~zero expected log-return per second). The
+        #     # kou_cdf default is the Q-measure martingale correction
+        #     # which would reintroduce the -1.7% to -7% p_UP bias we
+        #     # fought to remove from the plain "kou" path.
+        #     sigma_cont = ctx.get("_sigma_continuous_per_s", 0.0)
+        #     tau = ctx.get("_tau", 300.0)
+        #     if sigma_cont <= 0 or tau <= 0:
+        #         return norm_cdf(z)  # graceful fallback
+        #     delta_log = ctx.get("_delta_log", 0.0)
+        #     # P(UP) = P(log(S_T/S_0) > 0 | observed log(S_t/S_0) = delta_log)
+        #     #       = P(log(S_T/S_t) > -delta_log)   (future increment)
+        #     #       = 1 - kou_cdf(-delta_log, σ_cont, λ, p_up, η1, η2, τ)
+        #     p_down = kou_cdf(
+        #         -delta_log, sigma_cont,
+        #         self.kou_lambda, self.kou_p_up,
+        #         self.kou_eta1, self.kou_eta2, tau,
+        #         mu_override=0.0,
+        #     )
+        #     return 1.0 - p_down
+        # === DISABLED 2026-04-11 (END) ===
+        # === DISABLED 2026-04-11 (START) — tail_mode="market_adaptive" NOT used by any BTC market (btc_5m/btc_15m use "kou"); not referenced by any config in market_config.py. ===
+        # if self.tail_mode == "market_adaptive":
+        #     p_gbm = norm_cdf(z)
+        #     market_mid = ctx.get("_market_mid", 0.5)
+        #     choppiness = ctx.get("_choppiness", 1.0)
+        #     elapsed_frac = ctx.get("_elapsed_frac", 0.5)
+        #
+        #     # 1. Blend GBM with market price
+        #     alpha = self.market_blend_alpha
+        #     p_blend = alpha * p_gbm + (1.0 - alpha) * market_mid
+        #
+        #     # 2. Choppiness discount: pull toward 0.5 when choppy
+        #     # choppiness = actual_crossovers / expected_crossovers
+        #     # >1 means choppier than GBM predicts → less confident
+        #     chop_factor = min(1.0, 1.0 / max(choppiness, 0.3))
+        #     p_chop = chop_factor * p_blend + (1.0 - chop_factor) * 0.5
+        #
+        #     # 3. Time-confidence: S-curve, low at 0-25%, rises through 50%+
+        #     # Logistic: f(t) = 1 / (1 + exp(-k*(t - t0)))
+        #     t_conf = 1.0 / (1.0 + math.exp(-8.0 * (elapsed_frac - 0.35)))
+        #     p_final = t_conf * p_chop + (1.0 - t_conf) * 0.5
+        #     return p_final
+        # === DISABLED 2026-04-11 (END) ===
+        # student_t fallback (used by eth_15m, eth_5m; NOT btc_5m/btc_15m — those hit "kou" above)
         nu = ctx.get("_tail_nu", self.tail_nu_default)
         return fast_t_cdf(z, nu)
 
@@ -1252,7 +1292,9 @@ class DiffusionSignal(Signal):
             return Decision("FLAT", 0.0, 0.0, "zero vol")
 
         # Hawkes intensity (opt-in feature; published to ctx, no gating)
-        self._maybe_publish_hawkes(hist, ts_hist, sigma_per_s, ctx)
+        # === DISABLED 2026-04-11 (START) — Hawkes inert on btc_5m/btc_15m: live_trader doesn't pass hawkes_params, and the 29-feature filtration model doesn't read _hawkes_intensity (see filtration_model.py L45-49). Helper body also disabled. ===
+        # self._maybe_publish_hawkes(hist, ts_hist, sigma_per_s, ctx)
+        # === DISABLED 2026-04-11 (END) ===
 
         # Vol kill switch
         if self.vol_kill_sigma is not None and sigma_per_s > self.vol_kill_sigma:
@@ -1293,11 +1335,13 @@ class DiffusionSignal(Signal):
         # Continuous-component σ via bipower variation — only when the
         # model tail mode needs it. BV is cheap (one mean over a product)
         # but still worth skipping on the default path.
-        if self.tail_mode == "kou_full":
-            from scripts.sigma_estimators import bipower_variation_per_s
-            ctx["_sigma_continuous_per_s"] = bipower_variation_per_s(
-                hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
-            )
+        # === DISABLED 2026-04-11 (START) — tail_mode="kou_full" NEVER hit on btc_5m/btc_15m (both use "kou"); _model_cdf kou_full branch also disabled. ===
+        # if self.tail_mode == "kou_full":
+        #     from scripts.sigma_estimators import bipower_variation_per_s
+        #     ctx["_sigma_continuous_per_s"] = bipower_variation_per_s(
+        #         hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
+        #     )
+        # === DISABLED 2026-04-11 (END) ===
         # Window duration — use self.window_duration (config-wired), not
         # snapshot.time_remaining_s, to avoid baking the "late-join" value
         # when the bot wakes mid-window. See decide_both_sides for rationale.
@@ -1322,15 +1366,17 @@ class DiffusionSignal(Signal):
                             f"min_z gate (|z|={abs(z):.3f} < {self.min_entry_z:.3f})")
 
         # Cross-asset disagreement veto
-        if self.cross_asset_z_lookup is not None:
-            wstart = ctx.get("_window_start_ms")
-            z2 = _lookup_cross_asset_z(self.cross_asset_z_lookup, wstart, tau)
-            if (z2 is not None
-                    and abs(z) >= self.cross_asset_min_z
-                    and abs(z2) >= self.cross_asset_min_z
-                    and z * z2 < 0):
-                return Decision("FLAT", 0.0, 0.0,
-                                f"cross-asset veto (z={z:.3f}, z2={z2:.3f})")
+        # === DISABLED 2026-04-11 (START) — cross_asset_z_lookup is None on btc_5m/btc_15m production path: live_trader.py never sets signal_kw["cross_asset_z_lookup"], and backtest only builds it for ad-hoc cross-asset experiments. ===
+        # if self.cross_asset_z_lookup is not None:
+        #     wstart = ctx.get("_window_start_ms")
+        #     z2 = _lookup_cross_asset_z(self.cross_asset_z_lookup, wstart, tau)
+        #     if (z2 is not None
+        #             and abs(z) >= self.cross_asset_min_z
+        #             and abs(z2) >= self.cross_asset_min_z
+        #             and z * z2 < 0):
+        #         return Decision("FLAT", 0.0, 0.0,
+        #                         f"cross-asset veto (z={z:.3f}, z2={z2:.3f})")
+        # === DISABLED 2026-04-11 (END) ===
 
         p_model = self._p_model(z, tau, ctx)
         ctx["_p_model_raw"] = p_model
@@ -1702,12 +1748,14 @@ class DiffusionSignal(Signal):
                     Decision("FLAT", 0.0, 0.0, reason))
 
         # Track contract mid prices for A-S realized vol (sigma_p)
-        if self.as_mode:
-            mid_up = (bid_up + ask_up) / 2.0
-            contract_mids = ctx.setdefault("_contract_mids", [])
-            contract_mid_ts = ctx.setdefault("_contract_mid_ts", [])
-            contract_mids.append(mid_up)
-            contract_mid_ts.append(snapshot.ts_ms)
+        # === DISABLED 2026-04-11 (START) — as_mode=False on btc_5m/btc_15m production path (live_trader CLI default), so contract mid tracking is dead; _contract_sigma_p / _smoothed_sigma_p bodies also disabled. ===
+        # if self.as_mode:
+        #     mid_up = (bid_up + ask_up) / 2.0
+        #     contract_mids = ctx.setdefault("_contract_mids", [])
+        #     contract_mid_ts = ctx.setdefault("_contract_mid_ts", [])
+        #     contract_mids.append(mid_up)
+        #     contract_mid_ts.append(snapshot.ts_ms)
+        # === DISABLED 2026-04-11 (END) ===
 
         # VAMP computation
         vamp_up = compute_vamp(snapshot.bid_levels_up, snapshot.ask_levels_up)
@@ -1751,6 +1799,37 @@ class DiffusionSignal(Signal):
         else:
             raw_sigma = self._compute_vol(hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:])
 
+        # 2026-04-11 Test #3: calm-market filter. Refuse to trade when σ
+        # is unreliable. Two failure modes the filter must catch:
+        #
+        #   1. Calm regime: raw_sigma is small but nonzero. The model uses
+        #      it directly and z blows up because the denominator (σ·√τ)
+        #      is tiny. Resulting p_model is extreme and historically wrong.
+        #
+        #   2. Monotonic drift / thin history: Yang-Zhang returns 0 because
+        #      there is no measurable VARIANCE (a straight-line drop has
+        #      zero σ). When this happens, _smoothed_sigma falls back to a
+        #      time-of-day prior. On low-vol regimes (e.g. Saturday 21 UTC:
+        #      4.2e-5 × 0.94 × 0.46 = 1.82e-5) the prior gets clamped UP to
+        #      min_sigma=2e-5 and the signal fires extreme p_models against
+        #      a value that bears no relation to current market conditions.
+        #
+        # The original 2026-04-11 version of this filter only caught case
+        # (1) (`0 < raw_sigma < min_trade_sigma`). Case (2) was missed.
+        # Fixed 2026-04-11 (later same day) to catch both.
+        #
+        # Calibration-audit replay confirmed this filter at 2.5e-5 lifts
+        # WR from 62.9% → 71.4% and realized edge from 11.1% → 20.9%
+        # on the 455-trade sample. See tasks/findings/parity_experiments_2026-04-11.md.
+        if self.min_trade_sigma > 0 and raw_sigma < self.min_trade_sigma:
+            if raw_sigma <= 0:
+                reason = f"unreliable σ (raw=0, hist={len(hist)})"
+            else:
+                reason = (f"calm market σ={raw_sigma:.2e} < "
+                          f"{self.min_trade_sigma:.2e}")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
         # Vol regime filter
         sigma_baseline = 0.0
         if len(hist) >= self.vol_regime_lookback_s:
@@ -1777,7 +1856,9 @@ class DiffusionSignal(Signal):
         # Hawkes intensity (opt-in feature; published to ctx, no gating).
         # Same call as decide() — needed in both paths so the filtration
         # model sees populated _hawkes_intensity / _hawkes_n_events.
-        self._maybe_publish_hawkes(hist, ts_hist, sigma_per_s, ctx)
+        # === DISABLED 2026-04-11 (START) — Hawkes inert on btc_5m/btc_15m production path; live_trader doesn't pass hawkes_params; 29-feature filtration model doesn't consume _hawkes_intensity/_hawkes_n_events (filtration_model.py L45-49). Helper body also disabled. ===
+        # self._maybe_publish_hawkes(hist, ts_hist, sigma_per_s, ctx)
+        # === DISABLED 2026-04-11 (END) ===
 
         # Volatility kill switch: hard pause when EMA sigma exceeds
         # an absolute ceiling.  Distinct from the relative regime filter
@@ -1869,11 +1950,13 @@ class DiffusionSignal(Signal):
             ctx["_delta_log"] = 0.0
         # Continuous-component σ via bipower variation — only computed
         # when the model tail mode needs it.
-        if self.tail_mode == "kou_full":
-            from scripts.sigma_estimators import bipower_variation_per_s
-            ctx["_sigma_continuous_per_s"] = bipower_variation_per_s(
-                hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
-            )
+        # === DISABLED 2026-04-11 (START) — tail_mode="kou_full" NEVER hit on btc_5m/btc_15m (both use "kou"); _model_cdf kou_full branch also disabled. ===
+        # if self.tail_mode == "kou_full":
+        #     from scripts.sigma_estimators import bipower_variation_per_s
+        #     ctx["_sigma_continuous_per_s"] = bipower_variation_per_s(
+        #         hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
+        #     )
+        # === DISABLED 2026-04-11 (END) ===
         # Window duration — always use the config value (self.window_duration)
         # as the stable reference. The previous implementation used
         # `snapshot.time_remaining_s` on the first tick, which baked a wrong
@@ -1899,16 +1982,18 @@ class DiffusionSignal(Signal):
                     Decision("FLAT", 0.0, 0.0, reason))
 
         # Cross-asset disagreement veto
-        if self.cross_asset_z_lookup is not None:
-            wstart = ctx.get("_window_start_ms")
-            z2 = _lookup_cross_asset_z(self.cross_asset_z_lookup, wstart, tau)
-            if (z2 is not None
-                    and abs(z) >= self.cross_asset_min_z
-                    and abs(z2) >= self.cross_asset_min_z
-                    and z * z2 < 0):
-                reason = f"cross-asset veto (z={z:.3f}, z2={z2:.3f})"
-                return (Decision("FLAT", 0.0, 0.0, reason),
-                        Decision("FLAT", 0.0, 0.0, reason))
+        # === DISABLED 2026-04-11 (START) — cross_asset_z_lookup is None on btc_5m/btc_15m production path: live_trader.py never sets signal_kw["cross_asset_z_lookup"], so the lookup stays at its constructor default None. ===
+        # if self.cross_asset_z_lookup is not None:
+        #     wstart = ctx.get("_window_start_ms")
+        #     z2 = _lookup_cross_asset_z(self.cross_asset_z_lookup, wstart, tau)
+        #     if (z2 is not None
+        #             and abs(z) >= self.cross_asset_min_z
+        #             and abs(z2) >= self.cross_asset_min_z
+        #             and z * z2 < 0):
+        #         reason = f"cross-asset veto (z={z:.3f}, z2={z2:.3f})"
+        #         return (Decision("FLAT", 0.0, 0.0, reason),
+        #                 Decision("FLAT", 0.0, 0.0, reason))
+        # === DISABLED 2026-04-11 (END) ===
 
         p_model = self._p_model(z, tau, ctx)
 
@@ -2265,6 +2350,24 @@ class DiffusionSignal(Signal):
         else:
             raw_sigma = 0.0
 
+        # 2026-04-11 Test #3 (stale-quote variant): calm-market filter.
+        # MUST be checked BEFORE the min_sigma floor below — otherwise the
+        # floor masks the calm regime and the signal proceeds with σ=floor,
+        # producing extreme p_model values from any moderate Δ. This
+        # mirrors the filter in decide_both_sides; the behaviour is
+        # equally critical here because stale_quote uses raw EWMA σ which
+        # converges to ~0 on monotonic drift (no log-return variance).
+        # See display debug session 2026-04-11 (user observed p_up=0.0925
+        # with σ pinned at min_sigma=2e-5 on Saturday 21 UTC drift).
+        if self.min_trade_sigma > 0 and raw_sigma < self.min_trade_sigma:
+            if raw_sigma <= 0:
+                reason = f"unreliable σ (raw=0, hist={len(hist)})"
+            else:
+                reason = (f"calm market σ={raw_sigma:.2e} < "
+                          f"{self.min_trade_sigma:.2e}")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
         # Apply floor
         raw_sigma = max(raw_sigma, self.min_sigma)
 
@@ -2286,6 +2389,13 @@ class DiffusionSignal(Signal):
 
         # ── Fair value from Binance ───────────────────────────────────
         # Use raw Binance mid — no Chainlink blend, no market blend.
+        # NOTE: The delta below mixes Binance (now) with Chainlink (start).
+        # This is intentional for stale-quote: the Binance-Chainlink gap
+        # IS the signal — when Binance leads Chainlink, the gap predicts
+        # Chainlink's convergence direction (corr=0.175 with outcome).
+        # Approach B (same-basis: binance_now - binance_start) was tested
+        # and LOST 6pp direction accuracy + 0.66 Sharpe because it strips
+        # out the convergence signal. See fair_value_fix_2026-04-11.md.
         binance_mid = ctx.get("_binance_mid")
         if binance_mid is None or binance_mid <= 0:
             reason = "no binance_mid"

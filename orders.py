@@ -352,6 +352,162 @@ class OrderMixin:
 
     # ── Place limit order ──────────────────────────────────────────────────
 
+    def _build_model_snapshot(
+        self: "LiveTradeTracker",
+        snapshot: Snapshot,
+        decision: Decision,
+        side_label: str,
+        limit_price: float,
+    ) -> dict:
+        """Build the model_snapshot dict — deferred from the hot path."""
+        p_model = self.ctx.get("_p_model_raw", 0.0)
+        expected_range = self.ctx.get("_expected_range", {})
+        p_side = p_model if side_label == "UP" else 1.0 - p_model
+        cost_basis = self.ctx.get(
+            "_cost_down" if side_label == "DOWN" else "_cost_up", limit_price
+        )
+        return {
+            "p_model": round(p_model, 4),
+            "p_side": round(p_side, 4),
+            "sigma_per_s": self.ctx.get("_sigma_per_s", 0.0),
+            "tau": round(snapshot.time_remaining_s, 0),
+            "dyn_threshold": round(self.ctx.get("_dyn_threshold_down" if side_label == "DOWN" else "_dyn_threshold_up", 0.0), 4),
+            "expected_low": round(expected_range.get("expected_low", 0.0), 2),
+            "expected_high": round(expected_range.get("expected_high", 0.0), 2),
+            "cost_basis": round(cost_basis, 4),
+            "fill_price": limit_price,
+            "edge": round(decision.edge, 4),
+        }
+
+    def _build_limit_trade_record(
+        self: "LiveTradeTracker",
+        snapshot: Snapshot,
+        decision: Decision,
+        side_label: str,
+        limit_price: float,
+        shares: float,
+        cost_est: float,
+        now_iso: str,
+        model_snapshot: dict,
+        trigger_ts_ms: int,
+    ) -> dict:
+        """Build the trade_record dict — deferred from the hot path."""
+        return {
+            "type": "limit_order",
+            "ts": now_iso,
+            "market_slug": snapshot.market_slug,
+            "side": side_label,
+            "price": limit_price,
+            "shares": shares,
+            "cost_est": round(cost_est, 2),
+            "edge": round(decision.edge, 4),
+            "signal_reason": decision.reason,
+            "bankroll_before": round(self.bankroll, 2),
+            "chainlink_price": round(snapshot.chainlink_price, 2),
+            "signal_trigger_ts_ms": trigger_ts_ms,
+            **model_snapshot,
+            **self._latency_log_fields(),
+        }
+
+    def _dry_run_limit_order(
+        self: "LiveTradeTracker",
+        snapshot: Snapshot,
+        decision: Decision,
+        side_label: str,
+        limit_price: float,
+        shares: float,
+        cost_est: float,
+    ):
+        """Dry-run path — full logging, no network."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        now_unix = _time.time()
+        trigger_ts_ms = int(self.ctx.get("_signal_trigger_ts_ms", 0) or 0)
+        model_snapshot = self._build_model_snapshot(snapshot, decision, side_label, limit_price)
+        trade_record = self._build_limit_trade_record(
+            snapshot, decision, side_label, limit_price, shares, cost_est,
+            now_iso, model_snapshot, trigger_ts_ms,
+        )
+        trade_record["dry_run"] = True
+        trade_record["status"] = "dry_run"
+        self._log(trade_record)
+        self._event(
+            f"[DRY RUN] Would place limit: BUY {side_label} "
+            f"{shares:.1f}sh @ {limit_price:.4f} (${cost_est:.2f})"
+            f" | BTC: ${snapshot.chainlink_price:,.2f}"
+        )
+        self.bankroll -= cost_est
+        self.signal.bankroll = self.bankroll
+        self.open_orders.append({
+            "order_id": f"dry_{side_label}_{int(now_unix)}",
+            "side": side_label,
+            "price": limit_price,
+            "shares": shares,
+            "cost_est": cost_est,
+            "market_slug": snapshot.market_slug,
+            "placed_ts": now_iso,
+            "placed_ts_unix": now_unix,
+            "time_remaining_s": snapshot.time_remaining_s,
+            "chainlink_price": snapshot.chainlink_price,
+            "window_start_price": snapshot.window_start_price,
+            "model_snapshot": model_snapshot,
+            "edge_at_place": round(decision.edge, 4),
+        })
+
+    def _log_skipped_backoff(
+        self: "LiveTradeTracker",
+        snapshot: Snapshot,
+        decision: Decision,
+        side_label: str,
+        limit_price: float,
+        shares: float,
+        cost_est: float,
+        remaining: float,
+    ):
+        """Log a backoff-skipped order — cold path, full record."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        trigger_ts_ms = int(self.ctx.get("_signal_trigger_ts_ms", 0) or 0)
+        model_snapshot = self._build_model_snapshot(snapshot, decision, side_label, limit_price)
+        trade_record = self._build_limit_trade_record(
+            snapshot, decision, side_label, limit_price, shares, cost_est,
+            now_iso, model_snapshot, trigger_ts_ms,
+        )
+        trade_record["status"] = "skipped_backoff"
+        trade_record["error"] = f"service backoff ({remaining:.1f}s remaining)"
+        self._log(trade_record)
+
+    def _log_limit_order_exception(
+        self: "LiveTradeTracker",
+        snapshot: Snapshot,
+        decision: Decision,
+        side_label: str,
+        limit_price: float,
+        shares: float,
+        cost_est: float,
+        exc: Exception,
+        trigger_ts_ms: int,
+        post_start_ms: int,
+        post_done_ms: int,
+    ):
+        """Log an order placement exception — cold path, full record."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        model_snapshot = self._build_model_snapshot(snapshot, decision, side_label, limit_price)
+        trade_record = self._build_limit_trade_record(
+            snapshot, decision, side_label, limit_price, shares, cost_est,
+            now_iso, model_snapshot, trigger_ts_ms,
+        )
+        trade_record["status"] = "error"
+        trade_record["error"] = str(exc)
+        trade_record["order_post_ms"] = post_done_ms - post_start_ms
+        if trigger_ts_ms > 0:
+            trade_record["signal_to_post_ms"] = max(0, post_start_ms - trigger_ts_ms)
+            trade_record["signal_to_ack_ms"] = max(0, post_done_ms - trigger_ts_ms)
+        self._log(trade_record)
+        self._event(f"[LIMIT ORDER ERROR] {exc}")
+        err_str = str(exc).lower()
+        if "service not ready" in err_str or "425" in err_str:
+            self._service_unavailable_until = _time.time() + 10.0
+            self._event(f"[LIMIT] Service not ready — backoff 10s")
+
     def _place_limit_order(
         self: "LiveTradeTracker",
         snapshot: Snapshot,
@@ -359,7 +515,16 @@ class OrderMixin:
         token_id: str,
         side_label: str,
     ):
-        """Place a GTC limit order at best bid for maker mode."""
+        """Place a GTC limit order at best bid for maker mode.
+
+        Hot-path discipline: between the bankroll check and the
+        ``client.place_order`` call we do NOTHING but capture primitive
+        values. All trade_record/model_snapshot/datetime/round() work is
+        deferred to ``_finalize_limit_order`` which runs AFTER the HTTP
+        ack. The ctx fields read by the deferred path are stable during
+        the HTTP roundtrip because signal_ticker for this tracker is
+        blocked inside ``asyncio.to_thread`` until evaluate returns.
+        """
         if decision.action == "BUY_UP":
             best_bid = snapshot.best_bid_up
         else:
@@ -384,105 +549,45 @@ class OrderMixin:
                 return
             cost_est = shares * limit_price
 
-        now_iso = datetime.now(timezone.utc).isoformat()
-        now_unix = _time.time()
-
-        # Capture model state at order time for fill logging
-        p_model = self.ctx.get("_p_model_raw", 0.0)
-        expected_range = self.ctx.get("_expected_range", {})
-        p_side = p_model if side_label == "UP" else 1.0 - p_model
-        cost_basis = self.ctx.get(
-            "_cost_down" if side_label == "DOWN" else "_cost_up", limit_price
-        )
-        model_snapshot = {
-            "p_model": round(p_model, 4),
-            "p_side": round(p_side, 4),
-            "sigma_per_s": self.ctx.get("_sigma_per_s", 0.0),
-            "tau": round(snapshot.time_remaining_s, 0),
-            "dyn_threshold": round(self.ctx.get("_dyn_threshold_down" if side_label == "DOWN" else "_dyn_threshold_up", 0.0), 4),
-            "expected_low": round(expected_range.get("expected_low", 0.0), 2),
-            "expected_high": round(expected_range.get("expected_high", 0.0), 2),
-            "cost_basis": round(cost_basis, 4),
-            "fill_price": limit_price,
-            "edge": round(decision.edge, 4),
-        }
-
-        trade_record = {
-            "type": "limit_order",
-            "ts": now_iso,
-            "market_slug": snapshot.market_slug,
-            "side": side_label,
-            "price": limit_price,
-            "shares": shares,
-            "cost_est": round(cost_est, 2),
-            "edge": round(decision.edge, 4),
-            "signal_reason": decision.reason,
-            "bankroll_before": round(self.bankroll, 2),
-            "chainlink_price": round(snapshot.chainlink_price, 2),
-            "signal_trigger_ts_ms": int(self.ctx.get("_signal_trigger_ts_ms", 0) or 0),
-            **model_snapshot,
-            **self._latency_log_fields(),
-        }
-
+        # Dry-run path is not on the network critical path — keep heavy
+        # logging inline so we still get full trade_record output.
         if self.dry_run:
-            trade_record["dry_run"] = True
-            trade_record["status"] = "dry_run"
-            self._log(trade_record)
-            self._event(
-                f"[DRY RUN] Would place limit: BUY {side_label} "
-                f"{shares:.1f}sh @ {limit_price:.4f} (${cost_est:.2f})"
-                f" | BTC: ${snapshot.chainlink_price:,.2f}"
-            )
-            # Simulate resting order in dry run
-            self.bankroll -= cost_est
-            self.signal.bankroll = self.bankroll
-            self.open_orders.append({
-                "order_id": f"dry_{side_label}_{int(now_unix)}",
-                "side": side_label,
-                "price": limit_price,
-                "shares": shares,
-                "cost_est": cost_est,
-                "market_slug": snapshot.market_slug,
-                "placed_ts": now_iso,
-                "placed_ts_unix": now_unix,
-                "time_remaining_s": snapshot.time_remaining_s,
-                "chainlink_price": snapshot.chainlink_price,
-                "window_start_price": snapshot.window_start_price,
-                "model_snapshot": model_snapshot,
-                "edge_at_place": round(decision.edge, 4),
-            })
+            self._dry_run_limit_order(snapshot, decision, side_label, limit_price, shares, cost_est)
             return
 
         # 2026-04-09: API 425 "service not ready" backoff. After a 425
         # response Polymarket needs ~5-10s before accepting more orders.
-        # Without backoff the bot was firing 4+ identical orders in the
-        # same second, all rejected. self._service_unavailable_until is
-        # a unix timestamp; if now < that ts, skip this placement entirely.
-        now_ts = _time.time()
         backoff_until = getattr(self, "_service_unavailable_until", 0.0)
+        now_ts = _time.time()
         if now_ts < backoff_until:
-            remaining = backoff_until - now_ts
-            trade_record["status"] = "skipped_backoff"
-            trade_record["error"] = f"service backoff ({remaining:.1f}s remaining)"
-            self._log(trade_record)
+            self._log_skipped_backoff(snapshot, decision, side_label, limit_price, shares, cost_est, backoff_until - now_ts)
             return
 
-        # Place GTC limit order via Rust OrderClient (single call: sign + HTTP/2 POST)
+        # ─── HOT PATH: do nothing but capture primitives + send order ─────
+        trigger_ts_ms = int(self.ctx.get("_signal_trigger_ts_ms", 0) or 0)
+        post_start_ms = int(_time.time() * 1000)
         try:
-            post_start_ms = int(_time.time() * 1000)
             resp = self.client.place_order(token_id, limit_price, shares, "BUY", "GTC", 1000)
-            post_done_ms = int(_time.time() * 1000)
         except Exception as exc:
-            trade_record["status"] = "error"
-            trade_record["error"] = str(exc)
-            self._log(trade_record)
-            self._event(f"[LIMIT ORDER ERROR] {exc}")
-            # Detect "service not ready" / 425 in error message and arm backoff
-            err_str = str(exc).lower()
-            if "service not ready" in err_str or "425" in err_str:
-                self._service_unavailable_until = _time.time() + 10.0
-                self._event(f"[LIMIT] Service not ready — backoff 10s")
+            post_done_ms = int(_time.time() * 1000)
+            self._log_limit_order_exception(
+                snapshot, decision, side_label, limit_price, shares, cost_est,
+                exc, trigger_ts_ms, post_start_ms, post_done_ms,
+            )
             return
+        post_done_ms = int(_time.time() * 1000)
+        # ─── HOT PATH END ─────────────────────────────────────────────────
+
+        # Build trade_record + model_snapshot now that the network call is done.
+        # Reads from self.ctx are safe: signal_ticker for this tracker is
+        # paused inside asyncio.to_thread until evaluate() returns.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        now_unix = _time.time()
+        model_snapshot = self._build_model_snapshot(snapshot, decision, side_label, limit_price)
+        trade_record = self._build_limit_trade_record(
+            snapshot, decision, side_label, limit_price, shares, cost_est,
+            now_iso, model_snapshot, trigger_ts_ms,
+        )
 
         success = resp.get("success", False)
         order_id = resp.get("orderID") or resp.get("id", "")
@@ -493,7 +598,6 @@ class OrderMixin:
         trade_record["success"] = success
         trade_record["response"] = resp
         trade_record["order_post_ms"] = post_done_ms - post_start_ms
-        trigger_ts_ms = int(self.ctx.get("_signal_trigger_ts_ms", 0) or 0)
         if trigger_ts_ms > 0:
             trade_record["signal_to_post_ms"] = max(0, post_start_ms - trigger_ts_ms)
             trade_record["signal_to_ack_ms"] = max(0, post_done_ms - trigger_ts_ms)

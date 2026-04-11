@@ -96,8 +96,18 @@ _HOURLY_VOL_MULT: dict[int, float] = {
 _DOW_VOL_MULT: dict[int, float] = {
     0: 1.36, 1: 1.19, 2: 1.41, 3: 1.21, 4: 0.90, 5: 0.46, 6: 0.59,
 }
-# Global mean sigma (per 1-second non-zero return) across all BTC data.
-_GLOBAL_MEAN_SIGMA: float = 8.9e-05
+# Global mean sigma. Empirical 90s-rolling Yang-Zhang median across btc_5m
+# and btc_15m parquets (measured 2026-04-11 on ~300 windows/market at tau 50,
+# 150, 250): p50 ≈ 3.5e-5, p25 ≈ 2.1e-5, p75 ≈ 5.3e-5, mean ≈ 4.2e-5.
+# The old 8.9e-5 value (from the 2025 code) was derived from daily σ ÷ √86400
+# — i.e. a long-horizon estimator — which overstates the 90s realized vol
+# the signal actually uses by ~2.5×. When the time-prior is invoked (first
+# ~15s of a window before Yang-Zhang has enough bars), returning 8.9e-5 ×
+# hour/dow multipliers produced priors in the 3-18e-5 range, with most hours
+# well above the empirical median. Replaced with the empirical mean (4.2e-5)
+# so the prior roughly matches what the signal will converge to once it has
+# real history. This is Test #1 from the 2026-04-11 calibration audit.
+_GLOBAL_MEAN_SIGMA: float = 4.2e-05
 
 # Per-market overrides loaded lazily from data/<subdir>/hourly_priors.json.
 # Keyed by data_subdir (e.g. "btc_15m"). Populated on first call to

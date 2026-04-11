@@ -581,6 +581,16 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 f"@ {order_price:.4f} (${fill_cost:.2f}, fee=${fee:.2f}) "
                 f"edge={dec.edge:.4f}"
             )
+            # p_model_raw and _stale_fair_up are ALWAYS P(UP). For DOWN bets
+            # the bettor's-side probability is 1 - P(UP). Log both the raw
+            # up-side values and the correctly-flipped side-relative values
+            # so downstream analysis can't mistake one for the other.
+            # (2026-04-11 bug: prior version logged raw P(UP) as "p_model"
+            # for both sides, silently corrupting DOWN-side calibration.)
+            _p_up_raw = float(self.ctx.get("_p_model_raw", 0) or 0)
+            _fair_up = float(self.ctx.get("_stale_fair_up", 0) or 0)
+            _p_side = _p_up_raw if side_label == "UP" else 1.0 - _p_up_raw
+            _fair_side = _fair_up if side_label == "UP" else 1.0 - _fair_up
             self._log({
                 "type": "taker_fill",
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -590,8 +600,10 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 "cost_usd": round(fill_cost, 2),
                 "fee": round(fee, 4),
                 "edge": round(dec.edge, 4),
-                "p_model": round(self.ctx.get("_p_model_raw", 0), 4),
-                "fair_value": round(self.ctx.get("_stale_fair_up", 0), 4),
+                "p_up": round(_p_up_raw, 4),
+                "p_side": round(_p_side, 4),
+                "fair_value_up": round(_fair_up, 4),
+                "fair_value_side": round(_fair_side, 4),
                 "order_type": order_type,
                 "is_maker": is_maker,
                 "tau": round(snapshot.time_remaining_s, 0),
@@ -644,6 +656,13 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 f"@ {ask_price:.4f} (${fill_cost:.2f}) "
                 f"in {post_done - post_start}ms"
             )
+            # Log full model state for calibration analysis. p_up/fair_value_up
+            # are raw P(UP); p_side/fair_value_side are correctly flipped for
+            # DOWN bets (see 2026-04-11 calibration audit bug fix).
+            _p_up_raw = float(self.ctx.get("_p_model_raw", 0) or 0)
+            _fair_up = float(self.ctx.get("_stale_fair_up", 0) or 0)
+            _p_side = _p_up_raw if side_label == "UP" else 1.0 - _p_up_raw
+            _fair_side = _fair_up if side_label == "UP" else 1.0 - _fair_up
             self._log({
                 "type": "taker_fill",
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -654,6 +673,14 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 "cost_usd": round(fill_cost, 2),
                 "fee": round(fee, 4),
                 "edge": round(dec.edge, 4),
+                "p_up": round(_p_up_raw, 4),
+                "p_side": round(_p_side, 4),
+                "fair_value_up": round(_fair_up, 4),
+                "fair_value_side": round(_fair_side, 4),
+                "order_type": order_type,
+                "is_maker": is_maker,
+                "tau": round(snapshot.time_remaining_s, 0),
+                "binance_mid": round(self.ctx.get("_binance_mid", 0) or 0, 2),
                 "order_post_ms": post_done - post_start,
             })
         else:

@@ -2292,6 +2292,16 @@ class DiffusionSignal(Signal):
         ctx["_dyn_threshold_up"] = self.stale_threshold
         ctx["_dyn_threshold_down"] = self.stale_threshold
 
+        # ── Sanity gate: if model disagrees with market by > 15 cents,
+        # the model is probably wrong (sigma too low → z capped →
+        # overconfident fair value). Real stale-quote dislocations are
+        # 3-10 cents. Anything above 15c is model error, not a stale book.
+        MAX_PLAUSIBLE_EDGE = 0.15
+        if edge_up > MAX_PLAUSIBLE_EDGE:
+            edge_up = 0.0  # suppress — model is overconfident
+        if edge_down > MAX_PLAUSIBLE_EDGE:
+            edge_down = 0.0
+
         # ── Fire on the side with better edge (if above threshold) ────
         up_dec = flat
         down_dec = flat

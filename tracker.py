@@ -507,10 +507,12 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             self._bucket_flat_reason("max_trades_per_window")
             return Decision("FLAT", 0.0, 0.0, "max_trades_per_window")
 
-        # Don't stack at the same price — if we already hold a position
-        # on this side at a similar price, skip. Only add a new position
-        # if the price has moved significantly (2+ cents) since the last
-        # fill on this side, indicating a NEW dislocation not the same one.
+        # Get ask price for this side (needed by stacking check below)
+        ask_price = snapshot.best_ask_up if side_label == "UP" else snapshot.best_ask_down
+        if ask_price is None or ask_price <= 0 or ask_price >= 1:
+            return Decision("FLAT", 0.0, 0.0, "no_ask")
+
+        # Don't stack at the same price
         for fill in self.pending_fills:
             if fill["side"] == side_label:
                 last_entry = fill.get("cost_usd", 0) / max(fill.get("shares", 1), 1)
@@ -518,18 +520,9 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                     return Decision("FLAT", 0.0, 0.0,
                         f"same_price_stack ({side_label} already @ {last_entry:.2f})")
 
-        # Cooldown
-        # Cooldown between taker fills — don't fire 5 identical trades
-        # in 10 seconds. 30s gives time for the book to reprice or for
-        # the dislocation to resolve. If it persists, the next fill
-        # happens at a potentially different price (new dislocation).
+        # Cooldown between taker fills
         if hasattr(self, '_last_taker_ts') and (now - self._last_taker_ts) < 30.0:
             return Decision("FLAT", 0.0, 0.0, "taker_cooldown")
-
-        # Get ask price for this side
-        ask_price = snapshot.best_ask_up if side_label == "UP" else snapshot.best_ask_down
-        if ask_price is None or ask_price <= 0 or ask_price >= 1:
-            return Decision("FLAT", 0.0, 0.0, "no_ask")
 
         # Size: use decision size, convert to shares at ask
         shares = round(dec.size_usd / ask_price, 1)

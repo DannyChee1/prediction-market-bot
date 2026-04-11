@@ -2263,8 +2263,13 @@ class DiffusionSignal(Signal):
 
         delta = (binance_mid - wsp) / wsp
         z_raw = delta / (sigma_per_s * math.sqrt(tau))
-        z = max(-3.0, min(3.0, z_raw))
-        fair_up = norm_cdf(z)
+        z = max(-self.max_z, min(self.max_z, z_raw))
+        # Use the configured tail model (kou, student_t, normal, etc.)
+        # instead of hardcoded norm_cdf. Kou jump-diffusion accounts for
+        # fat tails in crypto returns which makes the fair value more
+        # accurate at extreme z-scores.
+        ctx["_sigma_per_s"] = sigma_per_s
+        fair_up = self._model_cdf(z, ctx)
         fair_down = 1.0 - fair_up
 
         ctx["_z_raw"] = z_raw

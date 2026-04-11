@@ -2281,6 +2281,22 @@ class DiffusionSignal(Signal):
         ctx["_stale_fair_down"] = fair_down
         ctx["_p_display_fresh"] = True
 
+        # ── Model sanity check: if the model's fair value diverges too
+        # far from the market mid, it's the model that's wrong (sigma
+        # underestimated), not the market being stale. Same gate as the
+        # diffusion model's max_model_market_disagreement.
+        bid_up = snapshot.best_bid_up
+        bid_down = snapshot.best_bid_down
+        if bid_up is not None and ask_up is not None and bid_up > 0:
+            mid_up = (bid_up + ask_up) / 2.0
+            disagreement = abs(fair_up - mid_up)
+            if self.max_model_market_disagreement < 1.0 and disagreement > self.max_model_market_disagreement:
+                reason = (f"model-market disagreement "
+                          f"(|fair={fair_up:.2f} - mid={mid_up:.2f}|="
+                          f"{disagreement:.2f} > {self.max_model_market_disagreement:.2f})")
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+
         # ── Edge calculation (taker: buy at ask, pay fee) ─────────────
         fee_up = poly_fee(ask_up)       # taker fee on UP contract
         fee_down = poly_fee(ask_down)   # taker fee on DOWN contract
@@ -2291,16 +2307,6 @@ class DiffusionSignal(Signal):
         ctx["_edge_down"] = edge_down
         ctx["_dyn_threshold_up"] = self.stale_threshold
         ctx["_dyn_threshold_down"] = self.stale_threshold
-
-        # ── Sanity gate: if model disagrees with market by > 15 cents,
-        # the model is probably wrong (sigma too low → z capped →
-        # overconfident fair value). Real stale-quote dislocations are
-        # 3-10 cents. Anything above 15c is model error, not a stale book.
-        MAX_PLAUSIBLE_EDGE = 0.15
-        if edge_up > MAX_PLAUSIBLE_EDGE:
-            edge_up = 0.0  # suppress — model is overconfident
-        if edge_down > MAX_PLAUSIBLE_EDGE:
-            edge_down = 0.0
 
         # ── Fire on the side with better edge (if above threshold) ────
         up_dec = flat

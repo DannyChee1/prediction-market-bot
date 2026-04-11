@@ -1410,9 +1410,12 @@ def _build_tracker(
                   if args.max_trades_per_window is not None
                   else config.max_trades_per_window)
 
-    # Shared trades log and state file (named after base asset, not timeframe)
-    trades_log = Path(f"live_trades_{base_market}.jsonl")
-    state_file = Path(f"live_state_{base_market}.json")
+    # Shared trades log and state file (named after base asset, not timeframe).
+    # The --label CLI flag appends a suffix so two concurrent instances
+    # don't collide (e.g. --label arb produces live_trades_btc_arb.jsonl).
+    label_suffix = f"_{args.label}" if args.label else ""
+    trades_log = Path(f"live_trades_{base_market}{label_suffix}.jsonl")
+    state_file = Path(f"live_state_{base_market}{label_suffix}.json")
 
     # Stale-quote sniper mode (opt-in via CLI)
     signal_kw["stale_quote_mode"] = args.stale_quote
@@ -1682,7 +1685,15 @@ def main():
                         help="Lookback (s) for contract mid vol (default: 60)")
 
     parser.add_argument("--no-record", action="store_true",
-                        help="Disable integrated parquet recording")
+                        help="Disable integrated parquet recording. Use this when "
+                             "running a second instance alongside the main bot — "
+                             "without it, both instances race to write the same "
+                             "data/{market}/{slug}.parquet file and corrupt it.")
+    parser.add_argument("--label", type=str, default="",
+                        help="Suffix appended to trades/state file names so two "
+                             "concurrent instances don't collide. Example: "
+                             "--label arb produces live_trades_btc_arb.jsonl and "
+                             "live_state_btc_arb.json.")
     parser.add_argument("--no-binance", action="store_true",
                         help="Disable Binance feed (use when another process already connects "
                              "to the same symbol, e.g. dashboard + recorder running together)")
@@ -1776,7 +1787,11 @@ def main():
 
     bankroll = args.bankroll
     saved = None
-    state_file = Path(f"live_state_{base_market}.json")
+    # Use the same label suffix as the trades log so concurrent instances
+    # don't share state. Both --label and the suffix logic mirror the
+    # block above.
+    _label_suffix = f"_{args.label}" if args.label else ""
+    state_file = Path(f"live_state_{base_market}{_label_suffix}.json")
     if args.resume:
         saved = LiveTradeTracker.load_state(state_file)
         if saved:

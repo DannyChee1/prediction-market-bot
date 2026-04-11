@@ -487,8 +487,10 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             self._bucket_flat_reason(reason)
             return self.last_decision
 
-        # Position limits
-        if self.position_count >= (1 if getattr(self.signal, "stale_quote_mode", False) else self.max_positions):
+        # Position limits — use max_positions from config/CLI.
+        # Previously stale-quote hardcoded to 1, but the user wants
+        # multiple positions per window (buy more as dislocations recur).
+        if self.position_count >= self.max_positions:
             self._bucket_flat_reason("max_positions")
             return Decision("FLAT", 0.0, 0.0, "max_positions")
 

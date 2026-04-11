@@ -445,7 +445,187 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             )
             return self.last_decision
 
+        # Stale-quote mode uses taker (FOK) execution — fill instantly at the
+        # ask or don't fill at all. No resting orders, no cancel races, no
+        # adverse selection. Regular mode uses maker (GTC limit at bid).
+        if getattr(self.signal, "stale_quote_mode", False):
+            return self._execute_taker(snapshot, up_token, down_token, up_dec, down_dec)
         return self._evaluate_maker(snapshot, up_token, down_token, up_dec, down_dec)
+
+    def _execute_taker(
+        self,
+        snapshot: Snapshot,
+        up_token: str,
+        down_token: str,
+        up_dec: Decision,
+        down_dec: Decision,
+    ) -> Decision:
+        """Taker execution for stale-quote mode: FOK at the ask, instant fill.
+
+        Instead of posting a GTC limit that rests in the book (maker),
+        this sends a FOK order that either fills immediately at the current
+        ask or is rejected. No resting orders, no cancel races, no adverse
+        selection. Pays the 7.2% taker fee.
+        """
+        now = _time.time()
+
+        # Pick the side with better edge
+        dec = None
+        token = ""
+        side_label = ""
+        if up_dec.action != "FLAT" and up_dec.size_usd > 0:
+            if down_dec.action != "FLAT" and down_dec.edge > up_dec.edge:
+                dec, token, side_label = down_dec, down_token, "DOWN"
+            else:
+                dec, token, side_label = up_dec, up_token, "UP"
+        elif down_dec.action != "FLAT" and down_dec.size_usd > 0:
+            dec, token, side_label = down_dec, down_token, "DOWN"
+
+        if dec is None:
+            reason = up_dec.reason or down_dec.reason or "no edge"
+            self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
+            self._bucket_flat_reason(reason)
+            return self.last_decision
+
+        # Position limits
+        if self.position_count >= (1 if getattr(self.signal, "stale_quote_mode", False) else self.max_positions):
+            self._bucket_flat_reason("max_positions")
+            return Decision("FLAT", 0.0, 0.0, "max_positions")
+
+        if self.window_trade_count >= self.max_trades_per_window:
+            self._bucket_flat_reason("max_trades_per_window")
+            return Decision("FLAT", 0.0, 0.0, "max_trades_per_window")
+
+        # Cooldown
+        if hasattr(self, '_last_taker_ts') and (now - self._last_taker_ts) < 5.0:
+            return Decision("FLAT", 0.0, 0.0, "taker_cooldown")
+
+        # Get ask price for this side
+        ask_price = snapshot.best_ask_up if side_label == "UP" else snapshot.best_ask_down
+        if ask_price is None or ask_price <= 0 or ask_price >= 1:
+            return Decision("FLAT", 0.0, 0.0, "no_ask")
+
+        # Size: use decision size, convert to shares at ask
+        shares = round(dec.size_usd / ask_price, 1)
+        if shares < self.min_order_shares:
+            shares = self.min_order_shares
+        cost_est = shares * ask_price
+        if cost_est > self.bankroll:
+            return Decision("FLAT", 0.0, 0.0, "insufficient_bankroll")
+
+        self.last_decision = dec
+
+        if self.dry_run:
+            # Simulate instant fill in dry run
+            fee = 0.072 * min(ask_price, 1 - ask_price) * shares
+            fill_cost = cost_est + fee
+            self.bankroll -= fill_cost
+            self.signal.bankroll = self.bankroll
+            self.pending_fills.append({
+                "market_slug": snapshot.market_slug,
+                "side": side_label,
+                "cost_usd": round(fill_cost, 2),
+                "shares": round(shares, 2),
+                "fee": round(fee, 4),
+                "order_id": f"dry-taker-{int(now*1000)}",
+                "entry_ts": now,
+                "fill_ts_unix": now,
+                "time_remaining_s": snapshot.time_remaining_s,
+                "chainlink_price": snapshot.chainlink_price,
+                "window_start_price": snapshot.window_start_price,
+            })
+            self.window_trade_count += 1
+            self.position_count += 1
+            self._record_window_fill_side(side_label)
+            self._last_taker_ts = now
+            self._event(
+                f"[TAKER FILL] {side_label} {shares:.1f}sh "
+                f"@ {ask_price:.4f} (${fill_cost:.2f}, fee=${fee:.2f})"
+            )
+            self._log({
+                "type": "taker_fill",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "side": side_label,
+                "price": ask_price,
+                "shares": round(shares, 2),
+                "cost_usd": round(fill_cost, 2),
+                "fee": round(fee, 4),
+                "edge": round(dec.edge, 4),
+                "p_model": round(self.ctx.get("_p_model_raw", 0), 4),
+            })
+            return dec
+
+        # Live: place FOK order at the ask
+        try:
+            post_start = int(_time.time() * 1000)
+            resp = self.client.place_order(
+                token, ask_price, shares, "BUY", "FOK", 0
+            )
+            post_done = int(_time.time() * 1000)
+        except Exception as exc:
+            self._event(f"[TAKER ERROR] {exc}")
+            return Decision("FLAT", 0.0, 0.0, f"taker_error: {exc}")
+
+        success = resp.get("success", False)
+        status = str(resp.get("status", "")).upper()
+        order_id = resp.get("orderID") or resp.get("id", "")
+
+        if success and status == "MATCHED":
+            taking = resp.get("takingAmount")
+            fill_cost = float(taking) if taking else cost_est
+            fee = 0.072 * min(ask_price, 1 - ask_price) * shares
+            self.bankroll -= fill_cost
+            self.signal.bankroll = self.bankroll
+            self.pending_fills.append({
+                "market_slug": snapshot.market_slug,
+                "side": side_label,
+                "cost_usd": round(fill_cost, 2),
+                "shares": round(shares, 2),
+                "fee": round(fee, 4),
+                "order_id": order_id,
+                "entry_ts": _time.time(),
+                "fill_ts_unix": _time.time(),
+                "time_remaining_s": snapshot.time_remaining_s,
+                "chainlink_price": snapshot.chainlink_price,
+                "window_start_price": snapshot.window_start_price,
+            })
+            self.window_trade_count += 1
+            self.position_count += 1
+            self._record_window_fill_side(side_label)
+            self._last_taker_ts = now
+            self._event(
+                f"[TAKER FILL] {side_label} {shares:.1f}sh "
+                f"@ {ask_price:.4f} (${fill_cost:.2f}) "
+                f"in {post_done - post_start}ms"
+            )
+            self._log({
+                "type": "taker_fill",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "order_id": order_id,
+                "side": side_label,
+                "price": ask_price,
+                "shares": round(shares, 2),
+                "cost_usd": round(fill_cost, 2),
+                "fee": round(fee, 4),
+                "edge": round(dec.edge, 4),
+                "order_post_ms": post_done - post_start,
+            })
+        else:
+            # FOK rejected — liquidity was taken by someone else
+            self._event(
+                f"[TAKER MISSED] {side_label} {shares:.1f}sh "
+                f"@ {ask_price:.4f} — {status}"
+            )
+            self._log({
+                "type": "taker_missed",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "side": side_label,
+                "price": ask_price,
+                "shares": round(shares, 2),
+                "status": status,
+            })
+
+        return dec
 
     def _evaluate_maker(
         self,

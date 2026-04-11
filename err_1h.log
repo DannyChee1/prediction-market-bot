@@ -1,0 +1,24 @@
+[OrderClient] warmup OK for 53323501762560968618244800471891671606689085370255649660581800727426462575408: tick_size=0.01, neg_risk=false
+[OrderClient] warmup OK for 115833756753460093765934315925789875570698979583646589415674863405309964174: tick_size=0.01, neg_risk=false
+[OrderClient] warmup OK for 41161771727694015762437001174542073265714208963842758866405252373244411507445: tick_size=0.01, neg_risk=false
+[OrderClient] warmup OK for 94845139987593039941646511554979587620647460301485159931834903201882515970605: tick_size=0.01, neg_risk=false
+[BookFeed] no data for 30s, reconnecting
+[OrderClient] warmup OK for 79245661995894422182717610256619276214769665956820160463352563038044919315534: tick_size=0.01, neg_risk=false
+[OrderClient] warmup OK for 79660296441486983050348678911603893098335007390656154277101573340170733395773: tick_size=0.01, neg_risk=false
+[BookFeed] no data for 30s, reconnecting
+[OrderClient] warmup OK for 75081833126331592284439569249231173274411690374057381158085455681823945348071: tick_size=0.01, neg_risk=false
+[OrderClient] warmup OK for 107722897908654308014177469007114365861968190099981973021220952295421538696131: tick_size=0.01, neg_risk=false
+[BookFeed] read error: WebSocket protocol error: Connection reset without closing handshake
+[BookFeed] read error: WebSocket protocol error: Connection reset without closing handshake
+[OrderClient] warmup OK for 73837156847816417547787933430187243975375342154575897815418408828249933945018: tick_size=0.01, neg_risk=false
+[OrderClient] warmup OK for 111591538763259338719466770048527286397480292856569847189246783069912037169001: tick_size=0.01, neg_risk=false
+[BookFeed] read error: WebSocket protocol error: Connection reset without closing handshake
+[BookFeed] no data for 30s, reconnecting
+[BookFeed] read error: WebSocket protocol error: Connection reset without closing handshake
+[OrderClient] warmup OK for 112682014983164328515070353588162232975676468645733419984346333885631720641024: tick_size=0.01, neg_risk=false
+[OrderClient] warmup OK for 5703517880241179631691052228894908837700847052688246490771859301470518891058: tick_size=0.01, neg_risk=false
+[BookFeed] read error: WebSocket protocol error: Connection reset without closing handshake
+[BookFeed] no data for 30s, reconnecting
+[OrderClient] warmup OK for 28458726922726122641796968088474998933810061091787706504229219982694617493258: tick_size=0.01, neg_risk=false
+[OrderClient] warmup OK for 6789739740574810325548708276079004988572426545662442618746969207282785280372: tick_size=0.01, neg_risk=false
+[BookFeed] read error: WebSocket protocol error: Connection reset without closing handshake

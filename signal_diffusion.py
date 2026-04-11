@@ -2236,11 +2236,48 @@ class DiffusionSignal(Signal):
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
-        # ── Volatility ───────────────────────────────────────────────
-        raw_sigma = self._compute_vol(
-            hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
-        )
-        sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
+        # ── Volatility (EWMA + rate limiter for stale-quote) ─────────
+        # Yang-Zhang was designed for daily bars with overnight gaps.
+        # Its var_oc component is meaningless on continuous BTC, and with
+        # only 18 bars in a 90s window, adding/removing a single bar
+        # shifts sigma 30-40%. EWMA (lambda=0.90) is inherently smooth:
+        # each observation has 10% weight, no cliff effects, 25-39%
+        # lower forecast MSE than YZ (validated in scripts/).
+        #
+        # The 5%/tick rate limiter prevents residual oscillation while
+        # still allowing sigma to double in ~14 seconds for real regime
+        # changes (e.g., flash crash).
+        _EWMA_LAMBDA = 0.90
+        _MAX_SIGMA_CHANGE_PCT = 0.05  # max 5% change per tick
+
+        # Compute EWMA sigma from log returns
+        if len(hist) >= 2:
+            # Get the most recent log return
+            if hist[-1] > 0 and hist[-2] > 0:
+                log_ret = math.log(hist[-1] / hist[-2])
+            else:
+                log_ret = 0.0
+
+            prev_var = ctx.get("_stale_ewma_var", log_ret ** 2)
+            new_var = _EWMA_LAMBDA * prev_var + (1 - _EWMA_LAMBDA) * (log_ret ** 2)
+            ctx["_stale_ewma_var"] = new_var
+            raw_sigma = math.sqrt(max(new_var, 0.0))
+        else:
+            raw_sigma = 0.0
+
+        # Apply floor
+        raw_sigma = max(raw_sigma, self.min_sigma)
+
+        # Rate limiter: cap change to ±5% per tick
+        prev_sigma = ctx.get("_stale_sigma_prev")
+        if prev_sigma is not None and prev_sigma > 0:
+            max_up = prev_sigma * (1 + _MAX_SIGMA_CHANGE_PCT)
+            max_down = prev_sigma * (1 - _MAX_SIGMA_CHANGE_PCT)
+            sigma_per_s = max(max_down, min(max_up, raw_sigma))
+        else:
+            sigma_per_s = raw_sigma
+        ctx["_stale_sigma_prev"] = sigma_per_s
+
         if sigma_per_s == 0.0:
             reason = "zero vol"
             return (Decision("FLAT", 0.0, 0.0, reason),

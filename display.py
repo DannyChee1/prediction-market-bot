@@ -122,12 +122,18 @@ def _render_section(
             )
         lines.append(f"  Time: {time_str}{window_str}")
 
-    # Per-window start price + delta
+    # Per-window start price + delta (show BOTH Chainlink and Binance)
     if window_start_price is not None:
         delta_str = ""
         if price is not None:
             delta = price - window_start_price
-            delta_str = f"  (delta: ${delta:+,.2f})"
+            delta_str = f"  (CL delta: ${delta:+,.2f}"
+            # Show Binance delta too — this is what the model actually uses
+            bn_mid = tracker.ctx.get("_binance_mid")
+            if bn_mid and bn_mid > 0:
+                bn_delta = bn_mid - window_start_price
+                delta_str += f", BN delta: ${bn_delta:+,.2f}"
+            delta_str += ")"
         lines.append(f"  Start: ${window_start_price:>12,.2f}{delta_str}")
 
     # Book BBO (compact single line) — tag with STALE indicator if the

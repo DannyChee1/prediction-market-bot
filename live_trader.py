@@ -1404,6 +1404,22 @@ def _build_tracker(
         requote_cooldown = 2.0
         exit_min_hold = 10.0
         exit_min_remaining = 20.0
+    else:
+        # 15m markets (the default branch — no _5m / _1h suffix).
+        # 2026-04-11: vol_lookback bumped from class default (90s) → 240s
+        # after the empirical sigma-lookback study on 2000 btc 15m windows
+        # showed 240s wins by log-MAE at every forecast horizon (60s, 120s,
+        # 300s). 180s is a close second; 240s edges it at the 120s/300s
+        # horizons which matter most for 15m windows.
+        # Findings: tasks/findings/sigma_lookback_research_2026-04-11.md
+        # Per-cell sample size is ~7,900 forecasts — statistically robust.
+        signal_kw["vol_lookback_s"] = 240
+        # maker_warmup bumped class default (100s) → 120s so the σ
+        # estimator has at least half its lookback worth of data before
+        # any trades fire. 120s of a 900s window = 13% — still leaves
+        # ~13 minutes of trading time.
+        signal_kw["maker_warmup_s"] = 120.0
+        signal_kw["maker_withdraw_s"] = maker_withdraw
 
     # Per-market max_trades_per_window (from config), CLI overrides
     max_trades = (args.max_trades_per_window

@@ -443,6 +443,35 @@ class BacktestEngine:
             if self.max_trades_per_window is not None and len(results) >= self.max_trades_per_window:
                 break
 
+            # Stale-quote sniper: taker mode, no warmup/withdraw.
+            # Check BEFORE maker_mode so --stale-quote takes priority.
+            stale_mode = getattr(self.signal, "stale_quote_mode", False)
+            if stale_mode and hasattr(self.signal, "decide_stale_quote"):
+                up_dec, down_dec = self.signal.decide_stale_quote(snap, ctx)
+                for decision in [up_dec, down_dec]:
+                    if decision.action != "FLAT" and decision.size_usd > 0:
+                        if self.max_trades_per_window is not None and len(results) >= self.max_trades_per_window:
+                            break
+                        side_label = "UP" if "UP" in decision.action else "DOWN"
+                        opposite = "DOWN" if side_label == "UP" else "UP"
+                        if opposite in filled_sides:
+                            continue
+                        # Taker fill: walk the ask book (FOK path)
+                        fill = self._execute_fill(snap, decision, ctx)
+                        if fill is not None:
+                            filled_sides.add(side_label)
+                            results.append(self._resolve_fill(fill, outcome_up, final_btc))
+                            self.bankroll += results[-1].pnl
+                            if hasattr(self.signal, "bankroll"):
+                                self.signal.bankroll = self.bankroll
+                            last_fill_ts = snap.ts_ms
+                            ctx["window_trade_count"] = ctx.get("window_trade_count", 0) + 1
+                            if "UP" in decision.action:
+                                ctx["inventory_up"] = ctx.get("inventory_up", 0) + fill.shares
+                            elif "DOWN" in decision.action:
+                                ctx["inventory_down"] = ctx.get("inventory_down", 0) + fill.shares
+                continue
+
             # Maker mode: evaluate both sides independently
             if maker_mode and hasattr(self.signal, "decide_both_sides"):
                 # Enforce maker warmup (matches live bot's _evaluate_maker)
@@ -1044,6 +1073,8 @@ def build_diffusion_signal(
     filtration_model_path: str | None = None,
     market_blend_override: float | None = None,
     tail_mode_override: str | None = None,
+    stale_quote_mode: bool = False,
+    stale_threshold: float = 0.03,
 ):
     """Construct the production DiffusionSignal for a given market.
 
@@ -1210,6 +1241,8 @@ def build_diffusion_signal(
         window_duration=config.window_duration_s,
         edge_persistence_s=edge_persistence_s,
         vol_regime_mult=vol_regime_mult,
+        stale_quote_mode=stale_quote_mode,
+        stale_threshold=stale_threshold,
         **{**eth_overrides, **maker_overrides, **vamp_kw},
     )
 
@@ -1299,6 +1332,14 @@ def main():
     parser.add_argument("--queue-model", action="store_true", default=False,
                         help="Enable queue-position fill model for maker mode "
                              "(fills only when sell volume exceeds queue depth)")
+    parser.add_argument("--stale-quote", action="store_true", default=False,
+                        help="Enable stale-quote sniper mode: detect when "
+                             "Polymarket CLOB is stale relative to Binance fair "
+                             "value and buy as taker. Replaces the diffusion "
+                             "model's decide_both_sides with decide_stale_quote.")
+    parser.add_argument("--stale-threshold", type=float, default=0.03,
+                        help="Minimum fair-ask edge after fees to fire a "
+                             "stale-quote trade (default 0.03 = 3 cents)")
     args = parser.parse_args()
 
     config = get_config(args.market)
@@ -1345,6 +1386,8 @@ def main():
             tail_mode_override=args.tail_mode,
             edge_persistence_s=args.edge_persistence_s,
             vol_regime_mult=args.vol_regime_mult,
+            stale_quote_mode=args.stale_quote,
+            stale_threshold=args.stale_threshold,
         ),
         "always_up": lambda: AlwaysUp(bankroll=args.bankroll),
         "always_down": lambda: AlwaysDown(bankroll=args.bankroll),
@@ -1354,7 +1397,12 @@ def main():
     names = ["always_up", "always_down", "random", "diffusion"] \
         if args.signal == "all" else [args.signal]
 
-    mode_str = "MAKER" if args.maker else "FOK"
+    if args.stale_quote:
+        mode_str = f"STALE_QUOTE(thresh={args.stale_threshold})"
+    elif args.maker:
+        mode_str = "MAKER"
+    else:
+        mode_str = "FOK"
     if args.maker and args.queue_model:
         mode_str += "+QUEUE"
     if args.maker and args.as_haircut > 0:

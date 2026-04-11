@@ -283,6 +283,11 @@ class DiffusionSignal(Signal):
         # markets, ~10s for 15m markets. Tracks per-side first-edge
         # timestamps in ctx; resets when edge drops back below threshold.
         edge_persistence_s: float = 0.0,
+        # Stale-quote sniper mode: opt-in taker strategy that buys when
+        # the Polymarket CLOB ask is stale relative to Binance fair value.
+        # See decide_stale_quote() for the logic.
+        stale_quote_mode: bool = False,
+        stale_threshold: float = 0.03,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -390,6 +395,8 @@ class DiffusionSignal(Signal):
         self.cross_asset_min_z = cross_asset_min_z
         self.min_entry_z = min_entry_z
         self.edge_persistence_s = edge_persistence_s
+        self.stale_quote_mode = stale_quote_mode
+        self.stale_threshold = stale_threshold
 
     def _compute_vol(
         self,
@@ -2156,3 +2163,193 @@ class DiffusionSignal(Signal):
                     f"entry {cost_down:.3f} < min {self.min_entry_price:.2f}")
 
         return (up_dec, down_dec)
+
+    # ── Stale-quote sniper ─────────────────────────────────────────────
+    def decide_stale_quote(
+        self, snapshot: Snapshot, ctx: dict,
+    ) -> tuple[Decision, Decision]:
+        """Detect when the Polymarket CLOB is stale relative to Binance.
+
+        Instead of predicting direction with the diffusion model, this
+        computes Binance-derived fair value and checks whether the best
+        ask is cheaper than fair value minus taker fees.  If the edge
+        exceeds ``stale_threshold`` (default 3 cents), fire a BUY as
+        taker.
+
+        Key differences from ``decide_both_sides``:
+          - Compares fair value to best ASK (taker), not best BID (maker)
+          - Includes the 7.2% Polymarket taker fee in the edge calc
+          - No market_blend — the whole point is trusting Binance
+          - No min_entry_z gate — the z-score is implicit in fair value
+          - No filtration, A-S, OBI, or edge persistence
+          - DOES apply stale-feature gates and max_trades_per_window
+
+        Returns (up_decision, down_decision) — at most one is non-FLAT.
+        """
+        flat = Decision("FLAT", 0.0, 0.0, "")
+
+        # ── Price history (always, for vol warmup) ────────────────────
+        effective_price = ctx.get("_binance_mid") or snapshot.chainlink_price
+        hist = ctx.setdefault("price_history", [])
+        ts_hist = ctx.setdefault("ts_history", [])
+        if ctx.pop("_live_history_appended", False):
+            pass  # signal_ticker already appended this tick
+        else:
+            hist.append(effective_price)
+            ts_hist.append(snapshot.ts_ms)
+
+        if len(hist) < 2:
+            reason = f"need history ({len(hist)}s collected)"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # ── Book validation ───────────────────────────────────────────
+        ask_up = snapshot.best_ask_up
+        ask_down = snapshot.best_ask_down
+        if ask_up is None or ask_down is None:
+            reason = "missing book"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+        if ask_up <= 0 or ask_up >= 1 or ask_down <= 0 or ask_down >= 1:
+            reason = "invalid asks"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # ── Stale-feature gates (parity with decide_both_sides) ───────
+        if self.max_book_age_ms is not None:
+            book_age = ctx.get("_book_age_ms")
+            if book_age is not None and book_age > self.max_book_age_ms:
+                reason = f"stale book ({book_age:.0f}ms > {self.max_book_age_ms}ms)"
+                return (Decision("FLAT", 0.0, 0.0, reason),
+                        Decision("FLAT", 0.0, 0.0, reason))
+        stale_reason = self._check_stale_features(ctx)
+        if stale_reason is not None:
+            return (Decision("FLAT", 0.0, 0.0, stale_reason),
+                    Decision("FLAT", 0.0, 0.0, stale_reason))
+
+        self._record_book_state(snapshot, ctx)
+
+        # ── Tau ───────────────────────────────────────────────────────
+        tau = snapshot.time_remaining_s
+        if tau <= 0:
+            reason = "window expired"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # ── Volatility ───────────────────────────────────────────────
+        raw_sigma = self._compute_vol(
+            hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
+        )
+        sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
+        if sigma_per_s == 0.0:
+            reason = "zero vol"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+        ctx["_sigma_per_s"] = sigma_per_s
+
+        # ── Fair value from Binance ───────────────────────────────────
+        # Use raw Binance mid — no Chainlink blend, no market blend.
+        binance_mid = ctx.get("_binance_mid")
+        if binance_mid is None or binance_mid <= 0:
+            reason = "no binance_mid"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        wsp = snapshot.window_start_price
+        if wsp is None or wsp <= 0:
+            reason = "no window_start_price"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        delta = (binance_mid - wsp) / wsp
+        z_raw = delta / (sigma_per_s * math.sqrt(tau))
+        z = max(-3.0, min(3.0, z_raw))
+        fair_up = norm_cdf(z)
+        fair_down = 1.0 - fair_up
+
+        ctx["_z_raw"] = z_raw
+        ctx["_z"] = z
+        ctx["_tau"] = tau
+        ctx["_p_model_raw"] = fair_up
+        ctx["_p_display"] = fair_up
+
+        # ── Edge calculation (taker: buy at ask, pay fee) ─────────────
+        fee_up = poly_fee(ask_up)       # taker fee on UP contract
+        fee_down = poly_fee(ask_down)   # taker fee on DOWN contract
+        edge_up = fair_up - ask_up - fee_up
+        edge_down = fair_down - ask_down - fee_down
+
+        ctx["_edge_up"] = edge_up
+        ctx["_edge_down"] = edge_down
+        ctx["_dyn_threshold_up"] = self.stale_threshold
+        ctx["_dyn_threshold_down"] = self.stale_threshold
+
+        # ── Fire on the side with better edge (if above threshold) ────
+        up_dec = flat
+        down_dec = flat
+
+        # Pick the side with the larger edge; only one side fires per tick
+        if edge_up > self.stale_threshold and edge_up >= edge_down:
+            up_dec = self._stale_size_decision(
+                "BUY_UP", edge_up, ask_up, fair_up,
+                sigma_per_s, tau, z, z_raw,
+            )
+        elif edge_down > self.stale_threshold:
+            down_dec = self._stale_size_decision(
+                "BUY_DOWN", edge_down, ask_down, fair_down,
+                sigma_per_s, tau, z, z_raw,
+            )
+
+        # No-edge reason
+        if up_dec.action == "FLAT" and down_dec.action == "FLAT":
+            if edge_up <= self.stale_threshold and edge_down <= self.stale_threshold:
+                reason = (f"no stale edge (up={edge_up:.4f} down={edge_down:.4f} "
+                          f"thresh={self.stale_threshold:.4f})")
+                up_dec = Decision("FLAT", 0.0, 0.0, reason)
+                down_dec = Decision("FLAT", 0.0, 0.0, reason)
+
+        return (up_dec, down_dec)
+
+    def _stale_size_decision(
+        self, side: str, edge: float, ask_price: float,
+        p_side: float, sigma_per_s: float, tau: float,
+        z: float, z_raw: float,
+    ) -> Decision:
+        """Kelly sizing for stale-quote taker fills.
+
+        Simpler than ``_size_decision`` — no filtration multiplier,
+        no inventory skew, no A-S spread. The cost basis is the ask
+        price (since we're crossing the spread as taker) plus fees.
+        """
+        fee = poly_fee(ask_price)
+        eff_cost = ask_price + fee
+        if eff_cost <= 0 or eff_cost >= 1.0:
+            return Decision("FLAT", 0.0, 0.0, "eff cost out of range")
+
+        # Min entry price gate
+        if self.min_entry_price > 0 and ask_price < self.min_entry_price:
+            return Decision("FLAT", 0.0, 0.0,
+                f"entry {ask_price:.3f} < min {self.min_entry_price:.2f}")
+
+        # Half-Kelly on the edge
+        kelly_f = max(0.0, (p_side - eff_cost) / (1.0 - eff_cost))
+        frac = min(self.kelly_fraction * kelly_f, self.max_bet_fraction)
+        if frac <= 0:
+            return Decision("FLAT", 0.0, 0.0, "kelly <= 0")
+
+        size_usd = self.bankroll * frac
+        min_usd = self.min_order_shares * eff_cost
+        if size_usd < min_usd:
+            if self.bankroll >= min_usd:
+                size_usd = min_usd
+            else:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"bankroll ${self.bankroll:.2f} < min order ${min_usd:.2f}")
+
+        reason = (
+            f"STALE_QUOTE p={p_side:.4f} sig={sigma_per_s:.2e} z={z:.2f}"
+            f" tau={tau:.0f}s edge={edge:.4f} thresh={self.stale_threshold:.4f}"
+            f" ask={ask_price:.4f} fee={fee:.4f} kelly={kelly_f:.4f}"
+            f" ${size_usd:.0f}"
+        )
+        return Decision(side, edge, size_usd, reason)

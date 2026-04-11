@@ -426,7 +426,10 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.ctx["window_trade_count"] = self.window_trade_count
         self.ctx["inventory_up"] = sum(f["shares"] for f in self.pending_fills if f["side"] == "UP")
         self.ctx["inventory_down"] = sum(f["shares"] for f in self.pending_fills if f["side"] == "DOWN")
-        up_dec, down_dec = self.signal.decide_both_sides(snapshot, self.ctx)
+        if getattr(self.signal, "stale_quote_mode", False):
+            up_dec, down_dec = self.signal.decide_stale_quote(snapshot, self.ctx)
+        else:
+            up_dec, down_dec = self.signal.decide_both_sides(snapshot, self.ctx)
         self.last_up_decision = up_dec
         self.last_down_decision = down_dec
 

@@ -1379,6 +1379,10 @@ def _build_tracker(
     trades_log = Path(f"live_trades_{base_market}.jsonl")
     state_file = Path(f"live_state_{base_market}.json")
 
+    # Stale-quote sniper mode (opt-in via CLI)
+    signal_kw["stale_quote_mode"] = args.stale_quote
+    signal_kw["stale_threshold"] = args.stale_threshold
+
     signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
     tracker = LiveTradeTracker(
         client=client,
@@ -1634,6 +1638,13 @@ def main():
     parser.add_argument("--no-5m", action="store_true",
                         help="Disable 5m timeframe (only trade 15m)")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--stale-quote", action="store_true", default=False,
+                        help="Enable stale-quote sniper mode: detect when "
+                             "Polymarket CLOB is stale relative to Binance fair "
+                             "value and buy as taker.")
+    parser.add_argument("--stale-threshold", type=float, default=0.03,
+                        help="Minimum fair-ask edge after fees for stale-quote "
+                             "trades (default 0.03 = 3 cents)")
     args = parser.parse_args()
 
     # Resolve market -> list of (config_key, config) pairs

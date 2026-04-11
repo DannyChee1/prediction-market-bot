@@ -2272,6 +2272,9 @@ class DiffusionSignal(Signal):
         ctx["_tau"] = tau
         ctx["_p_model_raw"] = fair_up
         ctx["_p_display"] = fair_up
+        ctx["_stale_fair_up"] = fair_up
+        ctx["_stale_fair_down"] = fair_down
+        ctx["_p_display_fresh"] = True
 
         # ── Edge calculation (taker: buy at ask, pay fee) ─────────────
         fee_up = poly_fee(ask_up)       # taker fee on UP contract

@@ -469,6 +469,17 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         """
         now = _time.time()
 
+        # Warmup gate: sigma needs vol_lookback_s of history to be
+        # reliable. At window start with tiny sigma, z blows up and
+        # everything looks like a massive dislocation. Wait until the
+        # vol estimator has enough data.
+        tau = snapshot.time_remaining_s
+        if tau is not None and self.signal.window_duration > 0:
+            elapsed = self.signal.window_duration - tau
+            if elapsed < self.signal.vol_lookback_s:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"taker warmup ({elapsed:.0f}s < {self.signal.vol_lookback_s}s)")
+
         # Pick the side with better edge
         dec = None
         token = ""

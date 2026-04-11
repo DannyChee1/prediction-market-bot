@@ -532,7 +532,9 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             is_maker = False
 
         if self.dry_run:
-            # Simulate fill
+            # Simulate fill at the order price with realistic fee.
+            # In dry-run we assume 100% fill rate (no competition).
+            # Real live will have ~50-80% fill rate due to other bots.
             fee = 0.0 if is_maker else 0.072 * min(order_price, 1 - order_price) * shares
             fill_cost = shares * order_price + fee
             self.bankroll -= fill_cost
@@ -554,20 +556,27 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             self.position_count += 1
             self._record_window_fill_side(side_label)
             self._last_taker_ts = now
+            mode_tag = "MAKER-GTD" if is_maker else "TAKER-FOK"
             self._event(
-                f"[TAKER FILL] {side_label} {shares:.1f}sh "
-                f"@ {ask_price:.4f} (${fill_cost:.2f}, fee=${fee:.2f})"
+                f"[{mode_tag}] {side_label} {shares:.1f}sh "
+                f"@ {order_price:.4f} (${fill_cost:.2f}, fee=${fee:.2f}) "
+                f"edge={dec.edge:.4f}"
             )
             self._log({
                 "type": "taker_fill",
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "side": side_label,
-                "price": ask_price,
+                "price": order_price,
                 "shares": round(shares, 2),
                 "cost_usd": round(fill_cost, 2),
                 "fee": round(fee, 4),
                 "edge": round(dec.edge, 4),
                 "p_model": round(self.ctx.get("_p_model_raw", 0), 4),
+                "fair_value": round(self.ctx.get("_stale_fair_up", 0), 4),
+                "order_type": order_type,
+                "is_maker": is_maker,
+                "tau": round(snapshot.time_remaining_s, 0),
+                "binance_mid": round(self.ctx.get("_binance_mid", 0) or 0, 2),
             })
             return dec
 

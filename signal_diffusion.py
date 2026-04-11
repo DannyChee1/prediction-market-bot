@@ -2237,18 +2237,8 @@ class DiffusionSignal(Signal):
                     Decision("FLAT", 0.0, 0.0, reason))
 
         # ── Volatility ───────────────────────────────────────────────
-        # Use a shorter lookback for stale-quote mode: we need sigma to
-        # compute fair value, but we don't need 90-120s of history to
-        # start. 20 ticks is enough for a rough estimate, and the Kalman
-        # smoother will refine it as more data arrives.
-        min_vol_ticks = 20
-        if len(hist) < min_vol_ticks:
-            reason = f"vol warmup ({len(hist)}/{min_vol_ticks} ticks)"
-            return (Decision("FLAT", 0.0, 0.0, reason),
-                    Decision("FLAT", 0.0, 0.0, reason))
-        vol_slice = min(self.vol_lookback_s, len(hist))
         raw_sigma = self._compute_vol(
-            hist[-vol_slice:], ts_hist[-vol_slice:]
+            hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
         )
         sigma_per_s = self._smoothed_sigma(raw_sigma, ctx)
         if sigma_per_s == 0.0:

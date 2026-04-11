@@ -296,6 +296,32 @@ class DiffusionSignal(Signal):
         # See decide_stale_quote() for the logic.
         stale_quote_mode: bool = False,
         stale_threshold: float = 0.03,
+        # ── Latency arbitrage mode (2026-04-11) ──────────────────────
+        # Pure Binance-momentum-based arbitrage. Bypasses every σ/p_model
+        # path. Detects "Binance just moved by X in the last N seconds AND
+        # the Polymarket book hasn't repriced yet" and fires a FOK taker
+        # order in the direction of the move. No GBM, no Kalman, no
+        # calibration table — just speed. See decide_latency_arb() and
+        # tasks/findings/latency_arb_implementation_plan_2026-04-11.md.
+        latency_arb_mode: bool = False,
+        # Δ threshold in absolute USD ($25 ≈ 3 bps on $84k BTC)
+        arb_delta_usd: float = 25.0,
+        # Lookback window in seconds — must exceed the 1.23s Chainlink lag
+        arb_window_s: float = 2.0,
+        # Cooldown after firing — prevents double-fire on same impulse
+        arb_cooldown_s: float = 4.0,
+        # Book staleness in ms — book must be at least this old to qualify
+        arb_book_stale_ms: float = 600.0,
+        # Entry price band — avoid mid-priced contracts where Polymarket's
+        # new dynamic taker fees (up to 3.15% at 50/50) eat the edge
+        arb_min_ask: float = 0.15,
+        arb_max_ask: float = 0.85,
+        # Min remaining seconds before expiry (no end-of-window snipes)
+        arb_min_tau_s: float = 30.0,
+        # Fixed bet size in USD per arb trade
+        arb_size_usd: float = 10.0,
+        # Hard cap as fraction of bankroll for any single arb trade
+        arb_max_bankroll_frac: float = 0.15,
     ):
         self.bankroll = bankroll
         self.vol_lookback_s = vol_lookback_s
@@ -406,6 +432,17 @@ class DiffusionSignal(Signal):
         self.min_trade_sigma = float(min_trade_sigma)
         self.stale_quote_mode = stale_quote_mode
         self.stale_threshold = stale_threshold
+        # Latency arb (2026-04-11)
+        self.latency_arb_mode = bool(latency_arb_mode)
+        self.arb_delta_usd = float(arb_delta_usd)
+        self.arb_window_s = float(arb_window_s)
+        self.arb_cooldown_s = float(arb_cooldown_s)
+        self.arb_book_stale_ms = float(arb_book_stale_ms)
+        self.arb_min_ask = float(arb_min_ask)
+        self.arb_max_ask = float(arb_max_ask)
+        self.arb_min_tau_s = float(arb_min_tau_s)
+        self.arb_size_usd = float(arb_size_usd)
+        self.arb_max_bankroll_frac = float(arb_max_bankroll_frac)
 
     def _compute_vol(
         self,
@@ -2515,3 +2552,163 @@ class DiffusionSignal(Signal):
             f" ${size_usd:.0f}"
         )
         return Decision(side, edge, size_usd, reason)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Latency arbitrage (2026-04-11) — pure Binance momentum signal
+    # ─────────────────────────────────────────────────────────────────
+
+    def decide_latency_arb(
+        self, snapshot: "Snapshot", ctx: dict,
+    ) -> tuple["Decision", "Decision"]:
+        """Pure Binance-momentum-based latency arbitrage.
+
+        Detects when Binance has just moved by more than ``arb_delta_usd``
+        in the last ``arb_window_s`` seconds AND the Polymarket book has
+        not yet repriced (book_age > ``arb_book_stale_ms``). Fires a FOK
+        taker order in the direction of the move at the current Polymarket
+        ask, sized to a fixed dollar amount.
+
+        Critical design notes:
+          1. NO σ estimation. NO p_model. NO Kelly. The whole point is
+             that the signal is the Binance Δ itself; the model adds noise.
+          2. NO calm filter conflict. A $25 move in 2s implies an
+             instantaneous σ ~1.5e-4, which is 6× above the 2.5e-5 calm
+             threshold by construction.
+          3. Fee-aware. Polymarket's new dynamic taker fees go up to
+             ~3.15% at 50/50 prices. We use ``poly_fee(ask)`` (which is
+             the 7.2% × p × (1−p) formula) and require the move magnitude
+             to dominate the fee. The arb_min/max_ask band also keeps us
+             out of the most expensive mid-price zone.
+          4. The Binance ring buffer is maintained by live_trader.py
+             (NOT by this method) and exposed via ``ctx["_binance_ring"]``
+             as a list of (ts_ms, price). The buffer covers the last
+             ``arb_window_s`` seconds at sub-second resolution.
+
+        Returns (up_dec, down_dec) — at most one is non-FLAT.
+        """
+        flat = Decision("FLAT", 0.0, 0.0, "")
+
+        # ── Tau gate: no end-of-window snipes ─────────────────────
+        tau = snapshot.time_remaining_s
+        if tau is None or tau <= self.arb_min_tau_s:
+            reason = f"tau {tau:.0f}s ≤ min {self.arb_min_tau_s:.0f}s"
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # ── Cooldown: don't double-fire on the same impulse ───────
+        now_ms = snapshot.ts_ms
+        last_arb_ms = ctx.get("_arb_last_fire_ms", 0)
+        if last_arb_ms > 0 and (now_ms - last_arb_ms) < self.arb_cooldown_s * 1000:
+            cooldown_left = self.arb_cooldown_s - (now_ms - last_arb_ms) / 1000
+            return (Decision("FLAT", 0.0, 0.0, f"arb cooldown {cooldown_left:.1f}s"),
+                    Decision("FLAT", 0.0, 0.0, f"arb cooldown {cooldown_left:.1f}s"))
+
+        # ── Binance ring buffer: must be present and non-trivial ──
+        ring = ctx.get("_binance_ring")
+        if not ring or len(ring) < 2:
+            return (Decision("FLAT", 0.0, 0.0, "no binance ring"),
+                    Decision("FLAT", 0.0, 0.0, "no binance ring"))
+
+        # ── Δ over arb_window_s ───────────────────────────────────
+        cutoff_ms = now_ms - int(self.arb_window_s * 1000)
+        # Walk back to find the oldest sample in [cutoff_ms, now_ms]
+        old_price = None
+        old_ts = None
+        for ts, px in ring:
+            if ts >= cutoff_ms:
+                old_price = px
+                old_ts = ts
+                break
+        if old_price is None:
+            return (Decision("FLAT", 0.0, 0.0, "no binance sample in window"),
+                    Decision("FLAT", 0.0, 0.0, "no binance sample in window"))
+
+        cur_price = ring[-1][1]
+        cur_ts = ring[-1][0]
+        delta_usd = cur_price - old_price
+        delta_age_s = (cur_ts - old_ts) / 1000.0
+
+        if abs(delta_usd) < self.arb_delta_usd:
+            reason = (f"|Δ|=${abs(delta_usd):.2f} < ${self.arb_delta_usd:.0f} "
+                      f"(window {delta_age_s:.1f}s)")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # ── Book staleness gate ───────────────────────────────────
+        book_age_ms = ctx.get("_book_age_ms")
+        if book_age_ms is None:
+            book_age_ms = 0  # backtest path: book is fresh by definition
+        if book_age_ms < self.arb_book_stale_ms:
+            reason = (f"book fresh ({book_age_ms:.0f}ms < "
+                      f"{self.arb_book_stale_ms:.0f}ms); arb requires staleness")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # ── Pick the side ─────────────────────────────────────────
+        if delta_usd > 0:
+            side = "BUY_UP"
+            ask = snapshot.best_ask_up
+        else:
+            side = "BUY_DOWN"
+            ask = snapshot.best_ask_down
+
+        if ask is None or ask <= 0 or ask >= 1:
+            return (Decision("FLAT", 0.0, 0.0, "invalid ask"),
+                    Decision("FLAT", 0.0, 0.0, "invalid ask"))
+
+        # ── Entry band: avoid mid-priced contracts (high taker fee) ──
+        if ask < self.arb_min_ask or ask > self.arb_max_ask:
+            reason = (f"ask {ask:.3f} outside arb band "
+                      f"[{self.arb_min_ask:.2f}, {self.arb_max_ask:.2f}]")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        # ── Fee accounting (informational, not gating) ────────────
+        # Polymarket dynamic taker fee = 7.2% × p × (1−p), max ~1.8% at
+        # p=0.5. The fee is on the CONTRACT, the Δ is on BTC SPOT —
+        # different unit systems. A 4bp BTC move on a binary at 0.35
+        # implies ~30+ percentage points of probability shift (because
+        # binaries are leveraged), which dwarfs any fee. So we DON'T
+        # gate on a "Δ > fee" check (that comparison is unit-confused).
+        # Instead the gating is:
+        #   1. arb_delta_usd threshold: "the move is big enough"
+        #   2. arb_min_ask / arb_max_ask: "we're in a sane price band"
+        # The user should tune arb_delta_usd to match worst-case fees:
+        # at ask=0.50 worst-case fee is 1.8%; bumping arb_delta_usd
+        # higher demands a larger underlying move per unit fee paid.
+        fee = poly_fee(ask)
+        spot = (cur_price if cur_price > 0 else snapshot.window_start_price) or 1.0
+        delta_bps = abs(delta_usd) / spot * 10000  # informational
+        fee_bps = fee * 10000  # informational
+
+        # ── Sizing: fixed $ with bankroll cap ─────────────────────
+        size_usd = min(self.arb_size_usd,
+                       self.bankroll * self.arb_max_bankroll_frac)
+        if size_usd < self.min_order_shares * ask:
+            return (Decision("FLAT", 0.0, 0.0,
+                             f"size ${size_usd:.2f} below min order"),
+                    Decision("FLAT", 0.0, 0.0,
+                             f"size ${size_usd:.2f} below min order"))
+
+        # ── Fire ──────────────────────────────────────────────────
+        ctx["_arb_last_fire_ms"] = now_ms
+        ctx["_arb_delta_usd"] = delta_usd
+        ctx["_arb_delta_bps"] = delta_bps
+        ctx["_arb_book_age_ms"] = book_age_ms
+        ctx["_arb_fee_bps"] = fee_bps
+        # Populate display ctx so the dashboard shows what's happening
+        ctx["_p_model_raw"] = 1.0 if side == "BUY_UP" else 0.0  # not really, but the display reads this
+        ctx["_p_display"] = 1.0 if side == "BUY_UP" else 0.0
+
+        edge_proxy = (delta_bps - fee_bps) / 10000.0  # in price units, for display
+        reason = (
+            f"LATENCY_ARB Δ=${delta_usd:+.2f} ({delta_bps:+.1f}bp) "
+            f"in {delta_age_s:.1f}s book_age={book_age_ms:.0f}ms "
+            f"ask={ask:.3f} fee={fee*100:.2f}% size=${size_usd:.0f}"
+        )
+        if side == "BUY_UP":
+            return (Decision("BUY_UP", edge_proxy, size_usd, reason),
+                    Decision("FLAT", 0.0, 0.0, ""))
+        else:
+            return (Decision("FLAT", 0.0, 0.0, ""),
+                    Decision("BUY_DOWN", edge_proxy, size_usd, reason))

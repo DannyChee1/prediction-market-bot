@@ -426,7 +426,14 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.ctx["window_trade_count"] = self.window_trade_count
         self.ctx["inventory_up"] = sum(f["shares"] for f in self.pending_fills if f["side"] == "UP")
         self.ctx["inventory_down"] = sum(f["shares"] for f in self.pending_fills if f["side"] == "DOWN")
-        if getattr(self.signal, "stale_quote_mode", False):
+        # 3-way routing: latency_arb > stale_quote > regular maker.
+        # latency_arb takes precedence because it's the most selective
+        # (only fires when Binance has just moved meaningfully); when it
+        # doesn't fire we want the regular FLAT, not a stale_quote
+        # fallback that uses different math.
+        if getattr(self.signal, "latency_arb_mode", False):
+            up_dec, down_dec = self.signal.decide_latency_arb(snapshot, self.ctx)
+        elif getattr(self.signal, "stale_quote_mode", False):
             up_dec, down_dec = self.signal.decide_stale_quote(snapshot, self.ctx)
         else:
             up_dec, down_dec = self.signal.decide_both_sides(snapshot, self.ctx)
@@ -445,9 +452,10 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             )
             return self.last_decision
 
-        # Stale-quote mode uses taker (FOK) execution — fill instantly at the
-        # ask or don't fill at all. No resting orders, no cancel races, no
-        # adverse selection. Regular mode uses maker (GTC limit at bid).
+        # Latency-arb and stale-quote modes use taker (FOK) execution.
+        # Regular mode uses maker (GTC limit at bid).
+        if getattr(self.signal, "latency_arb_mode", False):
+            return self._execute_taker(snapshot, up_token, down_token, up_dec, down_dec)
         if getattr(self.signal, "stale_quote_mode", False):
             return self._execute_taker(snapshot, up_token, down_token, up_dec, down_dec)
         return self._evaluate_maker(snapshot, up_token, down_token, up_dec, down_dec)
@@ -520,8 +528,18 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                     return Decision("FLAT", 0.0, 0.0,
                         f"same_price_stack ({side_label} already @ {last_entry:.2f})")
 
-        # Cooldown between taker fills
-        if hasattr(self, '_last_taker_ts') and (now - self._last_taker_ts) < 30.0:
+        # Cooldown between taker fills.
+        #
+        # 2026-04-11: was hardcoded 30s, which is appropriate for
+        # stale-quote (slow latency-arb-via-σ approach) but BLOCKS
+        # decide_latency_arb entirely (which has its own 4s cooldown
+        # and explicitly wants to fire often). Use the signal's own
+        # cooldown when latency_arb_mode is on.
+        if getattr(self.signal, "latency_arb_mode", False):
+            taker_cooldown_s = getattr(self.signal, "arb_cooldown_s", 4.0)
+        else:
+            taker_cooldown_s = 30.0
+        if hasattr(self, '_last_taker_ts') and (now - self._last_taker_ts) < taker_cooldown_s:
             return Decision("FLAT", 0.0, 0.0, "taker_cooldown")
 
         # Size: use decision size, convert to shares at ask

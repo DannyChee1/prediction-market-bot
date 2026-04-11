@@ -148,6 +148,26 @@ async def signal_ticker(
                 else:
                     tracker.ctx.pop("_binance_mid", None)
 
+            # 2026-04-11: Binance ring buffer for decide_latency_arb.
+            # The signal needs to look at Binance prices over the last
+            # arb_window_s seconds (default 2.0). We append every fresh
+            # mid into a deque keyed on ts_ms and trim entries older than
+            # 10s. The signal walks the ring on each tick to find the
+            # oldest sample within its lookback window. Only the latency-
+            # arb path reads this; other modes ignore it.
+            if binance_state is not None:
+                ring = tracker.ctx.setdefault("_binance_ring", collections.deque(maxlen=200))
+                _bn_mid_2 = binance_state.get("mid_price")
+                _bn_ts_2 = binance_state.get("last_update_ts", 0)
+                if _bn_mid_2 and _bn_ts_2:
+                    bn_ts_ms = int(_bn_ts_2 * 1000)
+                    if not ring or ring[-1][0] != bn_ts_ms:
+                        ring.append((bn_ts_ms, float(_bn_mid_2)))
+                    # Trim entries older than 10s (relative to now)
+                    _now_ms = int(_time.time() * 1000)
+                    while ring and (_now_ms - ring[0][0]) > 10_000:
+                        ring.popleft()
+
             # Accumulate price history — but only when the effective
             # price actually changed. On calm markets the signal_ticker
             # wakes every 10ms via `wake_event` timeout even when no
@@ -1398,6 +1418,22 @@ def _build_tracker(
     signal_kw["stale_quote_mode"] = args.stale_quote
     signal_kw["stale_threshold"] = args.stale_threshold
 
+    # 2026-04-11: latency arb mode (opt-in via --latency-arb).
+    # Pure Binance-momentum-based taker arb. See decide_latency_arb in
+    # signal_diffusion.py and tasks/findings/latency_arb_implementation_plan_2026-04-11.md.
+    signal_kw["latency_arb_mode"] = args.latency_arb
+    signal_kw["arb_delta_usd"] = args.arb_delta_usd
+    signal_kw["arb_window_s"] = args.arb_window_s
+    signal_kw["arb_cooldown_s"] = args.arb_cooldown_s
+    signal_kw["arb_book_stale_ms"] = args.arb_book_stale_ms
+    signal_kw["arb_min_ask"] = args.arb_min_ask
+    signal_kw["arb_max_ask"] = args.arb_max_ask
+    signal_kw["arb_min_tau_s"] = args.arb_min_tau_s
+    signal_kw["arb_size_usd"] = args.arb_size_usd
+    if args.latency_arb and args.stale_quote:
+        print("  [WARN] Both --latency-arb and --stale-quote enabled. "
+              "Latency arb takes precedence in tracker routing.")
+
     signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
     tracker = LiveTradeTracker(
         client=client,
@@ -1660,6 +1696,33 @@ def main():
     parser.add_argument("--stale-threshold", type=float, default=0.03,
                         help="Minimum fair-ask edge after fees for stale-quote "
                              "trades (default 0.03 = 3 cents)")
+    # ── Latency arbitrage mode (2026-04-11) ──────────────────────
+    parser.add_argument("--latency-arb", action="store_true", default=False,
+                        help="Enable pure Binance-momentum-based latency arb. "
+                             "Fires FOK taker orders when Binance moves > "
+                             "$arb_delta_usd in arb_window_s seconds AND the "
+                             "Polymarket book is stale. NO σ, NO p_model — just "
+                             "speed. Takes precedence over --stale-quote if both "
+                             "are set. See decide_latency_arb() in signal_diffusion.py.")
+    parser.add_argument("--arb-delta-usd", type=float, default=25.0,
+                        help="Δ threshold in absolute USD for latency arb (default 25)")
+    parser.add_argument("--arb-window-s", type=float, default=2.0,
+                        help="Lookback window in seconds for Δ measurement (default 2.0). "
+                             "Must exceed the 1.23s Chainlink lag.")
+    parser.add_argument("--arb-cooldown-s", type=float, default=4.0,
+                        help="Cooldown after firing in seconds (default 4.0)")
+    parser.add_argument("--arb-book-stale-ms", type=float, default=600.0,
+                        help="Required Polymarket book staleness in ms before firing "
+                             "(default 600). Lower = fires more often but lower edge.")
+    parser.add_argument("--arb-min-ask", type=float, default=0.15,
+                        help="Min ask price for arb entry (default 0.15)")
+    parser.add_argument("--arb-max-ask", type=float, default=0.85,
+                        help="Max ask price for arb entry (default 0.85). "
+                             "Tighten to 0.40 to avoid the high dynamic-fee mid zone.")
+    parser.add_argument("--arb-min-tau-s", type=float, default=30.0,
+                        help="Min seconds remaining in window before firing arb (default 30)")
+    parser.add_argument("--arb-size-usd", type=float, default=10.0,
+                        help="Fixed bet size per arb trade in USD (default 10)")
     args = parser.parse_args()
 
     # Resolve market -> list of (config_key, config) pairs

@@ -71,6 +71,13 @@ class MarketConfig:
     max_chainlink_age_ms: float | None = None   # Skip if chainlink price older
     max_binance_age_ms: float | None = None     # Skip if binance trade older
     max_trade_tape_age_ms: float | None = None  # Skip if trade tape older
+    # Stale-quote sniper mode: detect when the Polymarket CLOB book is
+    # stale relative to Binance fair value and buy as taker. Opt-in via
+    # CLI --stale-quote flag.  When enabled, decide_stale_quote() replaces
+    # decide_both_sides() — it compares Binance-derived fair value to the
+    # best ask (not bid) and includes the 7.2% taker fee in the edge calc.
+    stale_quote_mode: bool = False
+    stale_threshold: float = 0.03   # minimum fair-ask edge after fees
 
 
 MARKET_CONFIGS: dict[str, MarketConfig] = {

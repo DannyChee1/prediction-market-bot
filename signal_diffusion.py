@@ -2318,21 +2318,12 @@ class DiffusionSignal(Signal):
         ctx["_stale_fair_down"] = fair_down
         ctx["_p_display_fresh"] = True
 
-        # ── Model sanity check: if the model's fair value diverges too
-        # far from the market mid, it's the model that's wrong (sigma
-        # underestimated), not the market being stale. Same gate as the
-        # diffusion model's max_model_market_disagreement.
-        bid_up = snapshot.best_bid_up
-        bid_down = snapshot.best_bid_down
-        if bid_up is not None and ask_up is not None and bid_up > 0:
-            mid_up = (bid_up + ask_up) / 2.0
-            disagreement = abs(fair_up - mid_up)
-            if self.max_model_market_disagreement < 1.0 and disagreement > self.max_model_market_disagreement:
-                reason = (f"model-market disagreement "
-                          f"(|fair={fair_up:.2f} - mid={mid_up:.2f}|="
-                          f"{disagreement:.2f} > {self.max_model_market_disagreement:.2f})")
-                return (Decision("FLAT", 0.0, 0.0, reason),
-                        Decision("FLAT", 0.0, 0.0, reason))
+        # NOTE: no model-market disagreement gate in stale-quote mode.
+        # The sigma research (2026-04-11) showed the model BEATS the market
+        # on direction 55.7% of the time when they disagree, with the
+        # largest edge (+9.8pp) exactly in the low-sigma high-z regime
+        # that the gate was blocking. The whole point of stale-quote is
+        # that Binance leads the market — disagreement IS the signal.
 
         # ── Edge calculation (taker: buy at ask, pay fee) ─────────────
         fee_up = poly_fee(ask_up)       # taker fee on UP contract

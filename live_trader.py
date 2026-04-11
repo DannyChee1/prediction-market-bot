@@ -1160,18 +1160,19 @@ def _build_tracker(
     is_1h = "_1h" in config_key or config.window_duration_s >= 3600
 
     # Per-market signal overrides
-    # BTC: max_z=0.5 (prevent overconfidence), reversion_discount=0.30
-    # ETH: max_z=0.7, reversion_discount=0.20 (15m) / 0.0 (5m)
-    # SOL / XRP: defaults
+    # 2026-04-11: max_z=3.0 for ALL timeframes. The old 5m caps (1.0 BTC,
+    # 0.7 ETH) pinned probabilities at Φ(±1)=0.16/0.84 for any BTC move
+    # beyond ~$10, making the model unable to distinguish small from large
+    # moves. Overconfidence should come from accurate sigma, not z-capping.
     signal_kw: dict = {}
     if base_market == "btc":
         signal_kw = dict(
-            max_z=3.0 if not is_5m else 1.0,
+            max_z=3.0,
             reversion_discount=0.0,
         )
     elif base_market == "eth":
         signal_kw = dict(
-            max_z=3.0 if not is_5m else 0.7,
+            max_z=3.0,
             edge_threshold=0.12,
             reversion_discount=0.20 if not is_5m else 0.0,
             momentum_lookback_s=15,

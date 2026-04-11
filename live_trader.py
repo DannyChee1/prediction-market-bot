@@ -53,11 +53,11 @@ from recording import record_sampler
 from tracker import LiveTradeTracker
 from redemption import POLYGON_RPC
 
-FAST_PRICE_POLL_S = 0.005
-FAST_BINANCE_POLL_S = 0.005
-FAST_BOOK_POLL_S = 0.005
+FAST_PRICE_POLL_S = 0.001
+FAST_BINANCE_POLL_S = 0.001
+FAST_BOOK_POLL_S = 0.001
 FAST_SIGNAL_IDLE_S = 0.01
-FAST_SIGNAL_MIN_INTERVAL_S = 0.005
+FAST_SIGNAL_MIN_INTERVAL_S = 0.001
 
 
 # ── Signal Ticker ────────────────────────────────────────────────────────────
@@ -278,7 +278,7 @@ async def _poll_price_feed(price_feed: PriceFeed, price_state: dict,
                            symbol: str = "",
                            wake_event: asyncio.Event | None = None,
                            wake_state: dict | None = None,
-                           poll_interval_s: float = 0.02):
+                           poll_interval_s: float = 0.001):
     """Bridge Rust PriceFeed → Python price_state dict (shared across trackers).
 
     Auto-restarts the Rust WS feed if the price stays stale for >60s
@@ -324,7 +324,7 @@ async def _poll_binance_feed(binance_feed: BinanceFeed, binance_state: dict,
                              cancel: asyncio.Event, symbol: str = "",
                              wake_event: asyncio.Event | None = None,
                              wake_state: dict | None = None,
-                             poll_interval_s: float = 0.02):
+                             poll_interval_s: float = 0.001):
     """Bridge Rust BinanceFeed → Python binance_state dict.
 
     Auto-restarts if no update for >60s.
@@ -369,7 +369,7 @@ async def _poll_book_feed(book_feed: BookFeed, up_token: str, down_token: str,
                           book_state: dict | None = None,
                           wake_event: asyncio.Event | None = None,
                           wake_state: dict | None = None,
-                          poll_interval_s: float = 0.02):
+                          poll_interval_s: float = 0.001):
     """Bridge Rust BookFeed → Python flat_state + trade_state for VPIN."""
     while not cancel.is_set():
         await asyncio.sleep(poll_interval_s)
@@ -1159,42 +1159,45 @@ def _build_tracker(
     is_5m = "_5m" in config_key
     is_1h = "_1h" in config_key or config.window_duration_s >= 3600
 
-    # Per-market signal overrides
-    # 2026-04-11: max_z=3.0 for ALL timeframes. The old 5m caps (1.0 BTC,
-    # 0.7 ETH) pinned probabilities at Φ(±1)=0.16/0.84 for any BTC move
-    # beyond ~$10, making the model unable to distinguish small from large
-    # moves. Overconfidence should come from accurate sigma, not z-capping.
-    signal_kw: dict = {}
+    # Per-market signal overrides.
+    #
+    # max_z now flows from MarketConfig.max_z (set per-market in
+    # market_config.py) so live and backtest cannot drift. Previously
+    # this was hardcoded here and backtest had no corresponding path,
+    # so backtest silently ran the class default 1.0 while live used
+    # 3.0 for btc/eth. See
+    # tasks/findings/live_pmodel_divergence_root_cause_2026-04-11.md.
+    signal_kw: dict = {
+        "max_z": config.max_z,
+        # 2026-04-11 Test #3: calm-market filter wired from config.
+        "min_trade_sigma": config.min_trade_sigma,
+    }
     if base_market == "btc":
-        signal_kw = dict(
-            max_z=3.0,
-            reversion_discount=0.0,
-        )
+        signal_kw["reversion_discount"] = 0.0
     elif base_market == "eth":
-        signal_kw = dict(
-            max_z=3.0,
+        signal_kw.update(dict(
             edge_threshold=0.12,
             reversion_discount=0.20 if not is_5m else 0.0,
             momentum_lookback_s=15,
             momentum_majority=0.7,
             spread_edge_penalty=0.2,
-        )
+        ))
     elif base_market == "sol":
-        signal_kw = dict(
+        signal_kw.update(dict(
             edge_threshold=0.12,
             reversion_discount=0.0,
             momentum_lookback_s=15,
             momentum_majority=0.7,
             spread_edge_penalty=0.2,
-        )
+        ))
     elif base_market == "xrp":
-        signal_kw = dict(
+        signal_kw.update(dict(
             edge_threshold=0.12,
             reversion_discount=0.0,
             momentum_lookback_s=15,
             momentum_majority=0.7,
             spread_edge_penalty=0.2,
-        )
+        ))
 
     # Maker signal overrides
     signal_kw["window_duration"] = config.window_duration_s
@@ -1359,8 +1362,19 @@ def _build_tracker(
         exit_min_hold = 60.0
         exit_min_remaining = 120.0
     elif is_5m:
-        signal_kw["vol_lookback_s"] = 30
-        maker_warmup = 30.0
+        # 2026-04-11: vol_lookback bumped 30 → 300 after the empirical
+        # sigma-lookback study (analysis/sigma_lookback_research.py on 2000
+        # btc_5m windows × 4 decision taus × 14 lookbacks × 3 horizons)
+        # showed 300s wins by log-MAE at every forecast horizon. The old
+        # 30s value had been a guess; the empirical optimum is 10× larger.
+        # Findings: tasks/findings/sigma_lookback_research_2026-04-11.md
+        # Note: 300s is the WINDOW LENGTH for 5m markets — at any given
+        # tick the lookback will use min(300s, history_so_far). Combined
+        # with the maker_warmup_s gate below, the bot won't trade until
+        # at least vol_lookback_s of history is accumulated, ensuring the
+        # σ estimator has enough data to be reliable.
+        signal_kw["vol_lookback_s"] = 300
+        maker_warmup = 90.0  # was 30s — bumped to give vol estimator real data before trading
         if base_market in ("eth", "sol", "xrp"):
             signal_kw["early_edge_mult"] = 1.2
         signal_kw["maker_warmup_s"] = maker_warmup

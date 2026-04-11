@@ -1212,6 +1212,13 @@ def build_diffusion_signal(
         cross_asset_z_lookup=cross_asset_lookup,
         cross_asset_min_z=cross_asset_min_z,
         min_entry_z=effective_min_z,
+        # Wire from config so backtest matches live. Prior to 2026-04-11
+        # this was not passed, so backtest silently used the class default
+        # max_z=1.0 while live used 3.0 (for btc/eth) — running a different
+        # model than production. See tasks/findings/live_pmodel_divergence_root_cause_2026-04-11.md.
+        max_z=config.max_z,
+        # 2026-04-11 Test #3: calm-market filter wired from config.
+        min_trade_sigma=config.min_trade_sigma,
         tail_mode=effective_tail_mode,
         tail_nu_default=config.tail_nu_default,
         kou_lambda=config.kou_lambda,

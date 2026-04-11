@@ -196,11 +196,14 @@ impl OrderClient {
         Ok(())
     }
 
-    /// Place a GTC limit order (create + sign + post in one call).
+    /// Place a limit order (create + sign + post in one call).
     ///
     /// Returns a dict matching py-clob-client response format:
     ///   {success, orderID, status, makingAmount?, takingAmount?, errorMsg?}
-    #[pyo3(signature = (token_id, price, size, side, order_type="GTC", fee_rate_bps=0))]
+    ///
+    /// order_type: "GTC" (default), "FOK", "FAK", or "GTD"
+    /// expiration: Unix timestamp for GTD orders (0 = no expiration)
+    #[pyo3(signature = (token_id, price, size, side, order_type="GTC", fee_rate_bps=0, expiration=0))]
     fn place_order(
         &self,
         py: Python<'_>,
@@ -210,6 +213,7 @@ impl OrderClient {
         side: &str,
         order_type: &str,
         fee_rate_bps: u32,
+        expiration: u64,
     ) -> PyResult<PyObject> {
         let side_enum = parse_side(side)?;
         let ot = parse_order_type(order_type);
@@ -244,8 +248,9 @@ impl OrderClient {
         let resp = py
             .allow_threads(move || {
                 RUNTIME.block_on(async move {
+                    let exp = if expiration > 0 { Some(expiration) } else { None };
                     let signed = client
-                        .create_order(&args, None, extras, opts_ref)
+                        .create_order(&args, exp, extras, opts_ref)
                         .await?;
                     client.post_order(signed, ot).await
                 })

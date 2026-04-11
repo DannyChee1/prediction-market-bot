@@ -515,10 +515,26 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
         self.last_decision = dec
 
+        # Smart order type: use GTD at bid+1c with 1s TTL when there's a
+        # spread. If bid+1c < ask, the order rests as MAKER (0% fee) and
+        # either fills within 1s or expires harmlessly. If bid+1c >= ask,
+        # it crosses as taker (7.2% fee) — same as FOK.
+        bid_price = snapshot.best_bid_up if side_label == "UP" else snapshot.best_bid_down
+        use_gtd = (bid_price is not None and bid_price > 0
+                   and (bid_price + 0.01) < ask_price)  # spread > 1 cent
+        if use_gtd:
+            order_price = round(bid_price + 0.01, 2)  # bid + 1 cent (maker)
+            order_type = "GTD"
+            is_maker = True
+        else:
+            order_price = ask_price  # cross the spread (taker)
+            order_type = "FOK"
+            is_maker = False
+
         if self.dry_run:
-            # Simulate instant fill in dry run
-            fee = 0.072 * min(ask_price, 1 - ask_price) * shares
-            fill_cost = cost_est + fee
+            # Simulate fill
+            fee = 0.0 if is_maker else 0.072 * min(order_price, 1 - order_price) * shares
+            fill_cost = shares * order_price + fee
             self.bankroll -= fill_cost
             self.signal.bankroll = self.bankroll
             self.pending_fills.append({
@@ -555,11 +571,13 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             })
             return dec
 
-        # Live: place FOK order at the ask
+        # Live: place smart order (GTD at bid+1c when spread exists, FOK at ask otherwise)
+        # GTD expiration = 1 second from now (Unix timestamp)
+        gtd_expiration = int(_time.time()) + 1 if order_type == "GTD" else 0
         try:
             post_start = int(_time.time() * 1000)
             resp = self.client.place_order(
-                token, ask_price, shares, "BUY", "FOK", 0
+                token, order_price, shares, "BUY", order_type, 0, gtd_expiration
             )
             post_done = int(_time.time() * 1000)
         except Exception as exc:

@@ -498,9 +498,7 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             self._bucket_flat_reason(reason)
             return self.last_decision
 
-        # Position limits — use max_positions from config/CLI.
-        # Previously stale-quote hardcoded to 1, but the user wants
-        # multiple positions per window (buy more as dislocations recur).
+        # Position limits
         if self.position_count >= self.max_positions:
             self._bucket_flat_reason("max_positions")
             return Decision("FLAT", 0.0, 0.0, "max_positions")
@@ -509,8 +507,23 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             self._bucket_flat_reason("max_trades_per_window")
             return Decision("FLAT", 0.0, 0.0, "max_trades_per_window")
 
+        # Don't stack at the same price — if we already hold a position
+        # on this side at a similar price, skip. Only add a new position
+        # if the price has moved significantly (2+ cents) since the last
+        # fill on this side, indicating a NEW dislocation not the same one.
+        for fill in self.pending_fills:
+            if fill["side"] == side_label:
+                last_entry = fill.get("cost_usd", 0) / max(fill.get("shares", 1), 1)
+                if abs(ask_price - last_entry) < 0.02:
+                    return Decision("FLAT", 0.0, 0.0,
+                        f"same_price_stack ({side_label} already @ {last_entry:.2f})")
+
         # Cooldown
-        if hasattr(self, '_last_taker_ts') and (now - self._last_taker_ts) < 5.0:
+        # Cooldown between taker fills — don't fire 5 identical trades
+        # in 10 seconds. 30s gives time for the book to reprice or for
+        # the dislocation to resolve. If it persists, the next fill
+        # happens at a potentially different price (new dislocation).
+        if hasattr(self, '_last_taker_ts') and (now - self._last_taker_ts) < 30.0:
             return Decision("FLAT", 0.0, 0.0, "taker_cooldown")
 
         # Get ask price for this side

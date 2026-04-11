@@ -484,9 +484,25 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         tau = snapshot.time_remaining_s
         if tau is not None and self.signal.window_duration > 0:
             elapsed = self.signal.window_duration - tau
-            if elapsed < self.signal.vol_lookback_s:
-                return Decision("FLAT", 0.0, 0.0,
-                    f"taker warmup ({elapsed:.0f}s < {self.signal.vol_lookback_s}s)")
+            # 2026-04-11 BUG FIX: was `elapsed < self.signal.vol_lookback_s`
+            # which broke the moment vol_lookback_s was bumped to 300 for
+            # btc 5m today — a 300s window can never have elapsed >= 300s,
+            # so the bot was perma-warmed-up and silently FLAT. Worse, the
+            # early return below didn't update self.last_decision, so the
+            # display kept showing the placeholder "new window" forever.
+            #
+            # Use maker_warmup_s as the explicit warmup gate (same as the
+            # maker path at line ~715). For btc 5m: 90s warmup of a 300s
+            # window. For btc 15m: 120s warmup of a 900s window. Cap at
+            # 50% of window so we always have at least half the window
+            # available for trading.
+            warmup_s = min(self.signal.maker_warmup_s,
+                           self.signal.window_duration * 0.5)
+            if elapsed < warmup_s:
+                reason = f"taker warmup ({elapsed:.0f}s < {warmup_s:.0f}s)"
+                self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
+                self._bucket_flat_reason(reason)
+                return self.last_decision
 
         # Pick the side with better edge
         dec = None
@@ -506,27 +522,39 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             self._bucket_flat_reason(reason)
             return self.last_decision
 
+        # 2026-04-11 BUG FIX: every early return below now updates
+        # self.last_decision so the display can show what's actually
+        # happening. Previously these returned a fresh Decision without
+        # updating last_decision, so the display kept showing whatever
+        # last_decision was set to (often the "new window" placeholder
+        # from tracker.new_window()), making the bot appear stuck.
+        # See: stale-quote/latency-arb perma-FLAT bug found 2026-04-11.
+
         # Position limits
         if self.position_count >= self.max_positions:
             self._bucket_flat_reason("max_positions")
-            return Decision("FLAT", 0.0, 0.0, "max_positions")
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "max_positions")
+            return self.last_decision
 
         if self.window_trade_count >= self.max_trades_per_window:
             self._bucket_flat_reason("max_trades_per_window")
-            return Decision("FLAT", 0.0, 0.0, "max_trades_per_window")
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "max_trades_per_window")
+            return self.last_decision
 
         # Get ask price for this side (needed by stacking check below)
         ask_price = snapshot.best_ask_up if side_label == "UP" else snapshot.best_ask_down
         if ask_price is None or ask_price <= 0 or ask_price >= 1:
-            return Decision("FLAT", 0.0, 0.0, "no_ask")
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "no_ask")
+            return self.last_decision
 
         # Don't stack at the same price
         for fill in self.pending_fills:
             if fill["side"] == side_label:
                 last_entry = fill.get("cost_usd", 0) / max(fill.get("shares", 1), 1)
                 if abs(ask_price - last_entry) < 0.02:
-                    return Decision("FLAT", 0.0, 0.0,
-                        f"same_price_stack ({side_label} already @ {last_entry:.2f})")
+                    reason = f"same_price_stack ({side_label} already @ {last_entry:.2f})"
+                    self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
+                    return self.last_decision
 
         # Cooldown between taker fills.
         #
@@ -540,7 +568,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         else:
             taker_cooldown_s = 30.0
         if hasattr(self, '_last_taker_ts') and (now - self._last_taker_ts) < taker_cooldown_s:
-            return Decision("FLAT", 0.0, 0.0, "taker_cooldown")
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "taker_cooldown")
+            return self.last_decision
 
         # Size: use decision size, convert to shares at ask
         shares = round(dec.size_usd / ask_price, 1)
@@ -548,7 +577,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             shares = self.min_order_shares
         cost_est = shares * ask_price
         if cost_est > self.bankroll:
-            return Decision("FLAT", 0.0, 0.0, "insufficient_bankroll")
+            self.last_decision = Decision("FLAT", 0.0, 0.0, "insufficient_bankroll")
+            return self.last_decision
 
         self.last_decision = dec
 

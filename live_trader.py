@@ -1276,6 +1276,7 @@ def _build_tracker(
     signal_kw["kou_eta2"] = config.kou_eta2
     signal_kw["market_blend"] = config.market_blend
     signal_kw["max_book_age_ms"] = config.max_book_age_ms
+    signal_kw["sigma_estimator"] = config.sigma_estimator
     # Per-market entry filters: CLI overrides config if explicitly set
     signal_kw["min_entry_z"] = args.min_z if args.min_z > 0 else config.min_entry_z
     signal_kw["min_entry_price"] = args.min_entry_price if args.min_entry_price != 0.10 else config.min_entry_price
@@ -1452,6 +1453,38 @@ def _build_tracker(
     if args.latency_arb and args.stale_quote:
         print("  [WARN] Both --latency-arb and --stale-quote enabled. "
               "Latency arb takes precedence in tracker routing.")
+    if args.exp_filtration_taker and (args.stale_quote or args.latency_arb):
+        print("  [WARN] --exp-filtration-taker enabled alongside "
+              "--stale-quote/--latency-arb. Explicit stale/arb modes "
+              "take precedence in tracker routing.")
+
+    # Experimental early-tau filtration bundles. Strictly opt-in and
+    # separate from the legacy 29-feature filtration path; with no
+    # bundle path provided, live behavior is unchanged.
+    exp_bundle_path = args.exp_filtration_5m_bundle if is_5m else args.exp_filtration_15m_bundle
+    exp_threshold = args.exp_filtration_5m_threshold if is_5m else args.exp_filtration_15m_threshold
+    exp_mode = "taker" if args.exp_filtration_taker else "gate"
+    if exp_bundle_path:
+        try:
+            from experimental_filtration import load_bundle
+
+            bundle = load_bundle(exp_bundle_path)
+            signal_kw["experimental_filtration_bundle"] = bundle
+            signal_kw["experimental_filtration_threshold"] = exp_threshold
+            signal_kw["experimental_filtration_mode"] = exp_mode
+            print(
+                f"  [{config.display_name}] Experimental filtration enabled: "
+                f"{Path(exp_bundle_path).name} threshold={exp_threshold:.3f} mode={exp_mode}"
+            )
+        except Exception as exc:
+            print(
+                f"  [{config.display_name}] WARNING: experimental filtration load failed: {exc}"
+            )
+    elif args.exp_filtration_taker:
+        print(
+            f"  [{config.display_name}] WARNING: --exp-filtration-taker set but no "
+            f"experimental bundle path is configured for this market"
+        )
 
     signal = DiffusionSignal(bankroll=bankroll, slippage=args.slippage, **signal_kw)
     tracker = LiveTradeTracker(
@@ -1731,8 +1764,8 @@ def main():
                              "Polymarket book is stale. NO σ, NO p_model — just "
                              "speed. Takes precedence over --stale-quote if both "
                              "are set. See decide_latency_arb() in signal_diffusion.py.")
-    parser.add_argument("--arb-delta-usd", type=float, default=25.0,
-                        help="Δ threshold in absolute USD for latency arb (default 25)")
+    parser.add_argument("--arb-delta-usd", type=float, default=30.0,
+                        help="Δ threshold in absolute USD for latency arb (default 30)")
     parser.add_argument("--arb-window-s", type=float, default=2.0,
                         help="Lookback window in seconds for Δ measurement (default 2.0). "
                              "Must exceed the 1.23s Chainlink lag.")
@@ -1750,6 +1783,22 @@ def main():
                         help="Min seconds remaining in window before firing arb (default 30)")
     parser.add_argument("--arb-size-usd", type=float, default=10.0,
                         help="Fixed bet size per arb trade in USD (default 10)")
+    parser.add_argument("--exp-filtration-5m-bundle", type=str, default="",
+                        help="Path to experimental 5m filtration bundle pkl "
+                             "(opt-in, no effect when omitted)")
+    parser.add_argument("--exp-filtration-5m-threshold", type=float, default=0.20,
+                        help="Gate threshold for the experimental 5m bundle "
+                             "(default 0.20)")
+    parser.add_argument("--exp-filtration-15m-bundle", type=str, default="",
+                        help="Path to experimental 15m filtration bundle pkl "
+                             "(opt-in, no effect when omitted)")
+    parser.add_argument("--exp-filtration-15m-threshold", type=float, default=0.10,
+                        help="Gate threshold for the experimental 15m bundle "
+                             "(default 0.10)")
+    parser.add_argument("--exp-filtration-taker", action="store_true", default=False,
+                        help="Route the experimental filtration bundle through "
+                             "the stale-quote/latency-arb taker executor "
+                             "instead of using it only as a maker gate.")
     args = parser.parse_args()
 
     # Resolve market -> list of (config_key, config) pairs

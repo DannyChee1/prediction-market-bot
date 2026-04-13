@@ -426,17 +426,19 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         self.ctx["window_trade_count"] = self.window_trade_count
         self.ctx["inventory_up"] = sum(f["shares"] for f in self.pending_fills if f["side"] == "UP")
         self.ctx["inventory_down"] = sum(f["shares"] for f in self.pending_fills if f["side"] == "DOWN")
-        # 3-way routing: latency_arb > stale_quote > regular maker.
-        # latency_arb takes precedence because it's the most selective
-        # (only fires when Binance has just moved meaningfully); when it
-        # doesn't fire we want the regular FLAT, not a stale_quote
-        # fallback that uses different math.
+        # 4-way execution routing:
+        #   latency_arb > stale_quote > experimental_ev_taker > regular maker
+        # The experimental EV bundle still computes through
+        # decide_both_sides(), but when its mode is "taker" the returned
+        # decisions are one-sided taker entries and should be routed
+        # through _execute_taker().
         if getattr(self.signal, "latency_arb_mode", False):
             up_dec, down_dec = self.signal.decide_latency_arb(snapshot, self.ctx)
         elif getattr(self.signal, "stale_quote_mode", False):
             up_dec, down_dec = self.signal.decide_stale_quote(snapshot, self.ctx)
         else:
             up_dec, down_dec = self.signal.decide_both_sides(snapshot, self.ctx)
+        self.signal_eval_count += 1
         self.last_up_decision = up_dec
         self.last_down_decision = down_dec
 
@@ -452,11 +454,16 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             )
             return self.last_decision
 
-        # Latency-arb and stale-quote modes use taker (FOK) execution.
-        # Regular mode uses maker (GTC limit at bid).
+        # Latency-arb, stale-quote, and experimental EV taker use the
+        # taker executor. Regular mode uses maker (GTC limit at bid).
         if getattr(self.signal, "latency_arb_mode", False):
             return self._execute_taker(snapshot, up_token, down_token, up_dec, down_dec)
         if getattr(self.signal, "stale_quote_mode", False):
+            return self._execute_taker(snapshot, up_token, down_token, up_dec, down_dec)
+        if (
+            getattr(self.signal, "experimental_filtration_bundle", None) is not None
+            and getattr(self.signal, "experimental_filtration_mode", "gate") == "taker"
+        ):
             return self._execute_taker(snapshot, up_token, down_token, up_dec, down_dec)
         return self._evaluate_maker(snapshot, up_token, down_token, up_dec, down_dec)
 
@@ -477,32 +484,34 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
         """
         now = _time.time()
 
-        # Warmup gate: sigma needs vol_lookback_s of history to be
-        # reliable. At window start with tiny sigma, z blows up and
-        # everything looks like a massive dislocation. Wait until the
-        # vol estimator has enough data.
-        tau = snapshot.time_remaining_s
-        if tau is not None and self.signal.window_duration > 0:
-            elapsed = self.signal.window_duration - tau
-            # 2026-04-11 BUG FIX: was `elapsed < self.signal.vol_lookback_s`
-            # which broke the moment vol_lookback_s was bumped to 300 for
-            # btc 5m today — a 300s window can never have elapsed >= 300s,
-            # so the bot was perma-warmed-up and silently FLAT. Worse, the
-            # early return below didn't update self.last_decision, so the
-            # display kept showing the placeholder "new window" forever.
-            #
-            # Use maker_warmup_s as the explicit warmup gate (same as the
-            # maker path at line ~715). For btc 5m: 90s warmup of a 300s
-            # window. For btc 15m: 120s warmup of a 900s window. Cap at
-            # 50% of window so we always have at least half the window
-            # available for trading.
-            warmup_s = min(self.signal.maker_warmup_s,
-                           self.signal.window_duration * 0.5)
-            if elapsed < warmup_s:
-                reason = f"taker warmup ({elapsed:.0f}s < {warmup_s:.0f}s)"
-                self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
-                self._bucket_flat_reason(reason)
-                return self.last_decision
+        # Warmup gate only applies to sigma/fair-value taker strategies.
+        # Pure latency-arb is defined on the Binance delta ring and has
+        # its own internal ring warmup in decide_latency_arb(); forcing
+        # the generic 90s/120s taker warmup here was blocking the first
+        # third to half of every short window for no reason.
+        if not getattr(self.signal, "latency_arb_mode", False):
+            tau = snapshot.time_remaining_s
+            if tau is not None and self.signal.window_duration > 0:
+                elapsed = self.signal.window_duration - tau
+                # 2026-04-11 BUG FIX: was `elapsed < self.signal.vol_lookback_s`
+                # which broke the moment vol_lookback_s was bumped to 300 for
+                # btc 5m today — a 300s window can never have elapsed >= 300s,
+                # so the bot was perma-warmed-up and silently FLAT. Worse, the
+                # early return below didn't update self.last_decision, so the
+                # display kept showing the placeholder "new window" forever.
+                #
+                # Use maker_warmup_s as the explicit warmup gate (same as the
+                # maker path at line ~715). For btc 5m: 90s warmup of a 300s
+                # window. For btc 15m: 120s warmup of a 900s window. Cap at
+                # 50% of window so we always have at least half the window
+                # available for trading.
+                warmup_s = min(self.signal.maker_warmup_s,
+                               self.signal.window_duration * 0.5)
+                if elapsed < warmup_s:
+                    reason = f"taker warmup ({elapsed:.0f}s < {warmup_s:.0f}s)"
+                    self.last_decision = Decision("FLAT", 0.0, 0.0, reason)
+                    self._bucket_flat_reason(reason)
+                    return self.last_decision
 
         # Pick the side with better edge
         dec = None
@@ -639,7 +648,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             _fair_up = float(self.ctx.get("_stale_fair_up", 0) or 0)
             _p_side = _p_up_raw if side_label == "UP" else 1.0 - _p_up_raw
             _fair_side = _fair_up if side_label == "UP" else 1.0 - _fair_up
-            self._log({
+            _filt_conf = self.ctx.get("_filtration_confidence")
+            _fill_record = {
                 "type": "taker_fill",
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "side": side_label,
@@ -656,7 +666,17 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 "is_maker": is_maker,
                 "tau": round(snapshot.time_remaining_s, 0),
                 "binance_mid": round(self.ctx.get("_binance_mid", 0) or 0, 2),
-            })
+                "filtration_confidence": (
+                    round(float(_filt_conf), 4) if _filt_conf is not None else None
+                ),
+                "experimental_filtration_reason": self.ctx.get("_experimental_filtration_reason"),
+            }
+            if self.ctx.get("_arb_delta_usd") is not None:
+                _fill_record["arb_delta_usd"] = round(self.ctx["_arb_delta_usd"], 2)
+                _fill_record["arb_delta_bps"] = round(self.ctx.get("_arb_delta_bps", 0), 1)
+                _fill_record["arb_book_age_ms"] = round(self.ctx.get("_arb_book_age_ms", 0), 0)
+                _fill_record["arb_fee"] = round(self.ctx.get("_arb_fee", 0), 4)
+            self._log(_fill_record)
             return dec
 
         # Live: place smart order (GTD at bid+1c when spread exists, FOK at ask otherwise)
@@ -711,7 +731,8 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
             _fair_up = float(self.ctx.get("_stale_fair_up", 0) or 0)
             _p_side = _p_up_raw if side_label == "UP" else 1.0 - _p_up_raw
             _fair_side = _fair_up if side_label == "UP" else 1.0 - _fair_up
-            self._log({
+            _filt_conf = self.ctx.get("_filtration_confidence")
+            _fill_record = {
                 "type": "taker_fill",
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "order_id": order_id,
@@ -730,7 +751,17 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
                 "tau": round(snapshot.time_remaining_s, 0),
                 "binance_mid": round(self.ctx.get("_binance_mid", 0) or 0, 2),
                 "order_post_ms": post_done - post_start,
-            })
+                "filtration_confidence": (
+                    round(float(_filt_conf), 4) if _filt_conf is not None else None
+                ),
+                "experimental_filtration_reason": self.ctx.get("_experimental_filtration_reason"),
+            }
+            if self.ctx.get("_arb_delta_usd") is not None:
+                _fill_record["arb_delta_usd"] = round(self.ctx["_arb_delta_usd"], 2)
+                _fill_record["arb_delta_bps"] = round(self.ctx.get("_arb_delta_bps", 0), 1)
+                _fill_record["arb_book_age_ms"] = round(self.ctx.get("_arb_book_age_ms", 0), 0)
+                _fill_record["arb_fee"] = round(self.ctx.get("_arb_fee", 0), 4)
+            self._log(_fill_record)
         else:
             # FOK rejected — liquidity was taken by someone else
             self._event(
@@ -791,8 +822,6 @@ class LiveTradeTracker(OrderMixin, RedemptionMixin):
 
         if self.exit_enabled:
             self._evaluate_exits(snapshot, up_token, down_token)
-        self.signal_eval_count += 1
-
         if up_dec.action != "FLAT" or down_dec.action != "FLAT":
             self.last_decision = up_dec if up_dec.edge >= down_dec.edge else down_dec
         else:

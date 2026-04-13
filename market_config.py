@@ -424,6 +424,7 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         max_chainlink_age_ms=60_000.0,
         max_binance_age_ms=5_000.0,
         max_trade_tape_age_ms=15_000.0,
+        min_trade_sigma=2.5e-5,
     ),
 }
 

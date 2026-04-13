@@ -263,6 +263,12 @@ class DiffusionSignal(Signal):
         # ceiling, mult stays at 1.0. Default 0.50 means a predicted 50% per-
         # dollar return saturates the multiplier.
         filtration_ev_full: float = 0.50,
+        # Experimental filtration bundle (2026-04-11): newer `features.py`
+        # feature set + contemplated-trade overlay. Strictly opt-in; when
+        # None, the legacy 29-feature filtration path is unchanged.
+        experimental_filtration_bundle: dict | None = None,
+        experimental_filtration_threshold: float = 0.0,
+        experimental_filtration_mode: str = "gate",
         # Oracle hard cancel: return FLAT immediately when Binance-Chainlink
         # gap exceeds this fraction.  Set to 0.0 to disable (default).
         # 0.004 = cancel when gap > 0.4% (Chainlink triggers at 0.5%).
@@ -304,8 +310,8 @@ class DiffusionSignal(Signal):
         # calibration table — just speed. See decide_latency_arb() and
         # tasks/findings/latency_arb_implementation_plan_2026-04-11.md.
         latency_arb_mode: bool = False,
-        # Δ threshold in absolute USD ($25 ≈ 3 bps on $84k BTC)
-        arb_delta_usd: float = 25.0,
+        # Δ threshold in absolute USD ($30 ≈ 4 bps on $73k BTC)
+        arb_delta_usd: float = 30.0,
         # Lookback window in seconds — must exceed the 1.23s Chainlink lag
         arb_window_s: float = 2.0,
         # Cooldown after firing — prevents double-fire on same impulse
@@ -424,6 +430,13 @@ class DiffusionSignal(Signal):
         self.filtration_mode = filtration_mode
         self.filtration_size_mult_floor = float(filtration_size_mult_floor)
         self.filtration_ev_full = float(filtration_ev_full)
+        if experimental_filtration_mode not in ("gate", "taker"):
+            raise ValueError(
+                "experimental_filtration_mode must be 'gate' or 'taker'"
+            )
+        self.experimental_filtration_bundle = experimental_filtration_bundle
+        self.experimental_filtration_threshold = float(experimental_filtration_threshold)
+        self.experimental_filtration_mode = experimental_filtration_mode
         self.oracle_cancel_threshold = oracle_cancel_threshold
         self.cross_asset_z_lookup = cross_asset_z_lookup
         self.cross_asset_min_z = cross_asset_min_z
@@ -791,12 +804,36 @@ class DiffusionSignal(Signal):
         tau: float,
         snapshot: "Snapshot",
         ctx: dict,
+        p_model: float | None = None,
     ) -> bool:
         """Return True if filtration model approves this trade, False to filter out.
 
         Returns True unconditionally when no filtration model is loaded,
         or when |z| is too small to have meaningful signal direction.
         """
+        if self.experimental_filtration_bundle is not None:
+            if self.experimental_filtration_mode == "taker":
+                return True
+            from experimental_filtration import score_bundle
+
+            gbm_p = float(p_model if p_model is not None else ctx.get("_p_model_raw", 0.5) or 0.5)
+            score, reason = score_bundle(
+                self.experimental_filtration_bundle,
+                snapshot,
+                ctx,
+                sigma_per_s=sigma,
+                p_gbm=gbm_p,
+                tau=tau,
+                window_duration_s=self.window_duration,
+            )
+            if score is None:
+                ctx["_filtration_confidence"] = None
+                ctx["_experimental_filtration_reason"] = reason
+                return True
+            ctx["_filtration_confidence"] = score
+            ctx["_experimental_filtration_reason"] = "ok"
+            return score >= self.experimental_filtration_threshold
+
         if self.filtration_model is None:
             return True
         if abs(z) < 0.10:
@@ -895,6 +932,106 @@ class DiffusionSignal(Signal):
         if self.filtration_mode == "size_mult":
             return True
         return confidence >= self.filtration_threshold
+
+    def _experimental_taker_decisions(
+        self,
+        snapshot: "Snapshot",
+        ctx: dict,
+        *,
+        sigma_per_s: float,
+        tau: float,
+        z: float,
+        z_raw: float,
+        p_gbm: float,
+    ) -> tuple["Decision", "Decision"]:
+        """Score the contemplated taker trade with the experimental bundle."""
+        from experimental_filtration import score_bundle, trade_overlay
+
+        flat = Decision("FLAT", 0.0, 0.0, "")
+        score, reason = score_bundle(
+            self.experimental_filtration_bundle,
+            snapshot,
+            ctx,
+            sigma_per_s=sigma_per_s,
+            p_gbm=p_gbm,
+            tau=tau,
+            window_duration_s=self.window_duration,
+        )
+        if score is None:
+            ctx["_filtration_confidence"] = None
+            ctx["_experimental_filtration_reason"] = reason
+            flat_reason = f"exp_taker {reason}"
+            return (Decision("FLAT", 0.0, 0.0, flat_reason),
+                    Decision("FLAT", 0.0, 0.0, flat_reason))
+
+        overlay = trade_overlay(snapshot, p_gbm)
+        if overlay is None:
+            ctx["_filtration_confidence"] = None
+            ctx["_experimental_filtration_reason"] = "no_trade_overlay"
+            flat_reason = "exp_taker no_trade_overlay"
+            return (Decision("FLAT", 0.0, 0.0, flat_reason),
+                    Decision("FLAT", 0.0, 0.0, flat_reason))
+
+        ctx["_filtration_confidence"] = score
+        ctx["_experimental_filtration_reason"] = "ok"
+
+        threshold = self.experimental_filtration_threshold
+        if score < threshold:
+            reason = (f"exp_taker score={score:.4f} < {threshold:.4f} "
+                      f"raw_edge={overlay['trade_raw_edge_gbm']:.4f}")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        side = str(overlay["trade_side"])
+        ask_price = float(overlay["trade_ask_price"])
+        eff_cost = float(overlay["trade_eff_cost"])
+        raw_edge = float(overlay["trade_raw_edge_gbm"])
+        target = str(self.experimental_filtration_bundle.get("target", "edge_share"))
+
+        if target == "edge_share":
+            edge = float(score)
+            p_side = max(0.01, min(0.99, eff_cost + edge))
+        else:
+            p_side = max(0.01, min(0.99, float(score)))
+            edge = p_side - eff_cost
+
+        if edge <= 0.0:
+            reason = (f"exp_taker nonpositive_edge edge={edge:.4f} "
+                      f"score={score:.4f}")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+
+        fair_up = p_side if side == "BUY_UP" else 1.0 - p_side
+        ctx["_p_model_raw"] = p_gbm
+        ctx["_p_display"] = p_gbm
+        ctx["_p_display_fresh"] = True
+        ctx["_stale_fair_up"] = fair_up
+        ctx["_stale_fair_down"] = 1.0 - fair_up
+        ctx["_p_model_trade"] = fair_up
+        ctx["_edge_up"] = edge if side == "BUY_UP" else 0.0
+        ctx["_edge_down"] = edge if side == "BUY_DOWN" else 0.0
+        ctx["_dyn_threshold_up"] = threshold
+        ctx["_dyn_threshold_down"] = threshold
+
+        dec = self._experimental_taker_size_decision(
+            side=side,
+            edge=edge,
+            score=float(score),
+            ask_price=ask_price,
+            p_side=p_side,
+            sigma_per_s=sigma_per_s,
+            tau=tau,
+            z=z,
+            z_raw=z_raw,
+            raw_edge=raw_edge,
+            target=target,
+        )
+        if dec.action == "FLAT":
+            return (Decision("FLAT", 0.0, 0.0, dec.reason),
+                    Decision("FLAT", 0.0, 0.0, dec.reason))
+        if side == "BUY_UP":
+            return (dec, flat)
+        return (flat, dec)
 
     def _filtration_size_multiplier(self, ctx: dict) -> float:
         """Return Kelly multiplier from filtration confidence in size_mult mode.
@@ -1443,7 +1580,7 @@ class DiffusionSignal(Signal):
             ctx["_oracle_lead_bias"] = lead_bias
 
         # Filtration gate: XGBoost confidence check
-        if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx):
+        if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx, p_model=p_model):
             conf = ctx.get("_filtration_confidence", 0.0)
             return Decision("FLAT", 0.0, 0.0,
                             f"filtration ({conf:.3f} < {self.filtration_threshold})")
@@ -1715,6 +1852,7 @@ class DiffusionSignal(Signal):
             _raw = self._compute_vol(
                 hist[-self.vol_lookback_s:], ts_hist[-self.vol_lookback_s:]
             )
+            _raw = max(_raw, self.min_sigma)
             if _raw > 0:
                 _tau = snapshot.time_remaining_s
                 _delta = (effective_price - snapshot.window_start_price) / snapshot.window_start_price
@@ -2034,6 +2172,22 @@ class DiffusionSignal(Signal):
 
         p_model = self._p_model(z, tau, ctx)
 
+        if (self.experimental_filtration_bundle is not None
+                and self.experimental_filtration_mode == "taker"):
+            lead_bias = self._oracle_lead_bias(snapshot.chainlink_price, binance_mid)
+            if lead_bias != 0.0:
+                p_model = max(0.01, min(0.99, p_model + lead_bias))
+                ctx["_oracle_lead_bias"] = lead_bias
+            return self._experimental_taker_decisions(
+                snapshot,
+                ctx,
+                sigma_per_s=sigma_per_s,
+                tau=tau,
+                z=z,
+                z_raw=z_raw,
+                p_gbm=p_model,
+            )
+
         # Model-vs-market disagreement gate (mirror of decide()).
         # When raw p_model disagrees with mid by > threshold pp, the
         # σ-based z-score is probably overconfident due to a low-vol
@@ -2057,7 +2211,7 @@ class DiffusionSignal(Signal):
             ctx["_oracle_lead_bias"] = lead_bias
 
         # Filtration gate: XGBoost confidence check
-        if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx):
+        if not self._check_filtration(z, sigma_per_s, tau, snapshot, ctx, p_model=p_model):
             conf = ctx.get("_filtration_confidence", 0.0)
             reason = f"filtration ({conf:.3f} < {self.filtration_threshold})"
             return (Decision("FLAT", 0.0, 0.0, reason),
@@ -2369,7 +2523,7 @@ class DiffusionSignal(Signal):
         # The 5%/tick rate limiter prevents residual oscillation while
         # still allowing sigma to double in ~14 seconds for real regime
         # changes (e.g., flash crash).
-        _EWMA_LAMBDA = 0.90
+        _EWMA_LAMBDA = 0.94
         _MAX_SIGMA_CHANGE_PCT = 0.05  # max 5% change per tick
 
         # Compute EWMA sigma from log returns
@@ -2553,6 +2707,55 @@ class DiffusionSignal(Signal):
         )
         return Decision(side, edge, size_usd, reason)
 
+    def _experimental_taker_size_decision(
+        self,
+        *,
+        side: str,
+        edge: float,
+        score: float,
+        ask_price: float,
+        p_side: float,
+        sigma_per_s: float,
+        tau: float,
+        z: float,
+        z_raw: float,
+        raw_edge: float,
+        target: str,
+    ) -> Decision:
+        """Kelly sizing for experimental EV taker fills."""
+        fee = poly_fee(ask_price)
+        eff_cost = ask_price + fee
+        if eff_cost <= 0 or eff_cost >= 1.0:
+            return Decision("FLAT", 0.0, 0.0, "exp_taker eff cost out of range")
+
+        if self.min_entry_price > 0 and ask_price < self.min_entry_price:
+            return Decision("FLAT", 0.0, 0.0,
+                f"entry {ask_price:.3f} < min {self.min_entry_price:.2f}")
+
+        kelly_f = max(0.0, (p_side - eff_cost) / (1.0 - eff_cost))
+        frac = min(self.kelly_fraction * kelly_f, self.max_bet_fraction)
+        if frac <= 0:
+            return Decision("FLAT", 0.0, 0.0, "exp_taker kelly <= 0")
+
+        size_usd = self.bankroll * frac
+        min_usd = self.min_order_shares * eff_cost
+        if size_usd < min_usd:
+            if self.bankroll >= min_usd:
+                size_usd = min_usd
+            else:
+                return Decision("FLAT", 0.0, 0.0,
+                    f"bankroll ${self.bankroll:.2f} < min order ${min_usd:.2f}")
+
+        reason = (
+            f"EXP_TAKER target={target} score={score:.4f} raw_edge={raw_edge:.4f} "
+            f"p={p_side:.4f} sig={sigma_per_s:.2e} z={z:.2f}"
+            f"{'(cap)' if abs(z_raw) > self.max_z else ''} "
+            f"tau={tau:.0f}s edge={edge:.4f} "
+            f"thresh={self.experimental_filtration_threshold:.4f} "
+            f"ask={ask_price:.4f} fee={fee:.4f} kelly={kelly_f:.4f} ${size_usd:.0f}"
+        )
+        return Decision(side, edge, size_usd, reason)
+
     # ─────────────────────────────────────────────────────────────────
     # Latency arbitrage (2026-04-11) — pure Binance momentum signal
     # ─────────────────────────────────────────────────────────────────
@@ -2610,21 +2813,25 @@ class DiffusionSignal(Signal):
                     Decision("FLAT", 0.0, 0.0, "no binance ring"))
 
         # ── Δ over arb_window_s ───────────────────────────────────
-        cutoff_ms = now_ms - int(self.arb_window_s * 1000)
-        # Walk back to find the oldest sample in [cutoff_ms, now_ms]
+        # Anchor the lookback on the latest Binance sample, not the
+        # later book/Chainlink-triggered evaluation wall clock. When a
+        # non-Binance tick wakes the signal a few hundred milliseconds
+        # after the last Binance update, using `now_ms` here shrinks the
+        # effective lookback and can produce false "no sample in window"
+        # misses even though the Binance ring itself is healthy.
+        cur_ts, cur_price = ring[-1]
+        cutoff_ms = cur_ts - int(self.arb_window_s * 1000)
+        # Walk forward to find the oldest sample in [cutoff_ms, cur_ts]
         old_price = None
         old_ts = None
         for ts, px in ring:
-            if ts >= cutoff_ms:
+            if cutoff_ms <= ts <= cur_ts:
                 old_price = px
                 old_ts = ts
                 break
         if old_price is None:
             return (Decision("FLAT", 0.0, 0.0, "no binance sample in window"),
                     Decision("FLAT", 0.0, 0.0, "no binance sample in window"))
-
-        cur_price = ring[-1][1]
-        cur_ts = ring[-1][0]
         delta_usd = cur_price - old_price
         delta_age_s = (cur_ts - old_ts) / 1000.0
 
@@ -2635,12 +2842,20 @@ class DiffusionSignal(Signal):
                     Decision("FLAT", 0.0, 0.0, reason))
 
         # ── Book staleness gate ───────────────────────────────────
+        # We want genuine Polymarket pricing lag (300-3000ms), not WS
+        # disconnects (which produce 5000-30000ms+ staleness). Cap at
+        # 5s: anything beyond that is a feed outage, not an arb.
         book_age_ms = ctx.get("_book_age_ms")
         if book_age_ms is None:
-            book_age_ms = 0  # backtest path: book is fresh by definition
+            book_age_ms = 0
         if book_age_ms < self.arb_book_stale_ms:
             reason = (f"book fresh ({book_age_ms:.0f}ms < "
                       f"{self.arb_book_stale_ms:.0f}ms); arb requires staleness")
+            return (Decision("FLAT", 0.0, 0.0, reason),
+                    Decision("FLAT", 0.0, 0.0, reason))
+        if book_age_ms > 5000:
+            reason = (f"book too stale ({book_age_ms:.0f}ms > 5000ms); "
+                      f"likely WS disconnect, not pricing lag")
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
@@ -2663,23 +2878,16 @@ class DiffusionSignal(Signal):
             return (Decision("FLAT", 0.0, 0.0, reason),
                     Decision("FLAT", 0.0, 0.0, reason))
 
-        # ── Fee accounting (informational, not gating) ────────────
-        # Polymarket dynamic taker fee = 7.2% × p × (1−p), max ~1.8% at
-        # p=0.5. The fee is on the CONTRACT, the Δ is on BTC SPOT —
-        # different unit systems. A 4bp BTC move on a binary at 0.35
-        # implies ~30+ percentage points of probability shift (because
-        # binaries are leveraged), which dwarfs any fee. So we DON'T
-        # gate on a "Δ > fee" check (that comparison is unit-confused).
-        # Instead the gating is:
-        #   1. arb_delta_usd threshold: "the move is big enough"
-        #   2. arb_min_ask / arb_max_ask: "we're in a sane price band"
-        # The user should tune arb_delta_usd to match worst-case fees:
-        # at ask=0.50 worst-case fee is 1.8%; bumping arb_delta_usd
-        # higher demands a larger underlying move per unit fee paid.
+        # ── Fee & edge accounting ─────────────────────────────────
+        # For a binary option, edge = (expected payout) - cost.
+        # If we buy the winning side at `ask`, payout is 1.0, so:
+        #   edge = (1.0 - ask) - fee
+        # This is the correct unit: contract price space (0-1).
+        # We also track the BTC spot move in bps for logging.
         fee = poly_fee(ask)
         spot = (cur_price if cur_price > 0 else snapshot.window_start_price) or 1.0
-        delta_bps = abs(delta_usd) / spot * 10000  # informational
-        fee_bps = fee * 10000  # informational
+        delta_bps = abs(delta_usd) / spot * 10000
+        edge_proxy = (1.0 - ask) - fee
 
         # ── Sizing: fixed $ with bankroll cap ─────────────────────
         size_usd = min(self.arb_size_usd,
@@ -2695,16 +2903,14 @@ class DiffusionSignal(Signal):
         ctx["_arb_delta_usd"] = delta_usd
         ctx["_arb_delta_bps"] = delta_bps
         ctx["_arb_book_age_ms"] = book_age_ms
-        ctx["_arb_fee_bps"] = fee_bps
-        # Populate display ctx so the dashboard shows what's happening
-        ctx["_p_model_raw"] = 1.0 if side == "BUY_UP" else 0.0  # not really, but the display reads this
+        ctx["_arb_fee"] = fee
+        ctx["_p_model_raw"] = 1.0 if side == "BUY_UP" else 0.0
         ctx["_p_display"] = 1.0 if side == "BUY_UP" else 0.0
 
-        edge_proxy = (delta_bps - fee_bps) / 10000.0  # in price units, for display
         reason = (
             f"LATENCY_ARB Δ=${delta_usd:+.2f} ({delta_bps:+.1f}bp) "
             f"in {delta_age_s:.1f}s book_age={book_age_ms:.0f}ms "
-            f"ask={ask:.3f} fee={fee*100:.2f}% size=${size_usd:.0f}"
+            f"ask={ask:.3f} fee={fee*100:.2f}% edge={edge_proxy:.4f} size=${size_usd:.0f}"
         )
         if side == "BUY_UP":
             return (Decision("BUY_UP", edge_proxy, size_usd, reason),

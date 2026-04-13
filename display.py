@@ -31,6 +31,62 @@ def _safe_dict(obj):
         return {}
 
 
+def _result_key(result) -> tuple:
+    fill = result.fill
+    return (
+        fill.market_slug,
+        fill.side,
+        int(fill.entry_ts_ms),
+        round(float(fill.shares), 4),
+        round(float(fill.cost_usd), 4),
+        int(result.outcome_up),
+        round(float(result.payout), 4),
+        round(float(result.pnl), 4),
+    )
+
+
+def _dedupe_results(results):
+    unique = []
+    seen = set()
+    for result in results:
+        key = _result_key(result)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(result)
+    return unique
+
+
+def _fill_key(fill: dict) -> tuple:
+    return (
+        str(fill.get("order_id", "")),
+        str(fill.get("market_slug", "")),
+        str(fill.get("side", "")),
+        round(float(fill.get("shares", 0.0) or 0.0), 4),
+        round(float(fill.get("cost_usd", 0.0) or 0.0), 4),
+        round(float(fill.get("fill_ts_unix", fill.get("entry_ts", 0.0)) or 0.0), 3),
+    )
+
+
+def _marked_fill_value(fill: dict, flat_state: dict) -> float:
+    side = str(fill.get("side", "")).upper()
+    bid_key = "up_best_bid" if side == "UP" else "down_best_bid"
+    bid_val = flat_state.get(bid_key)
+    try:
+        bid = float(bid_val) if bid_val not in (None, "") else None
+    except (TypeError, ValueError):
+        bid = None
+    shares = float(fill.get("shares", 0.0) or 0.0)
+    cost = float(fill.get("cost_usd", 0.0) or 0.0)
+    if bid is None or bid <= 0 or shares <= 0:
+        return cost
+    return bid * shares
+
+
+def _pending_fill_upnl(fill: dict, flat_state: dict) -> float:
+    return _marked_fill_value(fill, flat_state) - float(fill.get("cost_usd", 0.0) or 0.0)
+
+
 def _pct(vals: list[float], q: float) -> float | None:
     if not vals:
         return None
@@ -231,18 +287,24 @@ def _render_section(
 
     # Bankroll + trades compact line. Show available cash AND the
     # cost locked up in resting orders + filled-but-unresolved positions
-    # so the operator can see why bankroll != cumulative PnL when there
-    # are open orders / pending fills.
+    # so the operator can see why bankroll != realized PnL when there
+    # are open orders / pending fills. Pending fills are marked to the
+    # current bid so underwater positions show up in the headline stats
+    # instead of looking like "cash vanished but PnL went up".
     open_orders = _safe_list(tracker.open_orders)
     pending_fills = _safe_list(tracker.pending_fills)
-    locked = sum(o.get("cost_est", 0) for o in open_orders) + \
-             sum(f.get("cost_usd", 0) for f in pending_fills)
+    reserved_cash = sum(o.get("cost_est", 0) for o in open_orders)
+    marked_positions = sum(_marked_fill_value(f, flat_state) for f in pending_fills)
+    open_upnl = sum(_pending_fill_upnl(f, flat_state) for f in pending_fills)
+    locked = reserved_cash + marked_positions
     avail = tracker.bankroll
     total_equity = avail + locked
     if locked > 0.01:
         lines.append(
             f"  Equity: ${total_equity:,.2f}  "
-            f"(cash ${avail:,.2f} + locked ${locked:,.2f})  |  "
+            f"(cash ${avail:,.2f} + orders ${reserved_cash:,.2f} "
+            f"+ pos ${marked_positions:,.2f})  |  "
+            f"uPnL: ${open_upnl:+,.2f}  |  "
             f"Trades: {tracker.window_trade_count}/win  |  "
             f"Open: {len(open_orders)}  |  Pos: {len(pending_fills)}"
         )
@@ -284,15 +346,9 @@ def _render_section(
 
     # Positions (compact)
     if pending_fills:
-        bid_map = {
-            "UP": flat_state.get("up_best_bid"),
-            "DOWN": flat_state.get("down_best_bid"),
-        }
         for fill in pending_fills:
             entry_px = fill["cost_usd"] / fill["shares"] if fill["shares"] > 0 else 0
-            bid_val = bid_map.get(fill["side"])
-            bid_f = float(bid_val) if bid_val else 0.0
-            upnl = (bid_f - entry_px) * fill["shares"]
+            upnl = _pending_fill_upnl(fill, flat_state)
             hold_s = int(_time.time() - fill.get("fill_ts_unix", _time.time()))
             lines.append(
                 f"    POS  {fill['side']:>4s} {fill['shares']:.1f}sh "
@@ -397,11 +453,8 @@ def render_display(
     max_dd = 0.0
     max_dd_pct = 0.0
     event_logs = []
-
-    # Aggregate lifetime + session totals across all timeframe trackers
-    lifetime_pnl_total = 0.0
-    lifetime_trades_total = 0
-    lifetime_wins_total = 0
+    open_upnl_total = 0.0
+    seen_pending_keys: set[tuple] = set()
     for sec in sections:
         t = sec["tracker"]
         all_results_combined.extend(_safe_list(t.all_results))
@@ -412,39 +465,37 @@ def render_display(
             max_dd = t.max_drawdown
             max_dd_pct = t.max_dd_pct
         event_logs.extend(_safe_list(t.event_log))
-        # Lifetime scalars (P12.4) — survive restarts via state file
-        lifetime_pnl_total += getattr(t, "lifetime_pnl", 0.0)
-        lifetime_trades_total += getattr(t, "lifetime_trades", 0)
-        lifetime_wins_total += getattr(t, "lifetime_wins", 0)
+        for fill in _safe_list(t.pending_fills):
+            key = _fill_key(fill)
+            if key in seen_pending_keys:
+                continue
+            seen_pending_keys.add(key)
+            open_upnl_total += _pending_fill_upnl(fill, sec["flat_state"])
 
-    # Session = since last restart (in-memory all_results)
-    session_total = len(all_results_combined)
-    session_pnl = sum(r.pnl for r in all_results_combined)
-    session_wins = sum(1 for r in all_results_combined if r.pnl > 0)
+    unique_results = _dedupe_results(all_results_combined)
+    closed_total = len(unique_results)
+    realized_pnl = sum(r.pnl for r in unique_results)
+    closed_wins = sum(1 for r in unique_results if r.pnl > 0)
+    net_pnl = realized_pnl + open_upnl_total
 
     lines.append("  -- Stats " + "-" * 50)
-    if lifetime_trades_total > 0:
-        # Show lifetime AND session when both are meaningful
-        lifetime_wr = (lifetime_wins_total / lifetime_trades_total
-                       if lifetime_trades_total > 0 else 0.0)
+    if closed_total > 0:
         lines.append(
-            f"  Lifetime: ${lifetime_pnl_total:+,.2f}  "
-            f"({lifetime_trades_total} trades, {lifetime_wr:.0%} win)  |  "
+            f"  Realized: ${realized_pnl:+,.2f}  |  "
+            f"Open uPnL: ${open_upnl_total:+,.2f}  |  "
+            f"Net: ${net_pnl:+,.2f}"
+        )
+        closed_wr = closed_wins / closed_total
+        lines.append(
+            f"  Trades: {closed_wins}/{closed_total} ({closed_wr:.0%})  |  "
+            f"Windows: {total_windows_traded}/{total_windows_seen}  |  "
             f"DD: ${max_dd:.0f} ({max_dd_pct:.1%})"
         )
-        if session_total > 0:
-            session_wr = session_wins / session_total
-            lines.append(
-                f"  Session:  ${session_pnl:+,.2f}  "
-                f"({session_total} trades, {session_wr:.0%} win)  |  "
-                f"Windows: {total_windows_traded}/{total_windows_seen}"
-            )
     else:
-        # Pre-P12.4 path or first session: only show session
-        win_str = (f"{session_wins}/{session_total} ({session_wins / session_total:.0%})"
-                   if session_total > 0 else "---")
         lines.append(
-            f"  PnL: ${session_pnl:+,.2f}  |  Win: {win_str}  |  "
+            f"  Realized: ${realized_pnl:+,.2f}  |  "
+            f"Open uPnL: ${open_upnl_total:+,.2f}  |  "
+            f"Net: ${net_pnl:+,.2f}  |  "
             f"DD: ${max_dd:.0f} ({max_dd_pct:.1%})"
         )
         lines.append(
@@ -453,8 +504,8 @@ def render_display(
         )
 
     # Last result
-    if all_results_combined:
-        r = all_results_combined[-1]
+    if unique_results:
+        r = unique_results[-1]
         tag = "WON" if r.pnl > 0 else "LOST"
         lines.append(
             f"  Last: {r.fill.side} ${r.fill.cost_usd:.2f} -> "

@@ -1,80 +1,56 @@
-# Prediction Market Bot
+# BTC Latency Arbitrage Bot
 
-Automated trading bot for Polymarket BTC / ETH / SOL / XRP "Up or Down"
-binary markets (5-minute and 15-minute windows). Posts CLOB limit orders
-from a diffusion-model-based signal with Bayesian calibration, market
-blending, and microstructure gating.
+  Fires FOK taker orders when Binance BTC moves significantly in 2s and
+  Polymarket's order book is still stale.
 
-## Quickstart
+  ## Strategy
 
-```bash
-uv sync
-uv run python live_trader.py --market btc --dry-run --bankroll 500
-uv run python dashboard.py
-uv run python backtest.py --market btc_5m --signal diffusion --train-frac 0.7
-uv run python recorder.py --market btc
-```
+  Binance is the price-discovery venue; Polymarket market makers lag.
+  When Binance moves ≥ $30 in 2s and Polymarket's book is 300-5000ms
+  stale, we cross the ask on the side of the move. Chainlink is the
+  settlement oracle (not our signal).
 
-The Rust feed extension prints WebSocket reconnect events to stderr
-(e.g. `[BookFeed] read error: ...`). These are auto-recovered by the
-30-second stale watchdog and aren't a concern. To keep the display
-clean, redirect stderr to a file:
-```bash
-uv run python live_trader.py --market btc 2>err.log
-```
+  No probability model. No Kelly sizing. Pure momentum + venue latency.
 
-## Repo Layout
+  ## Architecture
 
-| File / Dir | Purpose |
-|---|---|
-| `live_trader.py` | Live-trading entrypoint. Window lifecycle, feeds, execution. |
-| `backtest.py` | Walk-forward backtest engine + `DiffusionSignal` (the main signal). |
-| `market_config.py` | Per-market parameters (σ bounds, thresholds, `market_blend`, gates). |
-| `tracker.py` | Live state machine — orders, fills, resolutions, bankroll. |
-| `feeds.py` | WebSocket feeds: CLOB book, Chainlink RTDS, Binance book ticker. |
-| `recording.py` / `recorder.py` | Per-second parquet snapshot writer. |
-| `orders.py` / `redemption.py` | Order placement; on-chain CTF redemption. |
-| `market_api.py` | Gamma API + CLOB REST client. |
-| `dashboard.py` + `dashboard_signal_worker.py` | FastAPI web dashboard. |
-| `display.py` | Terminal UI for `live_trader.py`. |
-| `tick_backtest.py` / `train_filtration.py` / `clean_data.py` | Support scripts. |
-| `filtration_model.py` / `.pkl` | XGBoost confidence gate (opt-in). |
-| `regime_classifier.py` / `.pkl` | HMM regime classifier (auto-loaded). |
-| `data/` | Per-second parquet snapshots per market. Gitignored. |
-| `analysis/` | Offline analysis scripts + plot outputs + notebooks. |
-| `scripts/` | Validation scripts, training scripts, σ estimators, Hawkes tools. |
-| `tests/` | Unit tests. |
-| `validation_runs/` | Trade parquets, metrics, ergodicity plots, RESULTS docs. |
-| `tasks/findings/` | Dated markdown findings from each investigation. |
-| `rust/` | Compiled into `polybot_core` Python extension (`.so` in `.venv`). Live path — all WebSocket feeds (CLOB book, Chainlink RTDS, Binance book ticker, user orders) run in Rust. Python is orchestration only. |
+      Binance WS ──┐
+                   │
+      Polymarket ──┼──> signal_ticker ──> decide_latency_arb ──> FOK taker
+      CLOB WS      │         │
+                   │         ├─ Tau gate (≥30s)
+      Chainlink ───┘         ├─ Cooldown (4s)
+                             ├─ |Binance Δ| ≥ $30 over 2s
+                             ├─ book_age in [300, 5000] ms
+                             ├─ ask in [0.15, 0.85]
+                             └─ Fire: side = sign(Δ)
 
-## Signal Pipeline
+  ## Files
 
-`DiffusionSignal.decide_both_sides()`:
+  - `live_trader.py` — entry point, runs feeds + signal loop
+  - `signal_diffusion.py` — `decide_latency_arb()` at ~L2762
+  - `tracker.py` — order execution, fill logging, bankroll
+  - `feeds.py` — snapshot builder from Rust BookFeed
+  - `market_api.py` — Polymarket market discovery via Gamma API
+  - `market_config.py` — BTC 5m + 15m parameters
+  - `orders.py` — `OrderClient` (signs and posts CLOB orders)
+  - `recorder.py` — `OrderBook` parser (required by snapshots)
+  - `display.py` — terminal dashboard
 
-1. Gates: missing book / invalid asks / stale feature (book, chainlink, binance, trade tape).
-2. σ estimation (Yang-Zhang on 5s bars, opt-in EWMA/RV/GARCH).
-3. `z = (chainlink − window_start) / (σ · √τ)`, capped.
-4. `p_model = Φ(z)`.
-5. Bayesian fusion with calibration table: `p = w·p_cal + (1−w)·p_model`.
-6. Market blend: `p_final = (1−blend)·p + blend·mid_up`.
-7. OBI nudge + reversion discount.
-8. Edge = `p − bid − spread_penalty − fees`.
-9. Fractional Kelly × regime multiplier.
-10. Entry gates: `min_entry_z`, `min_entry_price`, `edge_threshold`, momentum, spread, toxicity.
+  ## Running
 
-## Shipped Params
+      python live_trader.py --market btc --latency-arb --dry-run \
+          --bankroll 100 --arb-delta-usd 30 --arb-book-stale-ms 300 \
+          2>err.log
 
-| Market | `tail_mode` | `market_blend` | `min_entry_z` | `min_entry_price` | `max_book_age_ms` |
-|---|---|---:|---:|---:|---:|
-| BTC 15m (`btc`) | kou | 0.5 | 0.5 | 0.25 | – |
-| BTC 5m (`btc_5m`) | kou | 0.3 | 0.0 | 0.20 | 1000 |
-| ETH 15m (`eth`) | student_t (ν=13) | 0.0 | 0.5 | 0.25 | – |
-| ETH 5m (`eth_5m`) | student_t (ν=15) | 0.0 | 0.5 | 0.25 | – |
-| SOL / XRP 15m / 5m | normal | 0.0 | 0.5 | 0.25 | – |
+  ## Parameters
 
-## Plots
-
-![Reliability](analysis/outputs/calibration_reliability.png)
-![Calibration by tau](analysis/outputs/calibration_by_tau.png)
-![Prediction distributions](analysis/outputs/calibration_distributions.png)
+  | Flag | Default | Meaning |
+  |---|---|---|
+  | `--arb-delta-usd` | 30 | Binance move threshold |
+  | `--arb-window-s` | 2.0 | Lookback window for delta |
+  | `--arb-book-stale-ms` | 300 | Min book age to qualify as stale |
+  | `--arb-cooldown-s` | 4.0 | Wait between fires |
+  | `--arb-min-ask` / `--arb-max-ask` | 0.15 / 0.85 | Entry price band |
+  | `--arb-min-tau-s` | 30 | Don't fire within 30s of window end |
+  | `--arb-size-usd` | 10 | Fixed bet size |

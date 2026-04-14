@@ -215,18 +215,6 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         max_binance_age_ms=2_000.0,      # binance bookTicker is 100ms; 2s = severe lag
         max_trade_tape_age_ms=10_000.0,  # trade tape is bursty; 10s of silence is ok
     ),
-    "eth": MarketConfig(
-        slug_prefix="eth-updown-15m",
-        chainlink_symbol="eth/usd",
-        data_subdir="eth_15m",
-        display_name="ETH 15m",
-        window_duration_s=900.0,
-        window_align_m=15,
-        max_sigma=1.0e-04,
-        binance_symbol="ethusdt",
-        tail_mode="student_t",
-        tail_nu_default=13.0,
-    ),
     "btc_5m": MarketConfig(
         slug_prefix="btc-updown-5m",
         chainlink_symbol="btc/usd",
@@ -320,112 +308,6 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         max_binance_age_ms=1_500.0,      # tighter than 15m — 5m bot reacts faster
         max_trade_tape_age_ms=8_000.0,
     ),
-    "eth_5m": MarketConfig(
-        slug_prefix="eth-updown-5m",
-        chainlink_symbol="eth/usd",
-        data_subdir="eth_5m",
-        display_name="ETH 5m",
-        window_duration_s=300.0,
-        window_align_m=5,
-        max_sigma=1.0e-04,
-        binance_symbol="ethusdt",
-        tail_mode="student_t",
-        tail_nu_default=15.0,
-    ),
-    "sol": MarketConfig(
-        slug_prefix="sol-updown-15m",
-        chainlink_symbol="sol/usd",
-        data_subdir="sol_15m",
-        display_name="SOL 15m",
-        window_duration_s=900.0,
-        window_align_m=15,
-        max_sigma=1.2e-04,
-        binance_symbol="solusdt",
-        # Live runs SOL with no max_z override → class default 1.0.
-        # Pinned here so backtest matches live. Revisit if SOL is re-tuned.
-        max_z=1.0,
-    ),
-    "sol_5m": MarketConfig(
-        slug_prefix="sol-updown-5m",
-        chainlink_symbol="sol/usd",
-        data_subdir="sol_5m",
-        display_name="SOL 5m",
-        window_duration_s=300.0,
-        window_align_m=5,
-        max_sigma=1.2e-04,
-        binance_symbol="solusdt",
-        max_z=1.0,
-    ),
-    "xrp": MarketConfig(
-        slug_prefix="xrp-updown-15m",
-        chainlink_symbol="xrp/usd",
-        data_subdir="xrp_15m",
-        display_name="XRP 15m",
-        window_duration_s=900.0,
-        window_align_m=15,
-        max_sigma=1.2e-04,
-        binance_symbol="xrpusdt",
-        max_z=1.0,
-    ),
-    "xrp_5m": MarketConfig(
-        slug_prefix="xrp-updown-5m",
-        chainlink_symbol="xrp/usd",
-        data_subdir="xrp_5m",
-        display_name="XRP 5m",
-        window_duration_s=300.0,
-        window_align_m=5,
-        max_sigma=1.2e-04,
-        binance_symbol="xrpusdt",
-        max_z=1.0,
-    ),
-    "btc_1h": MarketConfig(
-        slug_prefix="bitcoin-up-or-down",
-        chainlink_symbol="btc/usd",
-        data_subdir="btc_1h",
-        display_name="BTC 1h",
-        window_duration_s=3600.0,
-        window_align_m=60,
-        min_sigma=2e-05,
-        # btc_1h live uses base_market="btc_1h", which does NOT match
-        # the "btc" branch in live_trader.py:1168 → no max_z override →
-        # class default 1.0. Pinned here for backtest parity. If this
-        # should be 3.0 (matching btc_5m/btc_15m), the live override
-        # chain also needs updating — don't silently change one side.
-        max_z=1.0,
-        # 1h windows accumulate more vol samples → per-second sigma can
-        # be higher than 15m. The 4e-4 ceiling was hitting on ~30% of
-        # windows, clipping the signal. 1e-3 covers p99.9 of 1h sigma.
-        max_sigma=1e-03,
-        binance_symbol="btcusdt",
-        tail_mode="kou",
-        # 2026-04-10: the backtest analysis on synthetic data suggested 0.30,
-        # but live shows |z| rarely exceeds 0.22 on 1h because sqrt(tau)
-        # is 3-4x larger than 15m. Lowered to 0.10 so the bot actually
-        # trades. The edge_threshold (0.04) is the real quality filter.
-        min_entry_z=0.10,
-        # 2026-04-10: raised from default 0.25 to 0.40. Entries at <$0.45
-        # had 35% WR — deep OTM contrarian bets that fail on 1h.
-        min_entry_price=0.40,
-        market_blend=0.5,
-        max_model_market_disagreement=0.30,
-        # 1h has room for many buy/sell cycles when early-exit is on.
-        # Each cycle = 1 buy + 1 sell. With 20 max, up to 10 round-trips.
-        # Only 1 position held at any time — the cap is on total orders
-        # placed, not concurrent positions.
-        max_trades_per_window=20,
-        # Lower edge threshold for 1h — the early_edge_mult inflates
-        # the dynamic threshold by sqrt(tau/3600), which at mid-window
-        # pushes it to ~0.11 at edge_threshold=0.06. With 0.04 the
-        # mid-window threshold is ~0.074, which lets legitimate setups
-        # through. The 1h window gives more time for the edge to
-        # materialize vs 5m/15m where a quick threshold is defensive.
-        edge_threshold=0.04,
-        max_book_age_ms=10_000.0,
-        max_chainlink_age_ms=60_000.0,
-        max_binance_age_ms=5_000.0,
-        max_trade_tape_age_ms=15_000.0,
-        min_trade_sigma=2.5e-5,
-    ),
 }
 
 DEFAULT_MARKET = "btc"
@@ -433,10 +315,6 @@ DEFAULT_MARKET = "btc"
 # Paired configs: base asset -> (15m_key, 5m_key)
 _PAIRED = {
     "btc": ("btc", "btc_5m"),
-    "eth": ("eth", "eth_5m"),
-    "sol": ("sol", "sol_5m"),
-    "xrp": ("xrp", "xrp_5m"),
-    "btc_1h": ("btc_1h",),  # standalone, not paired with 5m/15m yet
 }
 
 

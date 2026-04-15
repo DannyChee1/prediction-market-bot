@@ -1,0 +1,31 @@
+binance_probe  host='Dannys-MacBook-Air.local'  2026-04-14 07:58:32 UTC
+
+=== stream.binance.com:9443 ===
+  DNS: 54.168.127.231 (AWS (unclassified)), 13.159.163.112 (non-AWS / CDN), 13.192.139.240 (non-AWS / CDN), 18.176.113.100 (AWS (unclassified))
+  TCP  n=10 min=165.5 p50=172.4 max=177.4 ms
+  WS:  opened in 875.1 ms  (HTTP 101 Switching Protocols)
+  WS:  first message at 82 ms from connect
+  WS:  20 msgs  inter-arrival  min=0.0 p50=0.0 max=59.6 ms
+  -> READ-ONLY ACCESS: OK
+
+=== data-stream.binance.vision ===
+  DNS: 18.181.142.103 (ap-northeast-1 Tokyo), 57.181.99.244 (non-AWS / CDN), 52.193.33.42 (AWS (unclassified)), 52.193.115.95 (AWS (unclassified))
+  TCP  n=10 min=165.6 p50=172.3 max=176.6 ms
+  WS:  opened in 874.2 ms  (HTTP 101 Switching Protocols)
+  WS:  first message at 106 ms from connect
+  WS:  20 msgs  inter-arrival  min=0.0 p50=0.0 max=95.5 ms
+  -> READ-ONLY ACCESS: OK
+
+=== fstream.binance.com ===
+  DNS: 52.197.93.34 (AWS (unclassified)), 52.194.26.55 (AWS (unclassified)), 54.168.197.79 (AWS (unclassified)), 18.177.43.87 (AWS (unclassified))
+  TCP  n=10 min=166.6 p50=171.5 max=176.2 ms
+  WS:  opened in 827.3 ms  (HTTP 101 Switching Protocols)
+  WS:  first message at 69 ms from connect
+  WS:  20 msgs  inter-arrival  min=0.0 p50=3.0 max=308.5 ms
+  -> READ-ONLY ACCESS: OK
+
+Legend:
+  * TCP p50  = pure geographic RTT
+  * WS open  = TCP + TLS + HTTP upgrade (~2x TCP RTT expected)
+  * inter-arrival = how fast bookTicker updates flow once connected
+  * If any endpoint shows 'OPEN FAILED 451' -> IP-geofenced, skip it

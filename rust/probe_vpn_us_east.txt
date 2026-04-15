@@ -1,0 +1,29 @@
+binance_probe  host='Dannys-MacBook-Air.local'  2026-04-14 07:58:01 UTC
+
+=== stream.binance.com:9443 ===
+  DNS: 13.192.45.224 (non-AWS / CDN), 54.150.59.169 (AWS (unclassified)), 13.114.108.198 (non-AWS / CDN), 52.196.198.222 (ap-northeast-1 Tokyo)
+  TCP  n=10 min=185.7 p50=189.1 max=193.7 ms
+  WS:  OPEN FAILED — HTTP error: 451 Unavailable For Legal Reasons
+       ^ geofenced / compliance-blocked from this IP
+
+=== data-stream.binance.vision ===
+  DNS: 13.193.41.216 (non-AWS / CDN), 13.112.77.52 (non-AWS / CDN), 52.193.33.42 (AWS (unclassified)), 52.193.76.183 (AWS (unclassified))
+  TCP  n=10 min=21.0 p50=90.2 max=105.1 ms
+  WS:  opened in 1347.2 ms  (HTTP 101 Switching Protocols)
+  WS:  first message at 112 ms from connect
+  WS:  20 msgs  inter-arrival  min=0.0 p50=2.6 max=502.4 ms
+  -> READ-ONLY ACCESS: OK
+
+=== fstream.binance.com ===
+  DNS: 18.178.25.228 (AWS (unclassified)), 54.150.255.11 (AWS (unclassified)), 54.199.44.184 (AWS (unclassified)), 13.193.146.191 (non-AWS / CDN)
+  TCP  n=10 min=20.1 p50=88.6 max=104.7 ms
+  WS:  opened in 2089.4 ms  (HTTP 101 Switching Protocols)
+  WS:  first message at 186 ms from connect
+  WS:  20 msgs  inter-arrival  min=0.0 p50=2.2 max=181.8 ms
+  -> READ-ONLY ACCESS: OK
+
+Legend:
+  * TCP p50  = pure geographic RTT
+  * WS open  = TCP + TLS + HTTP upgrade (~2x TCP RTT expected)
+  * inter-arrival = how fast bookTicker updates flow once connected
+  * If any endpoint shows 'OPEN FAILED 451' -> IP-geofenced, skip it

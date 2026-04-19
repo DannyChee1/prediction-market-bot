@@ -5,24 +5,6 @@ binary markets (5-minute and 15-minute windows). Posts CLOB limit orders
 from a diffusion-model-based signal with Bayesian calibration, market
 blending, and microstructure gating.
 
-## Quickstart
-
-```bash
-uv sync
-uv run python live_trader.py --market btc --dry-run --bankroll 500
-uv run python dashboard.py
-uv run python backtest.py --market btc_5m --signal diffusion --train-frac 0.7
-uv run python recorder.py --market btc
-```
-
-The Rust feed extension prints WebSocket reconnect events to stderr
-(e.g. `[BookFeed] read error: ...`). These are auto-recovered by the
-30-second stale watchdog and aren't a concern. To keep the display
-clean, redirect stderr to a file:
-```bash
-uv run python live_trader.py --market btc 2>err.log
-```
-
 ## Repo Layout
 
 | File / Dir | Purpose |
@@ -62,16 +44,6 @@ uv run python live_trader.py --market btc 2>err.log
 8. Edge = `p − bid − spread_penalty − fees`.
 9. Fractional Kelly × regime multiplier.
 10. Entry gates: `min_entry_z`, `min_entry_price`, `edge_threshold`, momentum, spread, toxicity.
-
-## Shipped Params
-
-| Market | `tail_mode` | `market_blend` | `min_entry_z` | `min_entry_price` | `max_book_age_ms` |
-|---|---|---:|---:|---:|---:|
-| BTC 15m (`btc`) | kou | 0.5 | 0.5 | 0.25 | – |
-| BTC 5m (`btc_5m`) | kou | 0.3 | 0.0 | 0.20 | 1000 |
-| ETH 15m (`eth`) | student_t (ν=13) | 0.0 | 0.5 | 0.25 | – |
-| ETH 5m (`eth_5m`) | student_t (ν=15) | 0.0 | 0.5 | 0.25 | – |
-| SOL / XRP 15m / 5m | normal | 0.0 | 0.5 | 0.25 | – |
 
 ## Plots
 

@@ -171,29 +171,45 @@ fn encode_redeem_calldata(condition_id: &str) -> Result<Vec<u8>> {
     Ok(call.abi_encode())
 }
 
-fn encode_proxy_calldata(redeem_data: Vec<u8>) -> Vec<u8> {
-    let call = proxyCall {
-        txns: vec![ProxyArg {
+fn encode_proxy_calldata(redeem_datas: Vec<Vec<u8>>) -> Vec<u8> {
+    let txns: Vec<ProxyArg> = redeem_datas
+        .into_iter()
+        .map(|data| ProxyArg {
             kind: 1, // DelegateCall semantic per Polymarket proxy
             to: CTF_ADDRESS,
             value: U256::ZERO,
-            data: redeem_data.into(),
-        }],
-    };
+            data: data.into(),
+        })
+        .collect();
+    let call = proxyCall { txns };
     call.abi_encode()
 }
 
 // ── Public entry point ─────────────────────────────────────────────────────
 
-/// Redeem a winning CTF position via the builder relayer. Returns the
-/// on-chain tx hash once confirmed (STATE_MINED / STATE_CONFIRMED).
+/// Redeem a single winning CTF position. Wrapper around the batch API.
+/// Kept for ergonomic single-position redemption if ever needed.
+#[allow(dead_code)]
+pub async fn redeem_position(http: &reqwest::Client, condition_id: &str) -> Result<String> {
+    redeem_positions(http, std::slice::from_ref(&condition_id.to_string())).await
+}
+
+/// Redeem MULTIPLE winning CTF positions in a single relayer call.
+/// One HTTP call, one signature, one quota unit — regardless of batch size.
+/// Max 15 per batch (proxy encoding limit).
 ///
 /// Reads from env: PRIVATE_KEY, POLY_BUILDER_API_KEY, POLY_BUILDER_SECRET,
-/// POLY_BUILDER_PASSPHRASE. All must be set, or this returns an error.
-pub async fn redeem_position(
+/// POLY_BUILDER_PASSPHRASE. All must be set.
+pub async fn redeem_positions(
     http: &reqwest::Client,
-    condition_id: &str,
+    condition_ids: &[String],
 ) -> Result<String> {
+    if condition_ids.is_empty() {
+        return Err(anyhow!("empty batch"));
+    }
+    if condition_ids.len() > 15 {
+        return Err(anyhow!("max 15 per batch, got {}", condition_ids.len()));
+    }
     let private_key = std::env::var("PRIVATE_KEY")
         .context("PRIVATE_KEY not set")?;
     let builder_key = std::env::var("POLY_BUILDER_API_KEY")
@@ -209,9 +225,12 @@ pub async fn redeem_position(
     let signer_addr = signer.address();
     let proxy_wallet = derive_proxy_wallet(signer_addr);
 
-    // 1+2. Build the proxy tx data
-    let redeem_data = encode_redeem_calldata(condition_id)?;
-    let proxy_data = encode_proxy_calldata(redeem_data);
+    // 1+2. Build the proxy tx data — one redeemPositions per conditionId, all bundled.
+    let mut redeem_datas = Vec::with_capacity(condition_ids.len());
+    for cid in condition_ids {
+        redeem_datas.push(encode_redeem_calldata(cid)?);
+    }
+    let proxy_data = encode_proxy_calldata(redeem_datas);
     let proxy_data_hex = format!("0x{}", hex::encode(&proxy_data));
 
     // 3. GET /relay-payload to get nonce + relay address
@@ -304,16 +323,6 @@ pub async fn redeem_position(
 
     let ts2 = now_ts();
     let sig2 = hmac_sign(&builder_secret, &ts2, "POST", "/submit", Some(&body_str))?;
-
-    // One-time debug: log the exact body bytes + signature so we can diff
-    // against a known-good Python run if auth still fails.
-    eprintln!(
-        "  [REDEEM_DEBUG] ts={ts2} body_len={} sig_len={} body_first80={:?} sig={}",
-        body_str.len(),
-        sig2.len(),
-        &body_str.chars().take(80).collect::<String>(),
-        sig2,
-    );
 
     let submit = header_set(
         http.post(format!("{RELAYER_URL}/submit")),

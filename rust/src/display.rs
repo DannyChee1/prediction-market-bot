@@ -44,7 +44,7 @@ pub fn print_dashboard(
     let now_et = now.with_timezone(&et());
     print!("\x1b[2J\x1b[H");
     println!(
-        "━━━ BTC Latency Arb · {} ET · bankroll ${:.2} fills={} w/l={}/{} realized=${:+.2} ━━━",
+        "━━━ Latency Arb · {} ET · bankroll ${:.2} fills={} w/l={}/{} realized=${:+.2} ━━━",
         now_et.format("%-I:%M:%S %p"),
         bankroll,
         fills,

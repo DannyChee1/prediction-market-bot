@@ -98,7 +98,7 @@ async fn ws_sample(url: &str, sub: Option<&str>) -> Option<(f64, Option<f64>)> {
     let (mut write, mut read) = ws.split();
 
     if let Some(s) = sub {
-        let _ = write.send(Message::Text(s.to_string())).await;
+        let _ = write.send(Message::Text(s.to_string().into())).await;
     }
 
     // Wait up to 5s for first data frame we'd actually use.

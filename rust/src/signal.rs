@@ -9,7 +9,7 @@ pub struct Snapshot {
     pub window_start_price: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     Flat,
     BuyUp,
@@ -32,6 +32,15 @@ impl Decision {
 pub struct ArbState {
     pub last_fire_ms: i64,
     pub bankroll: f64,
+    /// EWMA σ_2s in USD, updated every ~2s from Binance ring. Persistent
+    /// across ticks — doesn't recompute from scratch each evaluation.
+    pub sigma_2s: f64,
+    /// Sum of `Position::slots()` for positions already open on THIS market's
+    /// current window. Used to inflate the Binance-delta threshold per
+    /// successive fire: each slot already filled makes the next fire require
+    /// a stronger signal (`ramp_per_slot`). At slots_used=0 (no existing
+    /// fire) threshold is unchanged.
+    pub slots_used: f64,
 }
 
 /// Polymarket dynamic taker fee model — currently 7.2% * p * (1-p).
@@ -93,11 +102,35 @@ pub fn decide_latency_arb(
         Some(v) => v,
         None => return Decision::flat("no binance sample in window"),
     };
-    if delta_usd.abs() < arb.delta_usd {
+    // Adaptive threshold: max(floor, k × σ_2s), then inflated by the
+    // per-slot ramp if there are already fires on this window.
+    //
+    // σ_2s is EWMA-estimated (λ=0.94), updated every 2s in MarketRuntime.
+    // Spike-resistant: single $30 move contributes only 6% to variance.
+    //
+    // Ramp: `threshold_effective = base × (1 + ramp_per_slot × slots_used)`.
+    //   - slots_used = 0 (no existing fire): threshold = base
+    //   - slots_used = 1 (one full fill): threshold = base × (1 + ramp)
+    //   - slots_used = 2 (two full fills): threshold = base × (1 + 2·ramp)
+    // Each successive fire within the same window thus requires a stronger
+    // signal, reflecting that subsequent correlated fires have diminishing
+    // marginal edge vs. the first.
+    let sigma_2s = state.sigma_2s;
+    let vol_thresh = arb.sigma_k * sigma_2s;
+    let base = arb.delta_floor.max(vol_thresh);
+    let ramp_factor = 1.0 + arb.ramp_per_slot * state.slots_used;
+    let adaptive = base * ramp_factor;
+    if delta_usd.abs() < adaptive {
         return Decision::flat(format!(
-            "|delta|=${:.2} < ${:.0} (window {:.1}s)",
+            "|delta|=${:.2} < ${:.2} (base=${:.2} ramp×{:.2} slots={:.2} σ=${:.2} k×σ=${:.2} floor=${:.2} window {:.1}s)",
             delta_usd.abs(),
-            arb.delta_usd,
+            adaptive,
+            base,
+            ramp_factor,
+            state.slots_used,
+            sigma_2s,
+            vol_thresh,
+            arb.delta_floor,
             delta_age_s
         ));
     }
@@ -140,18 +173,24 @@ pub fn decide_latency_arb(
     // ── 6. Cross-venue consensus (Coinbase 2s) ───────────────────
     // Binance-specific wicks that Coinbase doesn't confirm are often
     // where makers intentionally leave stale quotes as traps.
+    //
+    // Consensus threshold scales off `arb.delta_floor` (per-asset) rather
+    // than the legacy `arb.delta_usd` constant, so ETH doesn't inherit
+    // BTC's $12.50 Coinbase requirement (which on $2.4k ETH is a 0.5%
+    // move in 2s — effectively impossible, silently blocking every
+    // single ETH fire).
     match ring_delta(coinbase_ring, window_ms) {
         Some((cb_delta, _, _)) => {
             if cb_delta.signum() != delta_usd.signum() {
                 return Decision::flat(format!(
-                    "coinbase disagree: bn={:+.1} cb={:+.1}",
+                    "coinbase disagree: bn={:+.2} cb={:+.2}",
                     delta_usd, cb_delta
                 ));
             }
-            let needed = arb.crossvenue_min_ratio * arb.delta_usd;
+            let needed = arb.crossvenue_min_ratio * arb.delta_floor;
             if cb_delta.abs() < needed {
                 return Decision::flat(format!(
-                    "coinbase weak: |cb|={:.1} < {:.1}*thresh={:.1}",
+                    "coinbase weak: |cb|={:.2} < {:.2}*floor={:.2}",
                     cb_delta.abs(), arb.crossvenue_min_ratio, needed
                 ));
             }
@@ -181,16 +220,23 @@ pub fn decide_latency_arb(
     let delta_bps = delta_usd.abs() / spot * 10_000.0;
     let edge_proxy = (1.0 - ask) - fee;
 
-    // ── 8. Size sanity ───────────────────────────────────────────
-    let size_usd = arb.size_usd.min(state.bankroll * arb.max_bankroll_frac);
+    // ── 8. Z-score proportional sizing ──────────────────────────
+    // Stronger signals (higher z = |Δ|/σ) get larger bets. Scales
+    // from 1.0× base at threshold to 1.5× base at 2× threshold.
+    // Capped by bankroll frac. Respects min 5 shares.
+    let z = if sigma_2s > 0.01 { delta_usd.abs() / sigma_2s } else { 1.0 };
+    let z_scale = (z / arb.sigma_k).clamp(1.0, 1.5);
+    let size_usd = (arb.size_usd * z_scale).min(state.bankroll * arb.max_bankroll_frac);
     if size_usd < arb.min_order_shares * ask {
-        return Decision::flat(format!("size ${size_usd:.2} below min order"));
+        return Decision::flat(format!(
+            "size ${size_usd:.2} below min (z={z:.1} scale={z_scale:.2})"
+        ));
     }
 
     let sign = if delta_usd >= 0.0 { "+" } else { "-" };
     let reason = format!(
         "LATENCY_ARB delta={sign}${:.2} ({sign}{:.1}bp) in {:.1}s book_age={book_age:.0}ms \
-         ask={ask:.3} fee={:.2}% edge={edge_proxy:.4} size=${size_usd:.0}",
+         ask={ask:.3} fee={:.2}% edge={edge_proxy:.4} z={z:.1} size=${size_usd:.2}",
         delta_usd.abs(),
         delta_bps,
         delta_age_s,

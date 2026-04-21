@@ -2,6 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{client_async_tls, MaybeTlsStream, WebSocketStream};
+
 use crate::book::BookSnapshot;
 use crate::types::now_s;
 
@@ -12,6 +16,32 @@ fn store_f64(a: &AtomicU64, v: f64) {
 }
 fn load_f64(a: &AtomicU64) -> f64 {
     f64::from_bits(a.load(Ordering::Acquire))
+}
+
+/// Connect a WebSocket with `TCP_NODELAY` enabled on the underlying socket.
+///
+/// `tokio_tungstenite::connect_async` does not expose a nodelay option and
+/// the MaybeTlsStream layering makes it awkward to reach the TcpStream
+/// post-handshake. Pre-connecting the TCP socket ourselves is the cleanest
+/// way to ensure Nagle is OFF — small WS frames (PINGs, subscribe messages,
+/// heartbeats) otherwise incur up to 40ms of kernel holdback.
+async fn connect_ws_nodelay(
+    url: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error + Send + Sync>> {
+    let request = url.into_client_request()?;
+    let host = request
+        .uri()
+        .host()
+        .ok_or("ws url missing host")?
+        .to_string();
+    let port = request.uri().port_u16().unwrap_or(443);
+    let addr = format!("{host}:{port}");
+
+    let tcp = TcpStream::connect(&addr).await?;
+    tcp.set_nodelay(true)?; // disable Nagle — critical for low-latency WS
+
+    let (ws, _resp) = client_async_tls(request, tcp).await?;
+    Ok(ws)
 }
 
 mod ordered_float {
@@ -144,13 +174,12 @@ impl BookFeed {
 
 async fn book_feed_task(url: String, tokens: Vec<String>, state: Arc<RwLock<BookState>>) {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
 
     let mut backoff = 2u64;
 
     loop {
-        let (ws, _) = match connect_async(&url).await {
+        let ws = match connect_ws_nodelay(&url).await {
             Ok(c) => {
                 backoff = 2;
                 c
@@ -169,14 +198,14 @@ async fn book_feed_task(url: String, tokens: Vec<String>, state: Arc<RwLock<Book
             "type": "market",
             "custom_feature_enabled": true,
         });
-        if write.send(Message::Text(sub_msg.to_string())).await.is_err() {
+        if write.send(Message::Text(sub_msg.to_string().into())).await.is_err() {
             continue;
         }
 
         let hb_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                if write.send(Message::Text("PING".to_string())).await.is_err() {
+                if write.send(Message::Text("PING".into())).await.is_err() {
                     break;
                 }
             }
@@ -361,14 +390,13 @@ async fn price_feed_task(
     last_update_ts: Arc<AtomicU64>,
 ) {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
 
     let url = "wss://ws-live-data.polymarket.com";
     let mut backoff = 2u64;
 
     loop {
-        let (ws, _) = match connect_async(url).await {
+        let ws = match connect_ws_nodelay(url).await {
             Ok(c) => {
                 backoff = 2;
                 c
@@ -386,12 +414,12 @@ async fn price_feed_task(
             "action": "subscribe",
             "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "*"}],
         });
-        let _ = write.send(Message::Text(sub.to_string())).await;
+        let _ = write.send(Message::Text(sub.to_string().into())).await;
 
         let hb = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if write.send(Message::Text("PING".to_string())).await.is_err() {
+                if write.send(Message::Text("PING".into())).await.is_err() {
                     break;
                 }
             }
@@ -451,21 +479,45 @@ async fn price_feed_task(
 
 // ── BinanceFeed (JSON bookTicker) ───────────────────────────────────────────
 
+/// Number of parallel WS subscriptions to Binance for the same symbol.
+/// Each connection sees the same update stream but with independent network
+/// jitter. We keep "first-arrival" per updateId (`u` field) via CAS on
+/// `last_u`. Smooths p99 tail latency at the cost of one extra TCP connection
+/// per asset (well under Binance's 300-per-IP / 5min limit).
+const BINANCE_PARALLEL_N: u32 = 2;
+
 pub struct BinanceFeed {
     mid: Arc<AtomicU64>,
     last_update_ts: Arc<AtomicU64>,
+    /// Highest Binance `u` update-id observed across all parallel replicas.
+    /// Used as a monotonic dedupe key so two replicas racing on the same
+    /// bookTicker event don't double-notify or stamp out of order.
+    last_u: Arc<AtomicU64>,
 }
 
 impl BinanceFeed {
-    pub fn new(symbol: String) -> Self {
+    /// `wake` is notified on every price update so the signal loop can wake
+    /// immediately instead of polling. Saves ~5ms median / ~10ms p99 vs the
+    /// old 10ms `sleep` poll.
+    ///
+    /// Spawns `BINANCE_PARALLEL_N` independent WS subscriptions and keeps
+    /// the fastest replica's view of each tick. Reduces p99 tail jitter
+    /// from any single connection having a bad hop.
+    pub fn new(symbol: String, wake: Arc<tokio::sync::Notify>) -> Self {
         let mid = Arc::new(AtomicU64::new(0));
         let ts = Arc::new(AtomicU64::new(0));
-        let m = mid.clone();
-        let t = ts.clone();
-        tokio::spawn(async move {
-            binance_feed_task(symbol, m, t).await;
-        });
-        Self { mid, last_update_ts: ts }
+        let last_u = Arc::new(AtomicU64::new(0));
+        for replica_id in 0..BINANCE_PARALLEL_N {
+            let m = mid.clone();
+            let t = ts.clone();
+            let u = last_u.clone();
+            let w = wake.clone();
+            let s = symbol.clone();
+            tokio::spawn(async move {
+                binance_feed_task(s, m, t, u, w, replica_id).await;
+            });
+        }
+        Self { mid, last_update_ts: ts, last_u }
     }
 
     pub fn mid(&self) -> Option<f64> {
@@ -480,6 +532,11 @@ impl BinanceFeed {
     pub fn last_update_ts(&self) -> f64 {
         load_f64(&self.last_update_ts)
     }
+
+    #[allow(dead_code)]
+    pub fn last_update_id(&self) -> u64 {
+        self.last_u.load(Ordering::Acquire)
+    }
 }
 
 // ── CoinbaseFeed (ticker channel) ───────────────────────────────────────────
@@ -490,14 +547,16 @@ pub struct CoinbaseFeed {
 }
 
 impl CoinbaseFeed {
-    /// product_id in Coinbase format, e.g. "BTC-USD"
-    pub fn new(product_id: String) -> Self {
+    /// product_id in Coinbase format, e.g. "BTC-USD".
+    /// `wake` is notified on every price update so the signal loop can wake
+    /// immediately instead of polling.
+    pub fn new(product_id: String, wake: Arc<tokio::sync::Notify>) -> Self {
         let mid = Arc::new(AtomicU64::new(0));
         let ts = Arc::new(AtomicU64::new(0));
         let m = mid.clone();
         let t = ts.clone();
         tokio::spawn(async move {
-            coinbase_feed_task(product_id, m, t).await;
+            coinbase_feed_task(product_id, m, t, wake).await;
         });
         Self { mid, last_update_ts: ts }
     }
@@ -516,9 +575,9 @@ async fn coinbase_feed_task(
     product_id: String,
     mid: Arc<AtomicU64>,
     last_update_ts: Arc<AtomicU64>,
+    wake: Arc<tokio::sync::Notify>,
 ) {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
 
     let url = "wss://ws-feed.exchange.coinbase.com";
@@ -530,7 +589,7 @@ async fn coinbase_feed_task(
     let mut backoff = 2u64;
 
     loop {
-        let (ws, _) = match connect_async(url).await {
+        let ws = match connect_ws_nodelay(url).await {
             Ok(c) => { backoff = 2; c }
             Err(e) => {
                 eprintln!("[CoinbaseFeed] connect error: {e}");
@@ -540,7 +599,7 @@ async fn coinbase_feed_task(
             }
         };
         let (mut write, mut read) = ws.split();
-        if write.send(Message::Text(sub.to_string())).await.is_err() {
+        if write.send(Message::Text(sub.to_string().into())).await.is_err() {
             continue;
         }
         let read_timeout = std::time::Duration::from_secs(30);
@@ -568,6 +627,7 @@ async fn coinbase_feed_task(
                     if let (Some(b), Some(a)) = (bid, ask) {
                         store_f64(&mid, (b + a) / 2.0);
                         store_f64(&last_update_ts, now_s());
+                        wake.notify_waiters();
                     }
                 }
                 Ok(Message::Ping(data)) => {
@@ -586,13 +646,29 @@ async fn coinbase_feed_task(
     }
 }
 
+/// Binance bookTicker shape. `s` / `B` / `A` fields present but unused here —
+/// sonic-rs ignores unknown fields by default so we only deserialize what we
+/// need.
+#[derive(serde::Deserialize)]
+struct BookTicker<'a> {
+    /// Update id (monotonic per symbol). Used for cross-replica dedup.
+    u: u64,
+    /// Best bid as a string (Binance serializes prices as quoted strings to
+    /// preserve precision).
+    b: &'a str,
+    /// Best ask.
+    a: &'a str,
+}
+
 async fn binance_feed_task(
     symbol: String,
     mid: Arc<AtomicU64>,
     last_update_ts: Arc<AtomicU64>,
+    last_u: Arc<AtomicU64>,
+    wake: Arc<tokio::sync::Notify>,
+    replica_id: u32,
 ) {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
 
     let url = format!(
@@ -602,13 +678,13 @@ async fn binance_feed_task(
     let mut backoff = 2u64;
 
     loop {
-        let (ws, _) = match connect_async(&url).await {
+        let ws = match connect_ws_nodelay(&url).await {
             Ok(c) => {
                 backoff = 2;
                 c
             }
             Err(e) => {
-                eprintln!("[BinanceFeed] connect error: {e}");
+                eprintln!("[BinanceFeed#{replica_id}] connect error: {e}");
                 tokio::time::sleep(std::time::Duration::from_secs(backoff.min(60))).await;
                 backoff = (backoff * 2).min(60);
                 continue;
@@ -621,24 +697,44 @@ async fn binance_feed_task(
                 Ok(Some(m)) => m,
                 Ok(None) => break,
                 Err(_) => {
-                    eprintln!("[BinanceFeed] no data for 30s, reconnecting");
+                    eprintln!("[BinanceFeed#{replica_id}] no data for 30s, reconnecting");
                     break;
                 }
             };
             match msg {
                 Ok(Message::Text(t)) => {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&t) {
-                        let bid = parsed
-                            .get("b")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<f64>().ok());
-                        let ask = parsed
-                            .get("a")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<f64>().ok());
-                        if let (Some(b), Some(a)) = (bid, ask) {
-                            store_f64(&mid, (b + a) / 2.0);
-                            store_f64(&last_update_ts, now_s());
+                    // sonic-rs: ~3× faster than serde_json on tiny payloads.
+                    // Zero-copy where possible (borrows `&str` out of `t`).
+                    let parsed: Result<BookTicker, _> = sonic_rs::from_str(&t);
+                    let Ok(msg) = parsed else { continue };
+                    let (Ok(b), Ok(a)) = (msg.b.parse::<f64>(), msg.a.parse::<f64>()) else {
+                        continue;
+                    };
+
+                    // Cross-replica dedup: only the replica whose message wins
+                    // the CAS on `last_u` gets to stamp mid/ts/wake. This means
+                    // if replica A's packet arrives 5ms before B's for the same
+                    // updateId, B's arrival is a no-op — first-arrival wins.
+                    loop {
+                        let current = last_u.load(Ordering::Acquire);
+                        if msg.u <= current {
+                            break; // stale or duplicate — another replica won
+                        }
+                        match last_u.compare_exchange_weak(
+                            current,
+                            msg.u,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                store_f64(&mid, (b + a) / 2.0);
+                                store_f64(&last_update_ts, now_s());
+                                wake.notify_waiters();
+                                break;
+                            }
+                            // Another replica moved last_u between our load and
+                            // CAS. Re-check: if their value >= ours, we're stale.
+                            Err(_) => continue,
                         }
                     }
                 }
@@ -648,7 +744,7 @@ async fn binance_feed_task(
                 Ok(Message::Close(_)) => break,
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("[BinanceFeed] read error: {e}");
+                    eprintln!("[BinanceFeed#{replica_id}] read error: {e}");
                     break;
                 }
             }

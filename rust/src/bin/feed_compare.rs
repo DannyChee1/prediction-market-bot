@@ -83,7 +83,7 @@ async fn coinbase_task(buf: Arc<FeedBuf>) {
             continue;
         };
         let (mut write, mut read) = ws.split();
-        let _ = write.send(Message::Text(sub.to_string())).await;
+        let _ = write.send(Message::Text(sub.to_string().into())).await;
         while let Some(Ok(Message::Text(t))) = read.next().await {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
                 if v.get("type").and_then(|x| x.as_str()) != Some("ticker") {
@@ -108,12 +108,12 @@ async fn chainlink_task(buf: Arc<FeedBuf>) {
             continue;
         };
         let (mut write, mut read) = ws.split();
-        let _ = write.send(Message::Text(sub.to_string())).await;
+        let _ = write.send(Message::Text(sub.to_string().into())).await;
         // Heartbeat PING every 5s
         let hb = tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(5)).await;
-                if write.send(Message::Text("PING".to_string())).await.is_err() {
+                if write.send(Message::Text("PING".into())).await.is_err() {
                     break;
                 }
             }

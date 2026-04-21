@@ -132,7 +132,18 @@ impl OrderClient {
         Ok(())
     }
 
-    /// FOK market-buy for taker arb entries.
+    /// FAK market-buy for taker arb entries.
+    ///
+    /// FAK (Fill and Kill) fills as much as the book can absorb at the
+    /// accepted price, then cancels any remainder. Chosen over FOK (Fill or
+    /// Kill) because:
+    ///   - Partial fills are accounted correctly in tracker::record_fire
+    ///     (we read taking_amount / making_amount from the response, not
+    ///     the intended amount).
+    ///   - At low sizes, FAK and FOK behave identically (plenty of depth).
+    ///   - As bankroll scales, FOK would reject when notional exceeds L1
+    ///     depth; FAK still captures L1 and skips deeper levels we didn't
+    ///     explicitly want. Strictly better upside, no downside.
     ///
     /// `fee_rate_bps` is a MAX-fee commitment in the signed order, NOT a fee
     /// we pay. Polymarket charges the market's actual dynamic fee (~1-3%
@@ -173,7 +184,7 @@ impl OrderClient {
             .map_err(|e| anyhow!("create_market_order: {e}"))?;
         let resp = self
             .inner
-            .post_order(signed, PolyOrderType::FOK)
+            .post_order(signed, PolyOrderType::FAK)
             .await
             .map_err(|e| anyhow!("post_order: {e}"))?;
         Ok(response_from(&resp))

@@ -1,0 +1,10 @@
+{
+  "bankroll": 165.60,
+  "starting_bankroll": 88.0,
+  "fills": 170,
+  "wins": 117,
+  "losses": 53,
+  "realized_pnl": 65.60,
+  "last_fire_ms": 0,
+  "open_positions": []
+}

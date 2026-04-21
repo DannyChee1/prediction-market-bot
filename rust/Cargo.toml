@@ -10,10 +10,18 @@ path = "src/main.rs"
 [dependencies]
 polyfill-rs = { git = "https://github.com/floor-licker/polyfill-rs", features = ["stream"] }
 tokio = { version = "1.41", features = ["full"] }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+# Upgraded from 0.21 — minor perf/bugfixes, same native-tls feature path.
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Faster JSON decode (~3× serde_json) for the Binance hot path.
+# Used in feed.rs for bookTicker parsing. No mutable-buffer requirement
+# (unlike simd-json), so safe to drop in alongside WS streaming.
+sonic-rs = "0.3"
+# Faster Mutex than tokio::sync::Mutex for critical sections that do NOT
+# span .await points. Swapped in where audit confirmed no-await-under-lock.
+parking_lot = "0.12"
 rust_decimal = "1.36"
 alloy-primitives = "1"
 alloy-sol-types = "1"

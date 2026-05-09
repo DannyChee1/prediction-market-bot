@@ -88,6 +88,27 @@ pub fn decide_latency_arb(
         return Decision::flat(format!("tau {tau:.0}s <= min {:.0}s", arb.min_tau_s));
     }
 
+    // ── 1a. Hour-of-day gate (asset-specific) ───────────────────
+    // Only applies to ETH currently. Historical analysis showed ETH fires
+    // are near 100% WR during 12-18 UTC and heavily negative outside that
+    // window (off-hours = thin liquidity, adverse-selection-dominant).
+    if let Some((start, end)) = arb.allowed_hours_utc {
+        // Derive hour-of-day UTC from the snapshot timestamp (integer math,
+        // no chrono call — ~ns per tick).
+        let hour = ((snap.ts_ms / 1000 / 3600).rem_euclid(24)) as u8;
+        let in_window = if start < end {
+            hour >= start && hour < end
+        } else {
+            // Wrap-around window (e.g., (22, 6) = 22-23 plus 00-05).
+            hour >= start || hour < end
+        };
+        if !in_window {
+            return Decision::flat(format!(
+                "off-hours: {hour}z not in [{start},{end})"
+            ));
+        }
+    }
+
     // ── 2. Cooldown ──────────────────────────────────────────────
     if state.last_fire_ms > 0 {
         let elapsed_s = (snap.ts_ms - state.last_fire_ms) as f64 / 1000.0;
@@ -225,6 +246,17 @@ pub fn decide_latency_arb(
     // from 1.0× base at threshold to 1.5× base at 2× threshold.
     // Capped by bankroll frac. Respects min 5 shares.
     let z = if sigma_2s > 0.01 { delta_usd.abs() / sigma_2s } else { 1.0 };
+
+    // Z-cap (asset-specific). On ETH, the z>8-10 fires are dominated by
+    // thin-book Binance spoofs that revert — opposite of BTC where high-z
+    // is real news flow. Historical ETH z8+: 36% WR, -40% ROI. If the
+    // asset's ArbParams carries a z_cap, reject when exceeded.
+    if let Some(cap) = arb.z_cap {
+        if z > cap {
+            return Decision::flat(format!("z {z:.1} > cap {cap:.1}"));
+        }
+    }
+
     let z_scale = (z / arb.sigma_k).clamp(1.0, 1.5);
     let size_usd = (arb.size_usd * z_scale).min(state.bankroll * arb.max_bankroll_frac);
     if size_usd < arb.min_order_shares * ask {

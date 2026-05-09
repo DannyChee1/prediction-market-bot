@@ -119,6 +119,16 @@ pub struct ArbParams {
     ///   `threshold_effective = base × (1 + ramp_per_slot × slots_used)`
     /// Set to 0 to disable (all slots use the same threshold).
     pub ramp_per_slot: f64,
+    /// UTC hour gate (start_inclusive, end_exclusive). None = always allow.
+    /// Set on ETH to [12, 18) — data showed ~100% WR in that window and
+    /// heavy losses off-hours (thin liquidity + fat-tail adverse selection).
+    /// Hours wrap around 00z if start > end (e.g. (22, 6) = 22:00-06:00).
+    pub allowed_hours_utc: Option<(u8, u8)>,
+    /// Reject fires whose Binance z-score exceeds this cap. None = no cap.
+    /// Set on ETH because ETH z>8 fires are dominated by Binance spoofs /
+    /// thin-book wicks that revert (opposite pattern vs BTC, where z8+ is
+    /// the strongest signal).
+    pub z_cap: Option<f64>,
 }
 
 impl Default for ArbParams {
@@ -142,6 +152,8 @@ impl Default for ArbParams {
             sigma_k: 2.5,
             max_positions_per_window: 2,
             ramp_per_slot: 0.5,
+            allowed_hours_utc: None,
+            z_cap: None,
         }
     }
 }

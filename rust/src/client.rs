@@ -182,9 +182,14 @@ impl OrderClient {
             .create_market_order(&args, extras, opts.as_ref())
             .await
             .map_err(|e| anyhow!("create_market_order: {e}"))?;
+        // Reverted FAK → FOK (2026-04-22). FAK was hypothesized to be a
+        // cause of the post-deploy P&L regression. Data later showed 195/195
+        // fills were 100% so FAK ≈ FOK in practice, but reverting removes
+        // one variable during the bisection. Re-enable FAK with explicit
+        // A/B measurement if capacity becomes a constraint.
         let resp = self
             .inner
-            .post_order(signed, PolyOrderType::FAK)
+            .post_order(signed, PolyOrderType::FOK)
             .await
             .map_err(|e| anyhow!("post_order: {e}"))?;
         Ok(response_from(&resp))

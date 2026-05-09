@@ -53,11 +53,12 @@ struct Args {
     #[arg(long, default_value_t = 25.0)]
     arb_delta_floor: f64,
 
-    /// Adaptive threshold floor for BTC 15m — higher than 5m because the
-    /// weak-signal (z2-3) bucket on 15m was losing money (-10% ROI) in
-    /// historical data. Longer tau = more time for mean-reversion, so
-    /// demand stronger signals on the 15m window.
-    #[arg(long, default_value_t = 35.0)]
+    /// Adaptive threshold floor for BTC 15m. Reverted 2026-04-22 from
+    /// $35 back to $25 (same as 5m). The $35 raise did not improve 15m
+    /// performance in live trading and removing the split lets us use a
+    /// single well-understood threshold until we re-evaluate with more
+    /// data. Flag retained so the per-15m override is easy to re-enable.
+    #[arg(long, default_value_t = 25.0)]
     arb_delta_floor_btc_15m: f64,
 
     /// Adaptive threshold floor for ETH 5m — never fire below this.
@@ -83,11 +84,12 @@ struct Args {
     #[arg(long, default_value_t = 2.5)]
     arb_sigma_k: f64,
 
-    /// Max concurrent positions per BTC market window. Interpreted as a
-    /// fractional-slot cap (each partial FAK fill uses slots ∈ [0, 1]).
-    /// Combined with --arb-ramp-per-slot, successive fires within the
-    /// same window require progressively stronger signals.
-    #[arg(long, default_value_t = 3)]
+    /// Max concurrent positions per BTC market window. Reverted to 2
+    /// on 2026-04-22 from 3 — slot-3 fires had no historical baseline
+    /// and allowing them appeared to change slot-2 dynamics negatively
+    /// (slot 2 ROI dropped from +18% historical to -17% after the
+    /// max=3 deploy, on a small but consistent sample).
+    #[arg(long, default_value_t = 2)]
     max_positions_per_window_btc: usize,
 
     /// Max concurrent positions per ETH market window. Kept lower than
@@ -98,9 +100,14 @@ struct Args {
 
     /// Per-slot ramp on the Binance-delta threshold within a window.
     /// `threshold_effective = base × (1 + ramp × slots_used)`.
-    ///   - 0.5 → slot 2 needs 1.5× base, slot 3 needs 2× base
-    ///   - 0.0 disables ramping (all fires use same threshold)
-    #[arg(long, default_value_t = 0.5)]
+    ///   - 0.0 (default): ramping disabled — all fires use same threshold.
+    ///     Analysis showed slot 2 at flat threshold was already profitable
+    ///     on BTC (68% WR, +21% ROI), so ramping would have filtered out
+    ///     good fires without evidence of benefit.
+    ///   - 0.5: slot 2 needs 1.5× base, slot 3 needs 2× base. Use this
+    ///     if you later decide to require progressively stronger signals
+    ///     for successive fires on the same window.
+    #[arg(long, default_value_t = 0.0)]
     arb_ramp_per_slot: f64,
 
     #[arg(long, default_value_t = 2.0)]
@@ -109,8 +116,35 @@ struct Args {
     #[arg(long, default_value_t = 4.0)]
     arb_cooldown_s: f64,
 
+    /// Minimum Polymarket book staleness for BTC fires. Below this the
+    /// book is still fresh — no real arb gap.
     #[arg(long, default_value_t = 600.0)]
     arb_book_stale_ms: f64,
+
+    /// ETH book staleness floor. Historical data showed ETH fires with
+    /// <1000ms book age were LOSING; 2000-3000ms bucket was the clear
+    /// winner. Raising ETH's floor to 1500ms rejects the thin-lag window
+    /// that's noise on ETH but a genuine arb gap on BTC.
+    #[arg(long, default_value_t = 1500.0)]
+    arb_book_stale_ms_eth: f64,
+
+    /// ETH trading hours — START of allowed UTC window (inclusive).
+    /// Default 12 UTC = 8am ET. Before this hour, ETH fires were heavy
+    /// losers (thin liquidity, overnight adverse selection).
+    #[arg(long, default_value_t = 12)]
+    eth_hours_start_utc: u8,
+
+    /// ETH trading hours — END of allowed UTC window (exclusive).
+    /// Default 18 UTC = 2pm ET = covers 12z–17z inclusive. Historical
+    /// WR in this 6-hour window was ~100%.
+    #[arg(long, default_value_t = 18)]
+    eth_hours_end_utc: u8,
+
+    /// ETH z-score cap. Reject fires whose Binance 2s delta exceeds
+    /// this many σ. Default 10.0: below z=10 ETH behaves reasonably;
+    /// above it, Binance spoofs dominate and WR drops to 36%.
+    #[arg(long, default_value_t = 10.0)]
+    arb_z_cap_eth: f64,
 
     #[arg(long, default_value_t = 0.15)]
     arb_min_ask: f64,
@@ -162,11 +196,27 @@ impl Args {
             "delta_floor must be finite and positive; got {delta_floor} for {}",
             cfg.display_name,
         );
+        // ETH filters (hour gate, z-cap, ETH-specific stale-ms) were
+        // reverted on 2026-04-22 during the post-regression bisection.
+        // All assets now share the global book_stale_ms and run without
+        // hour or z-score gating — same behavior as pre-ETH-filter state.
+        // CLI flags `--eth-hours-start-utc`, `--eth-hours-end-utc`,
+        // `--arb-z-cap-eth`, `--arb-book-stale-ms-eth` are retained but
+        // ignored; re-enable by restoring the asset-match block below.
+        let _ = (
+            self.arb_book_stale_ms_eth,
+            self.eth_hours_start_utc,
+            self.eth_hours_end_utc,
+            self.arb_z_cap_eth,
+        );
+        let book_stale_ms = self.arb_book_stale_ms;
+        let allowed_hours: Option<(u8, u8)> = None;
+        let z_cap: Option<f64> = None;
         ArbParams {
             delta_usd: self.arb_delta_usd,
             window_s: self.arb_window_s,
             cooldown_s: self.arb_cooldown_s,
-            book_stale_ms: self.arb_book_stale_ms,
+            book_stale_ms,
             min_ask: self.arb_min_ask,
             max_ask: self.arb_max_ask,
             min_tau_s: self.arb_min_tau_s,
@@ -181,6 +231,8 @@ impl Args {
             sigma_k: self.arb_sigma_k,
             max_positions_per_window: max_positions,
             ramp_per_slot: self.arb_ramp_per_slot,
+            allowed_hours_utc: allowed_hours,
+            z_cap,
         }
     }
 }
@@ -308,6 +360,7 @@ fn categorize_flat_reason(reason: &str) -> &'static str {
     else if reason.starts_with("book fresh") { "book_fresh" }
     else if reason.starts_with("book too stale") { "book_too_stale" }
     else if reason.starts_with("tau ") { "tau" }
+    else if reason.starts_with("off-hours") { "off_hours" }
     else if reason.starts_with("arb cooldown") { "cooldown" }
     else if reason.starts_with("trend disagree") { "trend_disagree" }
     else if reason.starts_with("trend weak") { "trend_weak" }
@@ -318,6 +371,7 @@ fn categorize_flat_reason(reason: &str) -> &'static str {
     else if reason.starts_with("no binance") { "binance_warmup" }
     else if reason.starts_with("ask ") { "ask_band" }
     else if reason.starts_with("invalid ask") { "invalid_ask" }
+    else if reason.starts_with("z ") { "z_cap" }
     else if reason.starts_with("size ") { "size_min" }
     else if reason.is_empty() { "ok" }
     else { "other" }
@@ -387,14 +441,25 @@ async fn main() -> Result<()> {
     );
     for cfg in &configs {
         if let Some(ap) = arb_by_market.get(cfg.slug_prefix) {
+            let hours = match ap.allowed_hours_utc {
+                Some((s, e)) => format!(" hours=[{s},{e})"),
+                None => String::new(),
+            };
+            let zcap = match ap.z_cap {
+                Some(c) => format!(" z_cap={c:.1}"),
+                None => String::new(),
+            };
             eprintln!(
-                "  [PARAMS] {:<8}: delta_floor=${:.2} sigma_k={:.1} size=${:.2} max_slots={} ramp={:.2}",
+                "  [PARAMS] {:<8}: delta_floor=${:.2} sigma_k={:.1} size=${:.2} max_slots={} ramp={:.2} stale>={:.0}ms{}{}",
                 cfg.display_name,
                 ap.delta_floor,
                 ap.sigma_k,
                 ap.size_usd,
                 ap.max_positions_per_window,
                 ap.ramp_per_slot,
+                ap.book_stale_ms,
+                hours,
+                zcap,
             );
         }
     }

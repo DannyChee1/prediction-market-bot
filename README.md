@@ -67,3 +67,4 @@ Competition. We're on EC2 Dublin with sub-millisecond RTT to Polymarket's edge. 
 Adverse selection. On the strongest signals, the makers update their quotes before us and we only fill in on trades we shouldn't take.
 
 Price manipulation. At low-volume hours such as (12:00–16:00 UTC), it's hard to prove but the data hinted that some samples deviated from their expected behaviour.
+

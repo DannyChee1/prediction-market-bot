@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "rust/Cargo.toml"
+module-name = "polybot_core"
+
+[dependency-groups]
+dev = [
+    "kaggle>=2.0.0",
+    "kagglehub>=1.0.0",
+]

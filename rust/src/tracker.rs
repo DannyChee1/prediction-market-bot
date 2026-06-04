@@ -260,7 +260,7 @@ impl Tracker {
     /// round-trip completes, with the lock re-acquired.
     pub fn record_fire(&mut self, ticket: FireTicket, result: anyhow::Result<OrderResponse>) {
         match result {
-            Ok(resp) if resp.success && resp.status == "MATCHED" => {
+            Ok(resp) if resp.success && resp.status.eq_ignore_ascii_case("MATCHED") => {
                 let shares = resp
                     .taking_amount
                     .as_ref()
@@ -271,8 +271,17 @@ impl Tracker {
                     .as_ref()
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(ticket.size_usd);
+                // Polymarket charges a dynamic taker fee = 0.072 × p × (1−p)
+                // on top of (shares × ask). polyfill-rs response.making_amount
+                // does NOT include it, so the bot's bankroll silently drifted
+                // up by ~$0.05 per trade vs actual onchain. Subtract the fee
+                // here to keep accounting truthful. Confirmed by trade-log
+                // audit 2026-05-29: $27 of unaccounted fees over 574 trades
+                // matched the observed onchain gap.
+                let avg_price = if shares > 0.0 { cost / shares } else { ticket.ask };
+                let fee = cost * 0.072 * avg_price * (1.0 - avg_price);
                 self.fills += 1;
-                self.bankroll -= cost;
+                self.bankroll -= cost + fee;
                 let pos = Position {
                     token_id: ticket.token_id.clone(),
                     side: ticket.side.clone(),
@@ -299,11 +308,13 @@ impl Tracker {
                     1.0
                 };
                 eprintln!(
-                    "  [FILL] {} {:?} shares={:.2} cost=${:.2}/${:.2} ({:.0}% fill, {:.2} slot) bankroll=${:.2}",
+                    "  [FILL] {} {:?} shares={:.2} cost=${:.2}+fee${:.3}=${:.2}/${:.2} ({:.0}% fill, {:.2} slot) bankroll=${:.2}",
                     ticket.market_name,
                     ticket.side,
                     shares,
                     cost,
+                    fee,
+                    cost + fee,
                     ticket.size_usd,
                     fill_rate * 100.0,
                     pos.slots(),

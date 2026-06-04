@@ -8,7 +8,7 @@ name = "polybot-arb"
 path = "src/main.rs"
 
 [dependencies]
-polyfill-rs = { git = "https://github.com/floor-licker/polyfill-rs", features = ["stream"] }
+polyfill-rs = { git = "https://github.com/floor-licker/polyfill-rs", rev = "d1ae63af8026a13cab47248408bc54aa53bf5694", features = ["stream"] }
 tokio = { version = "1.41", features = ["full"] }
 # Upgraded from 0.21 — minor perf/bugfixes, same native-tls feature path.
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }

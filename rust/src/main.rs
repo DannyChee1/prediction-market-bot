@@ -49,16 +49,15 @@ struct Args {
 
     /// Adaptive threshold floor for BTC 5m — never fire below this.
     /// threshold = max(floor, 2.5 × σ_2s). Scaled for BTC's ~$75k price point.
-    /// BTC 5m historical data: z2-3 bucket is profitable (+27% ROI), keep low.
-    #[arg(long, default_value_t = 25.0)]
+    /// Raised 2026-05-29 from $25 to $30 — recent live data showed bot
+    /// running net flat at $25 floor (302W/271L over 8d, fees ate edge);
+    /// tightening should cut marginal/competitive fires.
+    #[arg(long, default_value_t = 30.0)]
     arb_delta_floor: f64,
 
-    /// Adaptive threshold floor for BTC 15m. Reverted 2026-04-22 from
-    /// $35 back to $25 (same as 5m). The $35 raise did not improve 15m
-    /// performance in live trading and removing the split lets us use a
-    /// single well-understood threshold until we re-evaluate with more
-    /// data. Flag retained so the per-15m override is easy to re-enable.
-    #[arg(long, default_value_t = 25.0)]
+    /// Adaptive threshold floor for BTC 15m. Bumped to $30 on 2026-05-29
+    /// alongside 5m for the same reason — net flat live, fees ate edge.
+    #[arg(long, default_value_t = 30.0)]
     arb_delta_floor_btc_15m: f64,
 
     /// Adaptive threshold floor for ETH 5m — never fire below this.
@@ -157,6 +156,17 @@ struct Args {
 
     #[arg(long, default_value_t = 10.0)]
     arb_size_usd: f64,
+
+    /// Limit-FOK slippage budget in dollars (e.g. 0.02 = 2¢ above intended ask).
+    /// Bot places a FOK limit at `intended_ask + this` instead of a market
+    /// order. Trade-log audit 2026-05-29 found mean +10.83¢ slippage on
+    /// market orders (book moved between signal and arrival, 70% of fires).
+    /// Limit-FOK caps slippage to this budget at the cost of fewer fills.
+    /// Counterfactual fill rates from N=574: 0¢→16%, 2¢→24%, 5¢→38%.
+    /// Set to a large number (e.g. 1.0) to effectively disable the cap and
+    /// behave like a market order at L1 + 100¢ ceiling.
+    #[arg(long, default_value_t = 0.02)]
+    arb_limit_buffer: f64,
 
     /// Per-fill JSONL log path. Defaults to `live_trades_arb.jsonl` (shared
     /// across BTC and ETH — each row carries slug + asset).
@@ -395,7 +405,7 @@ fn build_client_from_env() -> Result<OrderClient> {
         );
     }
 
-    Ok(OrderClient::new(
+    OrderClient::new(
         CLOB_HOST,
         &private_key,
         CHAIN_ID,
@@ -404,7 +414,7 @@ fn build_client_from_env() -> Result<OrderClient> {
         &passphrase,
         sig_type,
         Some(&funder),
-    ))
+    )
 }
 
 #[tokio::main]
@@ -977,6 +987,7 @@ async fn main() -> Result<()> {
             let tracker_ref = tracker.clone();
             let client_ref = order_client.clone();
             let dry_run = args.dry_run;
+            let limit_buffer = args.arb_limit_buffer;
             tokio::spawn(async move {
                 let result: anyhow::Result<OrderResponse> = if dry_run {
                     Ok(OrderResponse {
@@ -991,11 +1002,14 @@ async fn main() -> Result<()> {
                         transaction_hashes: vec![],
                     })
                 } else if let Some(client) = client_ref {
-                    // 1000 bps (10%) max-fee commitment in the signed order.
-                    // Polymarket charges the market's actual dynamic fee, capped
-                    // at this value. Declaring 0 causes 400 "invalid fee rate".
+                    // FOK limit at `intended_ask + arb_limit_buffer`. If the
+                    // book moves past this between signal and arrival (the
+                    // 70% latency-loss case), order rejects cleanly instead
+                    // of walking up to a 30c-worse price. See trade-log
+                    // audit 2026-05-29.
+                    let max_price = (ticket.ask + limit_buffer).clamp(0.01, 0.99);
                     client
-                        .place_market_order(&ticket.token_id, ticket.size_usd, "BUY", 1000)
+                        .place_limit_fok(&ticket.token_id, max_price, ticket.size_usd, "BUY")
                         .await
                 } else {
                     Err(anyhow::anyhow!("no order client"))

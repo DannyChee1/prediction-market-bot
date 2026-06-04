@@ -2773,8 +2773,8 @@ dependencies = [
 
 [[package]]
 name = "polyfill-rs"
-version = "0.3.1"
-source = "git+https://github.com/floor-licker/polyfill-rs#17255926f9175e37fef1f5d8d072d11832a085a6"
+version = "0.4.0"
+source = "git+https://github.com/floor-licker/polyfill-rs?rev=d1ae63af8026a13cab47248408bc54aa53bf5694#d1ae63af8026a13cab47248408bc54aa53bf5694"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
